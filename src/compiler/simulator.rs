@@ -2144,6 +2144,16 @@ impl ProcCont {
         }
     }
 
+    /// A continuation over a shared statement slice.
+    fn from_frame(stmts: Arc<[Statement]>) -> Self {
+        ProcCont {
+            stmts,
+            start: 0,
+            next: None,
+            loop_tail_at: None,
+        }
+    }
+
     /// Nothing to run.
     fn empty() -> Self {
         thread_local! {
@@ -2194,6 +2204,34 @@ impl ProcCont {
             next,
             loop_tail_at: None,
         }
+    }
+
+    /// Like `pushed(vec![body.clone()], resume_at)`, but when `body` is
+    /// `StatementKind::Null` (a standalone `#delay;` or `@(ev);` with no
+    /// attached statement), skips allocating the 1-element `[Null]` wrapper
+    /// frame and `Arc<ProcCont>` link and resumes directly at `resume_at`.
+    fn pushed_body(&self, body: &Statement, resume_at: usize) -> Self {
+        if matches!(body.kind, StatementKind::Null) {
+            if resume_at < self.stmts.len() {
+                return self.resume_at(resume_at);
+            }
+            if let Some(next) = &self.next {
+                return (**next).clone();
+            }
+            thread_local! {
+                static NULL_ONE: Arc<[Statement]> = Arc::from(vec![Statement::new(
+                    StatementKind::Null,
+                    crate::ast::Span::dummy(),
+                )]);
+            }
+            return ProcCont {
+                stmts: NULL_ONE.with(Arc::clone),
+                start: 0,
+                next: None,
+                loop_tail_at: None,
+            };
+        }
+        self.pushed(vec![body.clone()], resume_at)
     }
 
     /// Like `pushed`, but `stmts[tail_idx]` is a synthesized `While`/`Repeat`
@@ -8766,8 +8804,12 @@ pub struct Simulator {
     vif_return_pending: bool,
     /// Static lvalue widths of bare-leaf identifiers, per identifier span (see infer_lhs_width).
     lhs_leaf_width_cache: HashMap<(usize, usize), u32>,
-    /// See `blocking_cont_frame`.
-    blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
+    /// See `blocking_cont_frame`. Keyed by `(node_addr, kind)` and retains
+    /// the owning `Arc<[Statement]>` alongside the prepared continuation frame
+    /// so the AST node address stays valid and cannot be recycled, while all
+    /// processes (`pid`s) executing the same shared AST node reuse one frame.
+    #[allow(clippy::type_complexity)]
+    blocking_cont_cache: HashMap<(usize, u8), (Arc<[Statement]>, Arc<[Statement]>)>,
     /// See `class_task_body_frame`.
     #[allow(clippy::type_complexity)]
     class_task_frame_cache:
@@ -52711,12 +52753,18 @@ impl Simulator {
             // this, return_flag/break_flag leaked past the ScopePop and skipped
             // the caller's next real statement.
             if self.return_flag {
-                if let StatementKind::ScopePop = &stmt.kind {
-                    if let Some(c) = self.task_cleanup.pop() {
-                        self.unwind_task_frame(c);
-                    } else {
-                        self.return_flag = false;
+                match &stmt.kind {
+                    StatementKind::ScopePop => {
+                        if let Some(c) = self.task_cleanup.pop() {
+                            self.unwind_task_frame(c);
+                        } else {
+                            self.return_flag = false;
+                        }
                     }
+                    StatementKind::ForeachTail { fe_auto_len, .. } => {
+                        self.auto_loop_vars.truncate(*fe_auto_len);
+                    }
+                    _ => {}
                 }
                 i += 1;
                 continue;
@@ -52831,12 +52879,12 @@ impl Simulator {
                     // §6.21: a block that declares variables opens a scope,
                     // closed by its frame's trailing `Null`.
                     let scope = self.block_scope_enter(inner);
-                    // Immutable AST: share one Arc frame per (process, span)
-                    // instead of cloning the whole list on every entry.
+                    // Immutable AST: share one Arc frame per AST node
+                    // instead of cloning the whole list per process entry.
                     let frame = match name {
-                        None if scope.is_some() => self.scoped_block_frame(pid, stmt, inner),
-                        None => self.blocking_cont_frame(pid, stmt.span, 0, inner),
-                        Some(n) => self.named_block_frame(pid, stmt, inner, &n.name),
+                        None if scope.is_some() => self.scoped_block_frame(&pc.stmts, stmt, inner),
+                        None => self.blocking_cont_frame(&pc.stmts, stmt, 0, inner),
+                        Some(n) => self.named_block_frame(&pc.stmts, stmt, inner, &n.name),
                     };
                     // §21.2.1.7: a NAMED block adds its name to the `%m`
                     // hierarchy while the process runs (and parks) in it;
@@ -53883,9 +53931,8 @@ impl Simulator {
                             self.inactive_queue.push((pid, whole));
                             return;
                         }
-                        let cont = vec![*body.clone()];
-                        // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                        let cont = pc.pushed(cont, pc.start + i + 1);
+                        // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
+                        let cont = pc.pushed_body(body, pc.start + i + 1);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the
@@ -53939,9 +53986,8 @@ impl Simulator {
                         // so accept both shapes.
                         if let Some(fname) = self.event_control_field_name(event) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
-                                let cont = vec![*body.clone()];
-                                // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                                let cont = pc.pushed(cont, pc.start + i + 1);
+                                // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
+                                let cont = pc.pushed_body(body, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -53967,9 +54013,8 @@ impl Simulator {
                                     self.park_condition_waiter(pid, cont, &cond);
                                     return;
                                 }
-                                let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
-                                let cont = pc.pushed(cont, pc.start + i + 1);
+                                let cont = pc.pushed_body(body, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -54025,7 +54070,7 @@ impl Simulator {
                             }
                         };
                         if let Some(key) = static_ev {
-                            let cont = pc.pushed(vec![*body.clone()], pc.start + i + 1);
+                            let cont = pc.pushed_body(body, pc.start + i + 1);
                             self.instance_event_waiters.push(InstanceEventWaiter {
                                 key,
                                 pid,
@@ -54056,9 +54101,8 @@ impl Simulator {
                         if let Some(key) = self.event_control_event_key(event) {
                             let canon = self.resolve_event_key(&key);
                             if self.signal_name_to_id.contains_key(canon.as_str()) {
-                                let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
-                                let cont = pc.pushed(cont, pc.start + i + 1);
+                                let cont = pc.pushed_body(body, pc.start + i + 1);
                                 let sens = vec![Sensitivity {
                                     signal_name: canon,
                                     edge: EdgeKind::AnyEdge,
@@ -54085,9 +54129,8 @@ impl Simulator {
                             return;
                         }
                         if !sens.is_empty() {
-                            let cont = vec![*body.clone()];
-                            // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                            let cont = pc.pushed(cont, pc.start + i + 1);
+                            // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
+                            let cont = pc.pushed_body(body, pc.start + i + 1);
                             // Late-bind virtual-interface / handle-chained
                             // names to their concrete instance signals before
                             // deciding whether anything real is waited on.
@@ -54167,9 +54210,10 @@ impl Simulator {
                     // peer process writing `sig` at the same simtime. Level-sensitive
                     // condition handoffs depend on exactly this delta-cycle
                     // handoff. Always park in condition_waiters.
-                    let cont = vec![stmt.clone()];
-                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                    let cont = pc.pushed(cont, pc.start + i + 1);
+                    // `stmt` is already `pc.stmts[pc.start + i]`, so resuming
+                    // `pc` at `pc.start + i` re-runs `stmt` followed by the
+                    // tail without cloning `stmt` or allocating a wrapper frame.
+                    let cont = pc.resume_at(pc.start + i);
                     self.park_condition_waiter(pid, cont, condition);
                     return;
                 }
@@ -54397,12 +54441,12 @@ impl Simulator {
                                 StatementKind::SeqBlock { stmts, .. }
                                     if !Self::stmts_declare_vars(stmts) =>
                                 {
-                                    self.blocking_cont_frame(pid, branch.span, 1, stmts)
+                                    self.blocking_cont_frame(&pc.stmts, branch, 1, stmts)
                                 }
                                 _ => self.blocking_cont_frame(
-                                    pid,
-                                    branch.span,
-                                    2,
+                                    &pc.stmts,
+                                    branch,
+                                    4,
                                     std::slice::from_ref(branch),
                                 ),
                             };
@@ -54480,11 +54524,10 @@ impl Simulator {
                         });
                     match chosen {
                         Some(arm) if self.stmt_is_blocking(arm) => {
-                            let arm_stmts: Vec<Statement> = Self::spliced_body(arm);
-                            let cont = arm_stmts;
+                            let frame = self.spliced_body_frame(&pc.stmts, arm);
                             // Chain the caller's tail instead of copying it onto the end of
-                            // the spliced body (ProcCont::pushed).
-                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                            // the spliced body (ProcCont::pushed_frame).
+                            self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                             return;
                         }
                         Some(arm) => self.exec_statement(arm),
@@ -54504,15 +54547,8 @@ impl Simulator {
                     if let Some(k) = self.randcase_pick(items) {
                         let arm = &items[k].1;
                         if self.stmt_is_blocking(arm) {
-                            let cont: Vec<Statement> = match &arm.kind {
-                                StatementKind::SeqBlock { name: None, stmts }
-                                    if !Self::stmts_declare_vars(stmts) =>
-                                {
-                                    stmts.clone()
-                                }
-                                _ => vec![arm.clone()],
-                            };
-                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                            let frame = self.spliced_body_frame(&pc.stmts, arm);
+                            self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                             return;
                         }
                         self.exec_statement(arm);
@@ -54582,34 +54618,43 @@ impl Simulator {
                             }
                         }
                     }
-                    let mut body_stmts = Self::spliced_body(body);
-                    // §12.7.2: a `continue` skips the rest of the body but the
-                    // step STILL runs. Without this barrier the step — appended
-                    // to the body by this very lowering — was skipped along
-                    // with it, so the index never advanced and the loop hung.
-                    if !step.is_empty() {
-                        body_stmts.push(Statement::new(StatementKind::LoopStep, stmt.span));
-                    }
-                    for s in step {
-                        body_stmts.push(Statement::new(StatementKind::Expr(s.clone()), stmt.span));
-                    }
-                    let while_body = Statement::new(
-                        StatementKind::SeqBlock {
-                            name: None,
-                            stmts: body_stmts,
-                        },
-                        stmt.span,
-                    );
-                    let while_stmt = Statement::new(
-                        StatementKind::While {
-                            condition: condition.clone().unwrap(),
-                            body: Box::new(while_body),
-                        },
-                        stmt.span,
-                    );
-                    let cont = vec![while_stmt];
-                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                    let cont = pc.pushed(cont, pc.start + i + 1);
+                    let for_key = (stmt as *const Statement as usize, 6u8);
+                    let frame = if let Some((_, f)) = self.blocking_cont_cache.get(&for_key) {
+                        f.clone()
+                    } else {
+                        let mut body_stmts = Self::spliced_body(body);
+                        // §12.7.2: a `continue` skips the rest of the body but the
+                        // step STILL runs. Without this barrier the step — appended
+                        // to the body by this very lowering — was skipped along
+                        // with it, so the index never advanced and the loop hung.
+                        if !step.is_empty() {
+                            body_stmts.push(Statement::new(StatementKind::LoopStep, stmt.span));
+                        }
+                        for s in step {
+                            body_stmts
+                                .push(Statement::new(StatementKind::Expr(s.clone()), stmt.span));
+                        }
+                        let while_body = Statement::new(
+                            StatementKind::SeqBlock {
+                                name: None,
+                                stmts: body_stmts,
+                            },
+                            stmt.span,
+                        );
+                        let while_stmt = Statement::new(
+                            StatementKind::While {
+                                condition: condition.clone().unwrap(),
+                                body: Box::new(while_body),
+                            },
+                            stmt.span,
+                        );
+                        let f: Arc<[Statement]> = Arc::from(vec![while_stmt]);
+                        self.blocking_cont_cache
+                            .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
+                        f
+                    };
+                    // Chain the caller's tail rather than copying it (ProcCont::pushed_frame).
+                    let cont = pc.pushed_frame(frame, pc.start + i + 1);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -54628,32 +54673,23 @@ impl Simulator {
                     self.reset_hint_to_process_scope();
                     let cond_val = self.eval_expr(condition).is_true();
                     if cond_val {
-                        let key = (stmt.span.start, stmt.span.end);
-                        let cached = (key != (0, 0))
-                            .then(|| {
-                                self.suspended_loop_frames
-                                    .get(&pid)
-                                    .and_then(|frames| frames.get(&key))
-                                    .cloned()
-                            })
-                            .flatten();
-                        let frame = if let Some(frame) = cached {
-                            frame
+                        let while_key = (stmt as *const Statement as usize, 7u8);
+                        let frame = if let Some((_, f)) = self.blocking_cont_cache.get(&while_key) {
+                            f.clone()
                         } else {
                             let mut prepared = Self::spliced_body(body);
                             prepared.push(stmt.clone());
                             let frame: Arc<[Statement]> = Arc::from(prepared);
-                            if key != (0, 0) {
-                                self.suspended_loop_frames
-                                    .entry(pid)
-                                    .or_default()
-                                    .insert(key, Arc::clone(&frame));
-                            }
+                            let tail_ptr = &frame[frame.len() - 1] as *const Statement as usize;
+                            self.blocking_cont_cache
+                                .insert(while_key, (Arc::clone(&pc.stmts), Arc::clone(&frame)));
+                            self.blocking_cont_cache
+                                .insert((tail_ptr, 7u8), (Arc::clone(&frame), Arc::clone(&frame)));
                             frame
                         };
                         // `frame` always ends with the re-appended `stmt.clone()`
                         // (freshly built above, or the identical shape pulled
-                        // from `suspended_loop_frames` — same span, same tail
+                        // from `blocking_cont_cache` — same span, same tail
                         // position either way): that last slot is this frame's
                         // genuine re-entry (see `loop_tail_at`'s doc comment).
                         let tail_idx = frame.len() - 1;
@@ -54708,7 +54744,7 @@ impl Simulator {
                 // §9.3.2 children start in THIS time slot, ahead of whatever
                 // is already queued for it; collected here and pushed to the
                 // slot front in reverse below so siblings keep source order.
-                let mut start_now: Vec<(usize, Statement)> = Vec::new();
+                let mut start_now: Vec<(usize, Arc<[Statement]>)> = Vec::new();
                 for s in spawnable {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
@@ -54762,13 +54798,15 @@ impl Simulator {
                             continue;
                         }
                     }
-                    // Schedule children to run at current time
-                    start_now.push((pid_child, s.clone()));
+                    // Schedule children to run at current time, sharing one
+                    // cached Arc<[Statement]> per static fork branch node.
+                    let frame = self.blocking_cont_frame(&pc.stmts, s, 5, std::slice::from_ref(s));
+                    start_now.push((pid_child, frame));
                     child_pids.insert(pid_child);
                 }
-                for (pid_child, s) in start_now.into_iter().rev() {
+                for (pid_child, frame) in start_now.into_iter().rev() {
                     self.event_queue
-                        .schedule_front(self.time, pid_child, vec![s].into());
+                        .schedule_front(self.time, pid_child, ProcCont::from_frame(frame));
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
@@ -54900,24 +54938,30 @@ impl Simulator {
                         };
                         self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                     }
-                    let body_stmts = Self::spliced_body(body);
-                    let mut cont = body_stmts;
-                    cont.push(Statement::new(
-                        StatementKind::ForeachTail {
-                            loop_var: loop_var.clone(),
-                            var_scope: var_scope.clone(),
-                            body: body.clone(),
-                            keys: keys.clone(),
-                            is_str: *is_str,
-                            key_type: *key_type,
-                            idx: idx + 1,
-                            fe_auto_len: *fe_auto_len,
-                            live_size_name: live_size_name.clone(),
-                        },
-                        stmt.span,
-                    ));
-                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                    let cont = pc.pushed(cont, pc.start + i + 1);
+                    let body_id = body.span.start;
+                    let body_frame = self
+                        .blocking_cont_cache
+                        .get(&(body_id, 8u8))
+                        .map(|(_, f)| f.clone())
+                        .unwrap_or_else(|| self.spliced_body_frame(&pc.stmts, body));
+                    let tail = pc.pushed(
+                        vec![Statement::new(
+                            StatementKind::ForeachTail {
+                                loop_var: loop_var.clone(),
+                                var_scope: var_scope.clone(),
+                                body: body.clone(),
+                                keys: keys.clone(),
+                                is_str: *is_str,
+                                key_type: *key_type,
+                                idx: idx + 1,
+                                fe_auto_len: *fe_auto_len,
+                                live_size_name: live_size_name.clone(),
+                            },
+                            stmt.span,
+                        )],
+                        pc.start + i + 1,
+                    );
+                    let cont = tail.pushed_frame(body_frame, 0);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -55004,24 +55048,33 @@ impl Simulator {
                                 self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                             }
                             self.continue_flag = false;
-                            let body_stmts = Self::spliced_body(body);
-                            let mut cont = body_stmts;
-                            cont.push(Statement::new(
-                                StatementKind::ForeachTail {
-                                    loop_var,
-                                    var_scope,
-                                    body: body.clone(),
-                                    keys,
-                                    is_str,
-                                    key_type,
-                                    idx: 1,
-                                    fe_auto_len,
-                                    live_size_name,
+                            let body_frame = self.spliced_body_frame(&pc.stmts, body);
+                            let body_id = (&**body) as *const Statement as usize;
+                            let marker = Box::new(Statement::new(
+                                StatementKind::Null,
+                                crate::ast::Span {
+                                    start: body_id,
+                                    end: 0,
                                 },
-                                stmt.span,
                             ));
-                            // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                            let cont = pc.pushed(cont, pc.start + i + 1);
+                            let tail = pc.pushed(
+                                vec![Statement::new(
+                                    StatementKind::ForeachTail {
+                                        loop_var,
+                                        var_scope,
+                                        body: marker,
+                                        keys,
+                                        is_str,
+                                        key_type,
+                                        idx: 1,
+                                        fe_auto_len,
+                                        live_size_name,
+                                    },
+                                    stmt.span,
+                                )],
+                                pc.start + i + 1,
+                            );
+                            let cont = tail.pushed_frame(body_frame, 0);
                             self.continue_stmts_or_trampoline(pid, cont);
                             return;
                         }
@@ -56049,6 +56102,22 @@ impl Simulator {
         }
     }
 
+    /// Cached `Arc<[Statement]>` form of `spliced_body(body)`, keyed by the
+    /// static AST node address of `body` so repeated loop iterations and
+    /// case/foreach entries share one allocation.
+    fn spliced_body_frame(
+        &mut self,
+        owner: &Arc<[Statement]>,
+        body: &Statement,
+    ) -> Arc<[Statement]> {
+        match &body.kind {
+            StatementKind::SeqBlock { stmts, .. } if !Self::stmts_declare_vars(stmts) => {
+                self.blocking_cont_frame(owner, body, 8, stmts)
+            }
+            _ => self.blocking_cont_frame(owner, body, 8, std::slice::from_ref(body)),
+        }
+    }
+
     /// §6.21: open the scope of a block whose statements are `stmts`. Its
     /// declarations land in the enclosing call frame under their bare names
     /// (and collections in `local_dyn`), so record what they will shadow.
@@ -56303,19 +56372,20 @@ impl Simulator {
     /// `block_scope_sentinel`).
     fn scoped_block_frame(
         &mut self,
-        pid: usize,
+        owner: &Arc<[Statement]>,
         stmt: &Statement,
         inner: &[Statement],
     ) -> Arc<[Statement]> {
-        let key = (pid, stmt.span.start as usize, stmt.span.end as usize, 3u8);
-        if let Some(f) = self.blocking_cont_cache.get(&key) {
+        let key = (stmt as *const Statement as usize, 3u8);
+        if let Some((_, f)) = self.blocking_cont_cache.get(&key) {
             return f.clone();
         }
         let mut v: Vec<Statement> = Vec::with_capacity(inner.len() + 1);
         v.extend_from_slice(inner);
         v.push(Statement::new(StatementKind::Null, stmt.span));
         let f: Arc<[Statement]> = Arc::from(v);
-        self.blocking_cont_cache.insert(key, f.clone());
+        self.blocking_cont_cache
+            .insert(key, (Arc::clone(owner), f.clone()));
         f
     }
 
@@ -56840,13 +56910,13 @@ impl Simulator {
     /// block ends.
     fn named_block_frame(
         &mut self,
-        pid: usize,
+        owner: &Arc<[Statement]>,
         stmt: &Statement,
         inner: &[Statement],
         name: &str,
     ) -> Arc<[Statement]> {
-        let key = (pid, stmt.span.start as usize, stmt.span.end as usize, 2u8);
-        if let Some(f) = self.blocking_cont_cache.get(&key) {
+        let key = (stmt as *const Statement as usize, 2u8);
+        if let Some((_, f)) = self.blocking_cont_cache.get(&key) {
             return f.clone();
         }
         let mut v: Vec<Statement> = Vec::with_capacity(inner.len() + 1);
@@ -56855,23 +56925,38 @@ impl Simulator {
         let f: Arc<[Statement]> = Arc::from(v);
         self.named_block_frames
             .insert(Self::frame_key(&f), name.to_string());
-        self.blocking_cont_cache.insert(key, f.clone());
+        self.blocking_cont_cache
+            .insert(key, (Arc::clone(owner), f.clone()));
         f
     }
 
     fn blocking_cont_frame(
         &mut self,
-        pid: usize,
-        span: crate::ast::Span,
+        owner: &Arc<[Statement]>,
+        node: &Statement,
         kind: u8,
         stmts: &[Statement],
     ) -> Arc<[Statement]> {
-        let key = (pid, span.start as usize, span.end as usize, kind);
-        if let Some(f) = self.blocking_cont_cache.get(&key) {
+        let key = (node as *const Statement as usize, kind);
+        if let Some((_, f)) = self.blocking_cont_cache.get(&key) {
             return f.clone();
         }
         let f: Arc<[Statement]> = Arc::from(stmts.to_vec());
-        self.blocking_cont_cache.insert(key, f.clone());
+        self.blocking_cont_cache
+            .insert(key, (Arc::clone(owner), f.clone()));
+        f
+    }
+
+    fn fork_child_frame(&mut self, s: &Statement) -> Arc<[Statement]> {
+        let key = (s as *const Statement as usize, 5u8);
+        if let Some((_, f)) = self.blocking_cont_cache.get(&key)
+            && f.first().is_some_and(|st| st.span == s.span)
+        {
+            return f.clone();
+        }
+        let f: Arc<[Statement]> = Arc::from(std::slice::from_ref(s));
+        self.blocking_cont_cache
+            .insert(key, (Arc::clone(&f), f.clone()));
         f
     }
 
@@ -88078,8 +88163,9 @@ impl Simulator {
                     self.process_origin.insert(pid, (s.span, "fork child"));
                     self.inherit_fork_child_context(pid);
                     self.inherit_fork_m_scope(pid, self.current_pid, block_name.as_ref());
+                    let frame = self.fork_child_frame(s);
                     self.event_queue
-                        .schedule(self.time, pid, vec![s.clone()].into());
+                        .schedule(self.time, pid, ProcCont::from_frame(frame));
                     child_set.insert(pid);
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
@@ -104349,6 +104435,9 @@ impl Simulator {
             self.suspended_proc_info.remove(&p);
             self.process_parents.remove(&p);
             self.process_contexts.remove(&p);
+            self.fork_baselines.remove(&p);
+            self.fork_signal_captures.remove(&p);
+            self.suspended_loop_frames.remove(&p);
         }
         // Purge from every scheduling structure — every DESCENDANT's
         // future-time #delay too, or the wheel keeps reporting activity
@@ -104614,10 +104703,15 @@ impl Simulator {
             self.process_m_label.remove(&child_pid);
         }
         self.suspended_loop_frames.remove(&child_pid);
+        self.fork_baselines.remove(&child_pid);
+        self.fork_signal_captures.remove(&child_pid);
+        self.process_contexts.remove(&child_pid);
         // §9.7: wake any process awaiting this one's termination.
-        let mut terminated = HashSet::default();
-        terminated.insert(child_pid);
-        self.wake_await_waiters(&terminated);
+        if !self.await_waiters.is_empty() {
+            let mut terminated = HashSet::default();
+            terminated.insert(child_pid);
+            self.wake_await_waiters(&terminated);
+        }
 
         // Reparent any still-running children of the completing process to its
         // own parent, so the fork descendant tree stays connected (a `wait fork`
