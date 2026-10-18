@@ -62,7 +62,6 @@ pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
 pub mod intra_delay;
-pub mod multikernel;
 pub mod sc_bridge;
 pub mod should_fail_lint;
 pub mod type_lint;

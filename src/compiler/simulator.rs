@@ -21093,17 +21093,6 @@ impl Simulator {
                 }
             }
         }
-        // Fire cbEndOfSimulation callbacks exactly once after the event loop
-        // terminates, before `final` blocks execute.
-        if !self.dpi_end_sim_cbs.is_empty() && !self.dpi_pending_end_sim_fired {
-            let self_ptr = self as *mut Simulator;
-            let now = self.time;
-            for cb in &self.dpi_end_sim_cbs.clone() {
-                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_END_OF_SIMULATION);
-            }
-            self.dpi_pending_end_sim_fired = true;
-        }
-
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
         // but BEFORE any trace flush. May not contain time-consuming
         // statements (no `#`, `@`, `wait`). We honor that by running each
@@ -48681,8 +48670,8 @@ impl Simulator {
                     }
                     self.finished = true;
                 }
+                break;
             }
-            break;
             // Deadlock: only waiters remain but nothing can ever wake them.
             // A pending phase/drain timer still needs the loop to advance to its
             // deadline, so don't treat that as a deadlock.
@@ -48708,8 +48697,8 @@ impl Simulator {
                     }
                     self.finished = true;
                 }
+                break;
             }
-            break;
 
             // Determine next time: minimum of event queue, clock generators, and delayed updates
             let next_eq_time = self.event_queue.next_time();            let next_clk_time = if has_clocks {
@@ -106529,10 +106518,6 @@ impl Simulator {
             }
             let _ = writeln!(hdr, "$upscope $end");
         }
-        for (child_name, child_node) in &root.children {
-            emit_scope(&mut hdr, child_name, child_node);
-        }
-        let _ = writeln!(hdr, "$upscope $end");
         // ── SystemC co-sim scope ──
         // The bridge's registry signals appear as their own scope, sibling of
         // the SV top, with id codes continuing after the SystemVerilog ones.
@@ -109164,7 +109149,7 @@ impl Simulator {
             let row = &mut b.trace[*i];
             row.fst_id = Some(*fid);
             row.fst_prev = Some(row.mirror.clone());
-            let _ = body.signal_change(*fid, &Self::fst_format_value(&row.mirror));
+            let _ = body.signal_change(*fid, &Self::fst_format_value(&row.mirror, row.width.max(1)));
         }
 
         // Incremental change detection, shared with the VCD and XTrace writers
@@ -109244,7 +109229,7 @@ impl Simulator {
                 };
                 if row.fst_prev.as_ref() != Some(&row.mirror) {
                     row.fst_prev = Some(row.mirror.clone());
-                    changes.push((fid, row.mirror.clone()));
+                    changes.push((fid, row.mirror.clone(), row.width.max(1)));
                 }
             }
         }

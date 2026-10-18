@@ -780,6 +780,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_RSS_TRACE",
         "Memory: print resident/peak RSS at each pipeline and compile phase",
     ),
+    ("XEZIM_RS_STATS", "Print resize/copy statistics for Values"),
+    ("XEZIM_SC_QUANTUM", "SystemC co-simulation: max ticks the SystemC kernel runs ahead per exchange (sc master, default 1000)"),
+    ("XEZIM_SC_SHIM_INC", "Build-time override for the include directory of the bundled SystemC shim sources"),
+    ("XEZIM_SC_SHIM_SRC", "Build-time override for the bundled SystemC shim source path (sc_shim.cc)"),
     (
         "XEZIM_SETTLE_LEVELS",
         "Settle: print levelization depth of the comb graph",
@@ -788,9 +792,6 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_SPLIT_CENSUS",
         "Census: size the block-splitting opportunity (multi-statement comb blocks with disjoint statement read sets)",
     ),
-    ("XEZIM_SC_QUANTUM", "SystemC co-simulation: max ticks the SystemC kernel runs ahead per exchange (sc master, default 1000)"),
-    ("XEZIM_SC_SHIM_INC", "Build-time override for the include directory of the bundled SystemC shim sources"),
-    ("XEZIM_SC_SHIM_SRC", "Build-time override for the bundled SystemC shim source path (sc_shim.cc)"),
     ("XEZIM_STACK_MB", "Main simulation thread stack size in MB"),
     (
         "XEZIM_STALL_LIMIT",
