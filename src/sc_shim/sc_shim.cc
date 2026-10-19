@@ -1,16 +1,21 @@
 // xezim SystemC co-simulation shim.
 //
-// One translation unit serves BOTH integration modes:
+// One translation unit serves BOTH integration modes; the master is inferred,
+// not user-picked:
 //
-//   SV top (--sc-top sv, the default):  xezim is the time master. The user's
-//     SystemC model is compiled together with this file into a model .so that
-//     exports xsc_model_init(); $sc_step / $sc_export_sig / $sc_import_sig
-//     drive it synchronously from the SystemVerilog testbench.
+//   SV top (inferred):  xezim is the time master. The user's SystemC model is
+//     compiled together with this file into a model .so that exports
+//     xsc_model_init(); $sc_step / $sc_export_sig / $sc_import_sig drive it
+//     synchronously from the SystemVerilog testbench.
 //
-//   SC top (--sc-top sc):  SystemC is the master. The user's sc_main() TU is
+//   SC top (inferred):  SystemC is the master. The user's sc_main() TU is
 //     compiled together with this file into a cosim .so exporting
 //     xsc_cosim_main(); xezim runs its own kernel on a worker thread that is
 //     stepped by the spawned "xezim_host" SC thread through the link below.
+//
+// Whether a given build is SV-top or SC-top is decided by the entry-point
+// symbol the user TU defines: a strong sc_main (SystemC owns the run) or a
+// passive xsc_model_build (SystemVerilog owns the run).
 //
 // Build requirements: SystemC 3.x (IEEE 1666-2011), C++17.
 // See docs/systemc-cosim.md for the full protocol description.
@@ -29,6 +34,18 @@
 
 extern "C" int sc_main(int argc, char* argv[]);        // provided by the user TU (SC top)
 extern "C" void xsc_model_build();                     // provided by the user TU (SV top)
+
+// SystemC 3.x links a reference to sc_main into libsystemc itself (the kernel
+// drives elaboration/simulation from it), so the model .so must export it even
+// when the user only supplies xsc_model_build() (SV-top mode). Provide a WEAK
+// no-op so the loader can resolve the symbol; a user TU that defines a strong
+// sc_main (SC-top mode) overrides it at link time.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) int sc_main(int argc, char* argv[]) {
+    (void)argc; (void)argv;
+    return 0;
+}
+#endif
 
 namespace {
 
@@ -58,6 +75,92 @@ std::vector<char> g_exp_dirty;
 int words_for(int width) { return (width + 63) / 64; }
 
 }  // namespace
+
+// Optional 2-state param registry mirrored onto SystemVerilog overrides:
+// (sv_name, value_text). `value_text` is a constant-expression string
+// exactly as it would appear in `-GNAME=VAL` (or an SV `#(.NAME(VAL))`
+// override): `int_param=4`, `lv_param=4'b01xz`, `str_param="Hello"`.
+namespace {
+std::mutex g_param_mu;
+std::vector<std::pair<std::string, std::string>> g_params;
+}  // namespace
+
+namespace xezim {
+
+int param_get_int(const char* name, int fallback, int* found) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    for (const auto& kv : g_params) {
+        if (kv.first == name) {
+            if (found) *found = 1;
+            long long v = fallback;
+            // Accept decimal / 0x / 0b / 0o / sized forms by stripping non-
+            // digits and signs, then base-scanning.
+            const char* p = kv.second.c_str();
+            int base = 10;
+            long long acc = 0; bool neg = false; bool sign_ok = true;
+            // Skip size prefix like 8'h / 32'd — scan the numeric body.
+            const char* body = p;
+            while (*body && *body != '\'' && !(*body >= '0' && *body <= '9') &&
+                   !(*body == '-' || *body == '+'))
+                body++;
+            if (*body == '-') { neg = true; body++; }
+            if (*body == '+') body++;
+            if (body[0] == '0' && (body[1] == 'x' || body[1] == 'X')) { base = 16; body += 2; }
+            else if (body[0] == '0' && (body[1] == 'b' || body[1] == 'B')) { base = 2; body += 2; }
+            else if (body[0] == '0' && (body[1] == 'o' || body[1] == 'O')) { base = 8; body += 2; }
+            else if (body[0] == '\'' && body[1]) {
+                const char* sz = body + 1;
+                if (*sz && (*sz == 'd' || *sz == 'h' || *sz == 'b' || *sz == 'o')) {
+                    base = (*sz == 'd') ? 10 : (*sz == 'h') ? 16 : (*sz == 'o') ? 8 : 2;
+                    body = sz + 1;
+                }
+            }
+            for (const char* q = body; *q; q++) {
+                int dg = -1;
+                if (*q >= '0' && *q <= '9') dg = *q - '0';
+                else if (*q >= 'a' && *q <= 'f') dg = 10 + (*q - 'a');
+                else if (*q >= 'A' && *q <= 'F') dg = 10 + (*q - 'A');
+                if (dg < 0 || dg >= base) break;
+                acc = acc * base + dg;
+            }
+            v = neg ? -acc : acc;
+            (void)sign_ok;
+            return (int)v;
+        }
+    }
+    if (found) *found = 0;
+    return fallback;
+}
+
+double param_get_real(const char* name, double fallback, int* found) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    for (const auto& kv : g_params) {
+        if (kv.first == name) { if (found) *found = 1; return std::strtod(kv.second.c_str(), nullptr); }
+    }
+    if (found) *found = 0;
+    return fallback;
+}
+
+const char* param_get_string(const char* name, const char* fallback, int* found) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    for (const auto& kv : g_params) {
+        if (kv.first == name) {
+            if (found) *found = 1;
+            // Strip optional surrounding double-quotes (SV string literals
+            // come in as "Hello" with the quotes).
+            static thread_local std::string out;
+            out = kv.second;
+            if (out.size() >= 2 && out.front() == '"' && out.back() == '"') {
+                out = out.substr(1, out.size() - 2);
+            }
+            return out.c_str();
+        }
+    }
+    if (found) *found = 0;
+    return fallback;
+}
+
+}  // namespace xezim
 
 namespace xezim {
 namespace detail {
@@ -114,8 +217,9 @@ bool set_resolution_from_tick(double tick_s) {
 
 // ── SV-top link / SV-SC shared rendezvous state ─────────────────────────────
 //
-// Only used by --sc-top sc, but declared unconditionally so both sides of the
-// Rust/C++ boundary can reference the same ops.
+// Only used when the inferred master is SystemC (SC top), but declared
+// unconditionally so both sides of the Rust/C++ boundary can reference the
+// same ops.
 
 std::mutex g_link_mu;
 std::condition_variable g_link_cv;
@@ -150,6 +254,18 @@ void apply_exports() {
 void capture_imports() {
     for (size_t i = 0; i < g_reg.size(); ++i)
         g_reg[i].read(g_imp_stage[i].data(), (int)g_imp_stage[i].size());
+}
+
+// Run zero-time delta cycles while a process triggered by an event exactly at
+// the current time needs to commit its signal writes before the caller reads
+// the registry. A few drain iterations are enough for the usual edge-triggered
+// `sc_out` write; the loop stops as soon as no further activity is pending at
+// the current time so we never advance the clock here.
+void drain_current_deltas() {
+    for (int i = 0; i < 4; ++i) {
+        if (!sc_core::sc_pending_activity_at_current_time()) break;
+        sc_core::sc_start(sc_core::SC_ZERO_TIME, sc_core::SC_RUN_TO_TIME);
+    }
 }
 
 // The SC-side slice step (SC top). Rendezvous protocol per slice:
@@ -215,7 +331,7 @@ void slice_loop() {
         } catch (const std::exception& e) {
             std::fprintf(stderr,
                          "[xezim-sc] slice sc_start failed: %s\n"
-                         "  (with --sc-top sc, sc_main() must call xsc_cosim_run() "
+                         "  (SC-top runs: sc_main() must call xsc_cosim_run() "
                          "instead of sc_start())\n",
                          e.what());
             std::lock_guard<std::mutex> lk(g_link_mu);
@@ -325,8 +441,37 @@ void xsc_step(std::uint64_t ticks) {
         // view of SystemC time stays exact.
         sc_core::sc_start(sc_core::sc_time::from_value((double)ticks),
                           sc_core::SC_RUN_TO_TIME);
+        // Committed-write visibility helper shared with Mode B below.
+        drain_current_deltas();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[xezim-sc] xsc_step failed: %s\n", e.what());
+    }
+}
+
+// Mode B (pure-SystemC leaf inside an SV netlist) exchange: the SC kernel is
+// co-scheduled with SV time, so each exchange must deliver the SV inputs at a
+// time coordinate the SC leaf already occupies. Unlike the SC-top `$sc_step`
+// flow (which applies exports and THEN advances), here we advance first with
+// the previously-applied inputs, then apply the new SV inputs at the endpoint,
+// then drain the delta cycles so an edge-triggered SC output (e.g. a posedge
+// `sync()` writing its `sc_out`) commits and is visible to the caller's import
+// read within the SAME SV time slot — matching the reference simulators, where
+// the SV testbench needs no `$sc_step`.
+void xsc_step_mode_b(std::uint64_t ticks) {
+    try {
+        // 1. Advance SC by exactly `ticks` with the last-applied export values
+        //    (the SC clock stays at its previous SV value, so no spurious edge
+        //    fires at the segment start).  First call elaborates + initializes.
+        sc_core::sc_start(sc_core::sc_time::from_value((double)ticks),
+                          sc_core::SC_RUN_TO_TIME);
+        // 2. Apply the new SV inputs at the endpoint time.  A value change
+        //    here (e.g. clk 0->1) is an event at the current SC time.
+        apply_exports();
+        // 3. Drain deltas so the edge-triggered method runs and commits its
+        //    `sc_out` write within this slot.
+        drain_current_deltas();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[xezim-sc] xsc_step_mode_b failed: %s\n", e.what());
     }
 }
 
@@ -413,6 +558,47 @@ void xsc_sv_set_finished(void) {
 std::uint64_t xsc_sv_cap(void) {
     std::lock_guard<std::mutex> lk(g_link_mu);
     return g_cap;
+}
+
+// ── Module parameter registry (SV → SC) ─────────────────────────────────────
+// The SystemVerilog side feeds a name=value list (the SC module's parametric
+// instantiation `#(.NAME(VAL), ...)`), which pure-SystemC code then reads with
+// `sc_get_int_param` / `sc_get_param` & co. Semantics match the reference
+// simulators: the SC module's generic-parameter list.
+void xsc_set_param_count(int n) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    g_params.clear();
+    g_params.reserve(n > 0 ? (size_t)n : 0);
+}
+
+void xsc_set_param_at(int idx, const char* name, const char* value) {
+    if (!name || !value) return;
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    if (idx < 0) {  // replace-or-append by name
+        for (auto& kv : g_params)
+            if (kv.first == name) { kv.second = value; return; }
+    } else if ((size_t)idx < g_params.size()) {
+        g_params[(size_t)idx] = {name, value};
+        return;
+    }
+    g_params.emplace_back(name, value);
+}
+
+int xsc_param_count(void) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    return (int)g_params.size();
+}
+
+const char* xsc_param_name(int idx) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    if (idx < 0 || (size_t)idx >= g_params.size()) return nullptr;
+    return g_params[(size_t)idx].first.c_str();
+}
+
+const char* xsc_param_value(int idx) {
+    std::lock_guard<std::mutex> lk(g_param_mu);
+    if (idx < 0 || (size_t)idx >= g_params.size()) return nullptr;
+    return g_params[(size_t)idx].second.c_str();
 }
 
 }  // extern "C"
