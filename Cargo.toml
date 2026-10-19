@@ -116,3 +116,13 @@ panic = "abort"
 inherits = "release"
 lto = "thin"
 codegen-units = 1
+
+# Optimize xezim-core (Value bit/slice arithmetic) and sv-parser (lexing/parsing
+# uvm_pkg.sv across UVM integration tests) during `cargo test`, while keeping
+# the xezim crate itself at opt-level = 0 for fast incremental test builds.
+[profile.test.package.xezim-core]
+opt-level = 2
+
+[profile.test.package.sv-parser]
+opt-level = 2
+
