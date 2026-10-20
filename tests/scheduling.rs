@@ -351,6 +351,8 @@ mod pending_negation_393;
 mod or_end_of_sim_compose_420;
 #[path = "scheduling/sampled_preponed_421.rs"]
 mod sampled_preponed_421;
+#[path = "scheduling/assertion_m_scope_419.rs"]
+mod assertion_m_scope_419;
 #[path = "scheduling/followed_vacuity_395.rs"]
 mod followed_vacuity_395;
 
