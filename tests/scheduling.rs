@@ -187,6 +187,8 @@ mod oracle_timing_semantics;
 mod parallel_dispatch_expr_fallback;
 #[path = "scheduling/preprocessor_diagnostic_location.rs"]
 mod preprocessor_diagnostic_location;
+#[path = "scheduling/preprocessor_undefined_macro_invocation_451.rs"]
+mod preprocessor_undefined_macro_invocation_451;
 #[path = "scheduling/preprocessor_github_issues.rs"]
 mod preprocessor_github_issues;
 #[path = "scheduling/procedural_loop_stall.rs"]
