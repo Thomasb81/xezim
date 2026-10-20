@@ -649,6 +649,18 @@ impl Simulator {
         }
     }
 
+    /// Whether one `and`/`or` operand fails at the end of simulation: a
+    /// resolved Pass/Vacuous holds, a resolved Fail already failed, and a
+    /// still-pending operand fails iff its own evaluation would fail once the
+    /// clock stops.
+    fn sva_op_fails(resolved: &Option<SvaOutcome>, node: &SvaNode, st: &SvaState) -> bool {
+        match resolved {
+            Some(SvaOutcome::Fail) => true,
+            Some(_) => false, // Pass / Vacuous
+            None => Self::sva_fails_at_end(node, st),
+        }
+    }
+
     /// Whether a pending property fails at the end of simulation (§16.12.2–3).
     /// A weak sequence holds when the clock stops; property `not` inverts
     /// that result just as it inverts a completed operand's result.
@@ -664,10 +676,16 @@ impl Simulator {
                 cons.iter()
                     .any(|(delay, cs)| *delay == 0 && Self::sva_fails_at_end(cn, cs))
             }
-            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
-            | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
-                (ra.is_none() && Self::sva_fails_at_end(na, a))
-                    || (rb.is_none() && Self::sva_fails_at_end(nb, b))
+            // §16.12.6: `p && q` (And) fails at end when EITHER operand fails;
+            // `p or q` (Or) fails only when BOTH operands fail. An operand
+            // already resolved to Pass/Vacuous can't fail; one already
+            // resolved to Fail already failed; one still pending fails iff
+            // its own evaluation would fail once the clock stops.
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) || Self::sva_op_fails(rb, nb, b)
+            }
+            (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) && Self::sva_op_fails(rb, nb, b)
             }
             _ => false,
         }
