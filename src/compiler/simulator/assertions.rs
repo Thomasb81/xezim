@@ -1421,6 +1421,14 @@ impl Simulator {
         for (e, _) in &var_sels {
             self.sva_cells(e, &mut sampled_ids);
         }
+        // §16.9.3 / §16.5.1: `$sampled(e)` in an action block reads the
+        // Preponed (slot-entry) value of `e`, whether or not the property
+        // reads `e`. Collect the operands of the action blocks' `$sampled`
+        // calls with the body's sampled signals, so `refresh_sva_preponed`
+        // captures their Preponed snapshots like the property's own operands.
+        for action in [&a.action, &a.else_action].into_iter().flatten() {
+            self.sva_collect_action_sampled(action, &mut sampled_ids);
+        }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
         // take the values now, before this slot's nonblocking updates. In
@@ -2034,6 +2042,105 @@ impl Simulator {
                 self.collect_sva_signal_ids(hi, out);
             }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
+            _ => {}
+        }
+    }
+
+    /// Collect the signal ids referenced by the `$sampled(...)` calls inside
+    /// an assertion action block, so their Preponed snapshots are captured
+    /// with the site's other sampled signals (§16.9.3, §16.5.1).
+    pub(super) fn sva_collect_action_sampled(&self, st: &Statement, out: &mut Vec<usize>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    self.sva_collect_action_sampled(s, out);
+                }
+            }
+            SK::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.sva_collect_action_sampled_expr(condition, out);
+                self.sva_collect_action_sampled(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    self.sva_collect_action_sampled(e, out);
+                }
+            }
+            SK::TimingControl { stmt, .. } => self.sva_collect_action_sampled(stmt, out),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => self.sva_collect_action_sampled(body, out),
+            SK::Case { expr, items, .. } => {
+                self.sva_collect_action_sampled_expr(expr, out);
+                for it in items {
+                    self.sva_collect_action_sampled(&it.stmt, out);
+                }
+            }
+            SK::BlockingAssign { rvalue, .. } => {
+                self.sva_collect_action_sampled_expr(rvalue, out)
+            }
+            SK::NonblockingAssign { rvalue, .. } => {
+                self.sva_collect_action_sampled_expr(rvalue, out)
+            }
+            SK::Expr(e) => self.sva_collect_action_sampled_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn sva_collect_action_sampled_expr(&self, e: &Expression, out: &mut Vec<usize>) {
+        match &e.kind {
+            // §16.9.3: `$sampled(e)` — the operand's signals are sampled.
+            ExprKind::SystemCall { name, args } if name == "$sampled" => {
+                for a in args {
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.sva_collect_action_sampled_expr(a, out);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.sva_collect_action_sampled_expr(left, out);
+                self.sva_collect_action_sampled_expr(right, out);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.sva_collect_action_sampled_expr(operand, out)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_collect_action_sampled_expr(condition, out);
+                self.sva_collect_action_sampled_expr(then_expr, out);
+                self.sva_collect_action_sampled_expr(else_expr, out);
+            }
+            ExprKind::Index { expr: base, index } => {
+                self.sva_collect_action_sampled_expr(base, out);
+                self.sva_collect_action_sampled_expr(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                ..
+            } => {
+                self.sva_collect_action_sampled_expr(base, out);
+                self.sva_collect_action_sampled_expr(left, out);
+                self.sva_collect_action_sampled_expr(right, out);
+            }
+            ExprKind::Concatenation(exprs) | ExprKind::Replication { exprs, .. } => {
+                for a in exprs {
+                    self.sva_collect_action_sampled_expr(a, out);
+                }
+            }
             _ => {}
         }
     }

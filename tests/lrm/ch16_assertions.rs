@@ -512,6 +512,22 @@ fn c16_9_3_sampled_value_functions() {
     );
 }
 
+// §16.9.3 / §16.5.1: `$sampled(e)` in an action block samples `e` even when
+// the property body does not read it. `q` is set by an NBA in the same slot
+// the action runs in; the sampled value comes from before that update (issue
+// #468).
+#[test]
+fn c16_9_3_sampled_action_block() {
+    check(
+        "16.9.3_sampled_action_block",
+        include_str!("sv/c16_9_3_sampled_action_block.sv"),
+        "t",
+        Order::Exact,
+        &["T|16.9.3|sampled-action t=5 q=0"],
+        &[],
+    );
+}
+
 // §16.5, §16.9.2, §16.9.5, §16.9.6, §16.9.7, §16.9.8, ...: sequence and property operators
 #[test]
 fn c16_9_sequence_operators() {
