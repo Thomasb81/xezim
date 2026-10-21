@@ -3643,13 +3643,15 @@ impl Simulator {
                         _ => unreachable!(),
                     }
                 }
-                // Logical implication / equivalence (IEEE §11.4.7).
-                if matches!(op, BinaryOp::LogImplies | BinaryOp::LogEquiv) {
+                // Logical implication / equivalence (IEEE §11.4.7). The SVA
+                // `iff` (§16.12.8), `property_expr1 iff property_expr2`, is
+                // logical equivalence too: true iff both hold or both don't.
+                if matches!(op, BinaryOp::LogImplies | BinaryOp::LogEquiv | BinaryOp::Iff) {
                     let l = self.eval_expr_ctx(left, ctx_width);
                     let r = self.eval_expr_ctx(right, ctx_width);
                     return match op {
                         BinaryOp::LogImplies => l.logic_impl(&r),
-                        BinaryOp::LogEquiv => l.logic_equiv(&r),
+                        BinaryOp::LogEquiv | BinaryOp::Iff => l.logic_equiv(&r),
                         _ => unreachable!(),
                     };
                 }

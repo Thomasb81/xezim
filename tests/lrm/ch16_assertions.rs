@@ -55,22 +55,13 @@ fn c16_11_subroutine_on_match() {
 fn c16_12_12_until() {
     // Known gap (§16.12.12): `until` reference `P t=45`, xezim `P t=25`
     // Known gap (§16.12.12): `s_until` reference `P t=45`, xezim `P t=25`
-    // Known gap (§16.12.8): `iff`: xezim prints extra 5 lines
     check(
         "16.12.12_until",
         include_str!("sv/16.12.12_until.sv"),
         "t16_12",
         Order::Exact,
         &["T|iff|F t=15", "T|iff|F t=25", "T|iff|F t=35"],
-        &[
-            "T|until|",
-            "T|s_until|",
-            "T|iff|F t=5",
-            "T|iff|F t=45",
-            "T|iff|F t=55",
-            "T|iff|F t=65",
-            "T|iff|F t=75",
-        ],
+        &["T|until|", "T|s_until|"],
     );
 }
 
