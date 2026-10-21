@@ -518,6 +518,9 @@ impl Simulator {
             match (&l_assoc, &r_assoc) {
                 (Some(d), None) => self.plain_assoc_operand(rvalue).map(|s| (d.clone(), s)),
                 (None, Some(s)) => self.plain_assoc_operand(lvalue).map(|d| (d, s.clone())),
+                (None, None) => self
+                    .plain_assoc_operand(lvalue)
+                    .and_then(|d| Some((d, self.plain_assoc_operand(rvalue)?))),
                 _ => None,
             }
         };
@@ -1851,15 +1854,65 @@ impl Simulator {
         self.eval_expr_ctx(rvalue, w)
     }
 
-    /// Only an operator takes a width from its context; a plain operand
-    /// converts to the same real either way, so only then does an
-    /// assignment need `assign_rhs_ctx`.
+    /// The right-hand side of an assignment the interpreter evaluates apart
+    /// from the blocking path: a nonblocking one (§10.4.2) and an
+    /// intra-assignment event control (§9.4.5). Its operators still take the
+    /// target's width as context (§11.6.1), so `s <= a16 + b16` into an
+    /// 18-bit `s` keeps the carry. Evaluated self-determined, the sum lost
+    /// it whenever the statement ran here instead of as bytecode, for
+    /// example in a `for` loop bounded by `$clog2(...)`.
+    ///
+    /// §11.4.1 has a side-effecting lvalue index (`v[i++ +: 18] = @(e) ...`)
+    /// evaluated once, when the assignment captures its target, so the
+    /// width lookup must not evaluate it (see `effect_free_target_width`).
+    pub(super) fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
+        if !Self::rhs_takes_context(rvalue) {
+            return self.eval_expr(rvalue);
+        }
+        match self.effect_free_target_width(lvalue) {
+            0 => self.eval_expr(rvalue),
+            w => self.eval_assign_rhs(lvalue, rvalue, w),
+        }
+    }
+
+    /// The width of an assignment target, or 0 when finding it would
+    /// evaluate a side-effecting index. Only an indexed part-select of a
+    /// plain base (`v[i++ +: 18]`) has a width that doesn't depend on such an
+    /// index: `infer_lhs_width` reads only its constant width. An element or
+    /// member target (`arr[i++].f`) is sized by reading it, and the
+    /// class-aggregate lookup may evaluate indices, so those give 0 and keep
+    /// the old self-determined evaluation.
+    pub(super) fn effect_free_target_width(&mut self, lvalue: &Expression) -> u32 {
+        if !Self::lvalue_has_incdec_index(lvalue) {
+            return self.infer_lhs_width(lvalue);
+        }
+        match &lvalue.kind {
+            ExprKind::RangeSelect {
+                expr,
+                right,
+                kind: RangeKind::IndexedUp | RangeKind::IndexedDown,
+                ..
+            } if self.no_class_objects()
+                && !Self::lvalue_has_incdec_index(expr)
+                && Self::cond_expr_is_effect_free(right, false) =>
+            {
+                self.infer_lhs_width(lvalue)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Only an operator takes a width from its context (§11.6.1: unary `+`,
+    /// `-` and `~` too); a plain operand converts to the same real either
+    /// way, so only then does an assignment need `assign_rhs_ctx`.
     #[inline]
     pub(super) fn rhs_takes_context(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(x) => Self::rhs_takes_context(x),
             ExprKind::Binary { .. } | ExprKind::Conditional { .. } => true,
-            ExprKind::Unary { op, .. } => matches!(op, UnaryOp::Minus | UnaryOp::BitNot),
+            ExprKind::Unary { op, .. } => {
+                matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+            }
             _ => false,
         }
     }

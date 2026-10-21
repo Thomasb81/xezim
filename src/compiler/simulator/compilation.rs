@@ -1262,6 +1262,19 @@ impl Simulator {
             "build edge and dependency indexes",
             &mut compile_phase_start,
         );
+        // §16.5.1: a sampled-value function's default sampled values are the
+        // values before time 0 — declaration initializers, else type
+        // defaults — so take them before the time-0 settle drives any net or
+        // continuously assigned variable. The procedural watches read theirs
+        // when they register.
+        self.capture_sampled_defaults();
+        // §16.9.3: pre-register sampled-value watches BEFORE the initial
+        // blocks are consumed into scheduled processes, so clock-edge
+        // history accumulates from the first edge.
+        self.register_sampled_watches();
+        if !self.sampled_defaults.is_empty() || !self.sampled_watches.is_empty() {
+            self.mark_deferred_inits();
+        }
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Only seed dirty IDs that have combinational dependents. Large
@@ -1301,6 +1314,7 @@ impl Simulator {
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();
         self.in_pre_process_settle = false;
+        self.time0_settled = true;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
@@ -1351,10 +1365,6 @@ impl Simulator {
         // #7 lazy-prefix path: also drain `pending_initial` one-at-a-time.
         // A pending block is materialized just before scheduling and dropped
         // after, so peak memory is at most one materialized InitialBlock.
-        // §16.9.3: pre-register sampled-value watches BEFORE the initial
-        // blocks are consumed into scheduled processes, so clock-edge
-        // history accumulates from the first edge.
-        self.register_sampled_watches();
         // §6.18: reject assigning a non-class value (an enum member or integer
         // literal) to a class-handle variable. The reference elaborator flags
         // this at compile time; surface a compile error so simulation never
@@ -1484,6 +1494,13 @@ impl Simulator {
         let saved_scope = self.current_scope.clone();
         let saved_hint = self.name_resolve_hint.borrow_mut().take();
         let saved_activation = self.activation_scope.borrow_mut().take();
+        // §21.2.1.7: a declarative assertion is not a comb/edge block, so the
+        // scope the time-0 settle last recorded must not leak into its
+        // registration (and so into the site's `%m` chain / action), as a
+        // process run clears it (see `run_process`).
+        let saved_block_scope = std::mem::take(&mut self.m_block_scope);
+        let saved_block_scope_id = std::mem::replace(&mut self.m_block_scope_id, u32::MAX);
+        let saved_block_active = std::mem::replace(&mut self.m_block_active, false);
         for ib in initial_blocks
             .extract_if(.., |ib| declarative(&ib.stmt))
             .chain(early.extract_if(.., |ib| declarative(&ib.stmt)))
@@ -1506,6 +1523,9 @@ impl Simulator {
         self.current_scope = saved_scope;
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         *self.activation_scope.borrow_mut() = saved_activation;
+        self.m_block_scope = saved_block_scope;
+        self.m_block_scope_id = saved_block_scope_id;
+        self.m_block_active = saved_block_active;
         for ib in early
             .into_iter()
             .chain(pending_initial.into_iter().map(&mut rename_pending))

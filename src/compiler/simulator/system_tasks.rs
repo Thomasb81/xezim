@@ -312,6 +312,10 @@ impl Simulator {
             }
             return;
         }
+        if name == SAMPLED_DEFAULT_MARKER {
+            self.record_sampled_defaults(args);
+            return;
+        }
         // §21.7: every waveform task is inert without `--wave`, which is what
         // makes the dump opt-in at model-compile time rather than triggered by
         // whatever the source happens to call.

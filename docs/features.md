@@ -20,6 +20,21 @@ per release are in the [release notes](../NOTES.md).
   matures at the end of the time slot; a report is dropped if its process
   resumes first, and one still pending at `$finish` prints a note instead of
   running its action.
+* **Sampled values in concurrent assertions** (§16.5.1) — a property reads
+  every variable as sampled in the Preponed region, elements of unpacked
+  arrays included: multidimensional arrays, arrays of structs, arrays in
+  interfaces and array ports. A select samples only the element it names; one
+  whose index reads variables finds that element from the index's sampled
+  value in each time slot, so a large memory is never copied. An index known
+  only when the property is evaluated (a sequence local variable, a
+  procedure's loop variable, a sampled-value function or a call) samples the
+  whole array. In time slot 0 a sampled value is the default sampled value:
+  a variable's declaration initializer, else its type's default, so an
+  attempt at a time-0 clock edge does not see what the slot's continuous
+  assignments and processes write. The `disable iff` condition reads current
+  values (§16.12).
+  Dynamic-array and queue elements past index 63 and associative-array
+  entries are still read unsampled.
 * **Assertion control** (§20.11, §20.12) — `$asserton`, `$assertoff`,
   `$assertkill`, the pass/fail/vacuous action-control tasks and
   `$assertcontrol` with Lock/Unlock, the assertion-type and directive-type
@@ -97,7 +112,9 @@ See the [coverage guide](coverage-guide.md).
   a VPI tool can walk. See the [DPI and VPI guide](dpi-guide.md).
 * **cocotb** — Python testbenches run against xezim through a runner backend
   (`contrib/cocotb/xezim_runner.py`) on top of the VPI layer, including timed
-  and synchronous callbacks.
+  and synchronous callbacks. `get_runner("xezim")` takes the options of
+  cocotb's other runners: `parameters` become `-g` overrides, and since xezim
+  has no compile step, `build_args` apply when `test()` runs.
 
 ## Performance features
 

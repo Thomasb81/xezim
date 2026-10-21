@@ -523,6 +523,9 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 /// control (`@prop` on a non-event class property) was armed. Never
 /// user-visible.
 const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
+/// Ends a deferred declaration initializer: `(<target>, ...)` records the
+/// values it gave as their default sampled values (see `sampled_defaults`).
+const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
@@ -1595,7 +1598,7 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB019";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB020";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -3492,9 +3495,18 @@ struct ObservedProbe {
     this_handle: Option<usize>,
 }
 
+/// §9.4.2: one term in an assertion clocking event, including its last
+/// value. A simple signal keeps its resolved name for the common fast path.
+#[derive(Debug, Clone)]
+struct SvaClockEvent {
+    event: EventExpr,
+    signal: Option<String>,
+    previous: Value,
+}
+
 /// LRM §16.5 SVA clocked property site. Registered once when an
 /// `assert property (@clk body)` statement first executes; thereafter
-/// edge-detect on `clock_signal` drives per-cycle evaluation of `body`.
+/// any term in its clocking event drives per-cycle evaluation of `body`.
 /// Every clock tick starts one attempt of `node`; `attempts` holds the ones
 /// still in flight (multi-cycle sequences, deferred consequents).
 #[derive(Debug, Clone)]
@@ -3514,13 +3526,13 @@ struct SvaClockedSite {
     /// §16.14.3 `cover sequence`: an attempt counts every match of the
     /// sequence and lives on while it can still match.
     all_matches: bool,
-    /// Resolved signal name for the clock; we re-resolve to value
-    /// each tick rather than caching an id (small site count).
+    /// The first term's simple signal, if any, for sampled calls using the
+    /// single-signal history path. `events` drives assertion evaluation.
     clock_signal: String,
-    /// Clock edge: 0 posedge, 1 negedge, 2 any edge (§16.5).
+    /// The first term's edge: 0 posedge, 1 negedge, 2 any change.
     edge: u8,
-    /// `@(posedge clk iff g)`: the tick counts only while `g` holds.
-    iff: Option<Expression>,
+    /// §16.5: a tick is the union of the per-term edge/iff events.
+    events: Vec<SvaClockEvent>,
     /// The bare signal names `$past` reads in the body (sorted, unique), found
     /// once at registration: the walk ran on every clock fire.
     past_names: Vec<String>,
@@ -3530,9 +3542,9 @@ struct SvaClockedSite {
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
     disable: Option<Expression>,
-    /// LSB of the most recent clock value: 0, 1, X (2), or Z (3).
-    /// Declarative sites start with the value before Active processes run.
-    prev_clock: u8,
+    /// The clock event happened and the attempts it starts have not been
+    /// evaluated yet (`sva_note_edges`).
+    fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
@@ -3560,6 +3572,13 @@ struct SvaClockedSite {
     /// and swapped in while this site's predicate is evaluated, so the
     /// property samples pre-edge values through the sampled-value overlay.
     sampled_ids: Vec<usize>,
+    /// §16.5.1: the selects of unpacked arrays in `body` whose indices read
+    /// signals (`a[k]`), each with its array's (first cell id, low index,
+    /// high index) when it selects an element of a 1-D array. The cells they
+    /// name are renamed in each Preponed region and kept in `sampled_ids`
+    /// after its first `fixed` entries.
+    sels: Vec<(Expression, Option<(usize, i64, i64)>)>,
+    fixed: usize,
     /// §16.10: the initial values of the attempt's local variable slots
     /// (empty when the property has none).
     lv_init: SvaEnv,
@@ -4528,6 +4547,10 @@ struct BlockScopeSave {
     /// `(depth, len)` of `static_local_syncs` at entry when the block
     /// declares a `static` variable.
     static_mark: Option<(usize, usize)>,
+    /// The subroutine's `static` locals that a non-static block variable of
+    /// the same name hides, as `static_local_syncs` depth and the
+    /// `(name, key)` entries taken out of that frame until the block ends.
+    static_hidden: Option<(usize, Vec<(String, String)>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,
@@ -4553,6 +4576,8 @@ struct TaskCleanup {
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
+    /// §25.9: flat binding slots shadowed by this task's formals.
+    saved_vif_formals: Vec<(String, Option<Value>)>,
     assoc_params: Vec<(String, String, bool)>,
     array_params: Vec<String>,
     /// `(formal, actual, lo, hi)` for an `output`/`inout`/`ref` ARRAY formal:
@@ -5230,6 +5255,16 @@ impl PackedMem {
         true
     }
 
+    /// Land `(v, x)` in the cell even if it is forced, leaving the force as
+    /// it is: for a swap undone before anything else reads the cell (a
+    /// concurrent assertion's sampled values, §16.5.1).
+    fn put_raw(&mut self, id: usize, v: u64, x: u64) {
+        if let Some((seg, at)) = self.locate(id) {
+            let seg = *seg;
+            self.store_at(&seg, at, v, x);
+        }
+    }
+
     /// §10.6.2 `force`: land `(v, x)` in the cell even if it is already
     /// forced, and pin it there until `release_forced`.
     pub(crate) fn force_raw(&mut self, id: usize, v: u64, x: u64) -> bool {
@@ -5791,8 +5826,9 @@ enum PackedHop {
     /// A packed dimension declared `[l:r]` of elements `ew` bits wide.
     /// §7.4.1: the left bound labels the most significant element.
     Dim { l: i64, r: i64, ew: u32 },
-    /// A member of a packed struct or union, `off` bits above its LSB.
-    Field(u32),
+    /// A member of a packed struct or union, `off` bits above its LSB and
+    /// `w` bits wide.
+    Field { off: u32, w: u32 },
 }
 
 /// The §7.8 collection kind of an unpacked-struct member whose declarator
@@ -6441,7 +6477,7 @@ pub struct Simulator {
     class_prop_dim_cache: std::cell::RefCell<HashMap<(String, String), Option<(i64, i64)>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
-    /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
+    /// expr:SvaClocked} executes. Each site's saved event values let us
     /// edge-detect the clock signal each loop iteration; `pending`
     /// queues consequents deferred by `|=>` or `##N`.
     sva_sites: Vec<SvaClockedSite>,
@@ -6474,6 +6510,14 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
+    /// The time slot `sva_preponed` was captured for. The Preponed region
+    /// runs once per slot (§4.4.2.1), so the later deltas of a slot (a VPI
+    /// write from cbReadWriteSynch reopening the Active region) keep it.
+    sva_preponed_slot: Option<u64>,
+    /// A site's clock event is recorded (`fired`) and not evaluated yet.
+    sva_owed: bool,
+    /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
+    sva_post_nba_busy: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -6499,6 +6543,10 @@ pub struct Simulator {
     /// Buffer-collapse exclusions (override-target leaves, procedural write
     /// names), collected once while the process bodies are still present.
     buf_collapse_write_sets: Option<(HashSet<String>, HashSet<String>)>,
+    /// Last source value of constant packed-memory element connections.
+    /// Unresolved dependency polling must not overwrite a VPI deposit when
+    /// the connection's source has not changed (§23.3.3.3, §38.34).
+    packed_array_copy_values: HashMap<(usize, usize), Value>,
     /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
     /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
@@ -8272,6 +8320,10 @@ pub struct Simulator {
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
     dump_dirty_active: bool,
+    /// A dump writer or toggle coverage is open under a forced full scan
+    /// (`XEZIM_VCD_FULL=1` / `XEZIM_DUMP_FULL=1`), so `dump_dirty_active` is
+    /// off with something still to flush.
+    dump_full: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -9280,6 +9332,14 @@ pub struct Simulator {
     /// the operand sampled (preponed) at each matching clock edge. hist[0]
     /// is the sample at the most recent edge, hist[1] one edge earlier, …
     sampled_watches: Vec<SampledWatch>,
+    /// §16.5.1 default sampled values by signal id: what each signal a
+    /// concurrent assertion can name held before time 0 (its declaration
+    /// initializer, else its type's default). §16.9.3 reads it for a clock
+    /// tick before the first one. Filled by `capture_sampled_defaults`.
+    sampled_defaults: HashMap<usize, Value>,
+    /// The pre-process time-0 settle has run: a value read now is no longer
+    /// a default sampled value.
+    time0_settled: bool,
     /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
     /// time-0 settle (compile) happens before any `always @(ev)` process has
     /// registered its waiter — the trigger would be lost. Queue them and
@@ -9308,8 +9368,11 @@ pub struct Simulator {
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
 struct SampledWatch {
+    /// A simple clock id, or usize::MAX when `clock_events` supplies it.
     clk_id: usize,
     edge: EdgeKind,
+    /// A union, guarded, or expression-valued implicit assertion clock.
+    clock_events: Vec<SvaClockEvent>,
     /// Simple-signal operand: sampled PREPONED via the prev-value snapshot.
     sig_id: Option<usize>,
     /// General operand, evaluated using the slot-entry snapshot.

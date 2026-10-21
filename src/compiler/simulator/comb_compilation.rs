@@ -196,6 +196,7 @@ impl Simulator {
     pub(super) fn build_comb_entries(&mut self) {
         // Entry indices are about to change — drop stale two-state bodies.
         self.ts_comb.clear();
+        self.packed_array_copy_values.clear();
         if self.try_load_prepared_comb_cache() {
             return;
         }
@@ -397,6 +398,23 @@ impl Simulator {
                 };
             if ident_copy_ids.is_some_and(|(dst_id, src_id)| dst_id == src_id) {
                 continue;
+            }
+            // So is an element connect of an unpacked-array port collapsed
+            // onto its actual (see `collapse_array_port_nets`).
+            if ca.rhs_parent_scoped
+                && explicit_delay == 0
+                && cov_counter.is_none()
+                && matches!(ca.lhs.kind, ExprKind::Index { .. })
+            {
+                let cell = |e: &Expression| {
+                    let (base, idx) = Self::const_elem_ref(e, &self.module)?;
+                    self.elem_cell(&base, &idx)
+                };
+                if let (Some(dst), Some(src)) = (cell(&ca.lhs), cell(&ca.rhs)) {
+                    if dst == src {
+                        continue;
+                    }
+                }
             }
             reads.clear();
             writes.clear();
@@ -609,7 +627,14 @@ impl Simulator {
                     }
                 }
             }
-            let item = if explicit_delay > 0 {
+            // Packed cells have no per-element dependency epochs. Retain
+            // these port copies as AST entries so their evaluator can poll
+            // the source without redriving an unchanged value (§38.34).
+            let packed_array_copy = ca.rhs_parent_scoped
+                && Self::const_elem_ref(&ca.rhs, &self.module)
+                    .and_then(|(base, idx)| self.elem_cell(&base, &idx))
+                    .is_some_and(is_packed_id);
+            let item = if explicit_delay > 0 || packed_array_copy {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),

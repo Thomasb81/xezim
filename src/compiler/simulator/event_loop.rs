@@ -1312,6 +1312,14 @@ impl Simulator {
         }
     }
 
+    // Kept out of line: inlined into the event loop, it pushed the loop's
+    // other callees out of line, which cost instructions on designs without
+    // assertions.
+    // Out of line. Once the sampled array cells made the assertion code it
+    // used to inline longer, it was inlined into `event_loop_singlethread`
+    // instead, which cost a design without assertions 1.1% more
+    // instructions.
+    #[inline(never)]
     pub(super) fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -1336,6 +1344,14 @@ impl Simulator {
         // §14.4: #1step samples precede every callback/active-region write
         // at this time, and remain fixed across this slot's later deltas.
         self.refresh_clocking_preponed();
+        // LRM §16.5.1: the same holds for the Preponed samples of every
+        // SVA-referenced signal: taken before the slot's Pre-Active VPI
+        // callbacks (cbAtStartOfSimTime, cbAfterDelay; §4.4.3.2) and its
+        // active/NBA regions, and kept by the slot's later deltas, so a
+        // clocked assertion firing later in the slot (a clock written from
+        // cbReadWriteSynch, or one a later delta raises) samples pre-edge
+        // values rather than values written earlier in the slot.
+        self.refresh_sva_preponed();
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -1357,11 +1373,6 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.fire_timing_timers();
-        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
-        // SVA-referenced signal BEFORE the active/NBA regions run, so a
-        // clocked assertion firing later this slot (tick_sva_sites) samples
-        // pre-edge values rather than same-edge NBA updates.
-        self.refresh_sva_preponed();
 
         if self.sched_trace_on() {
             eprintln!("[sched] t={} +--- tick ---", self.time);
@@ -1596,7 +1607,9 @@ impl Simulator {
         }
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        self.tick_sva_sites();
+        // A cbNBASynch or cbReadWriteSynch due at a clock edge runs first
+        // (`sva_post_nba`).
+        self.sva_observed();
         if self.finished {
             return;
         }
@@ -1706,8 +1719,10 @@ impl Simulator {
         self.loop_iters += 1;
     }
 
-    pub(super) fn event_loop(&mut self) {
-        self.event_loop_singlethread();
+    /// `start`: a `cbStartOfSimulation` routine wrote a value, so the time-0
+    /// slot runs even with nothing else due in it.
+    pub(super) fn event_loop(&mut self, start: bool) {
+        self.event_loop_singlethread(start);
     }
 
     /// Ask the event loop to stop at the next slot boundary and finalize.
@@ -1749,7 +1764,7 @@ impl Simulator {
         self.finished = true;
     }
 
-    pub(super) fn event_loop_singlethread(&mut self) {
+    pub(super) fn event_loop_singlethread(&mut self, mut start: bool) {
         Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
         // Realtime twin for the human-facing report (see crate::WallTimer).
@@ -1913,6 +1928,13 @@ impl Simulator {
                 self.clock_generators.len()
             );
         }
+        // §38.36.3: a value a VPI client writes before time 0 (from
+        // cbStartOfSimulation, where cocotb starts its first test, so its
+        // `Immediate` writes there) is processed in the time-0 slot, like one
+        // written at time 0. With nothing else due at time 0 the loop used to
+        // skip that slot, so the combinational logic read the old value until
+        // the next one and toggle coverage never saw the written value as a
+        // baseline. `start` holds the loop at time 0 until that slot has run.
         while !self.finished && iters < max_iters {
             iters += 1;
             // ── SystemC co-sim rendezvous (SC top) ──────────────────────────
@@ -2161,6 +2183,7 @@ impl Simulator {
                 // without this the run ends at time 0 and every `Timer`
                 // reports as never set up.
                 && !self.vpi_timed_future()
+                && !start
             {
                 // The slot still ends: its cbAtEndOfSimTime/cbReadOnlySynch
                 // run, and may schedule more.
@@ -2189,6 +2212,7 @@ impl Simulator {
                 && self.delayed_nba.is_empty()
                 && self.delayed_nba_queue.is_empty()
                 && !self.vpi_timed_future()
+                && !start
             {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
@@ -2243,6 +2267,7 @@ impl Simulator {
                     u64::MAX
                 }
             });
+            let next_time = if start { self.time } else { next_time };
             // SystemC master cap (SC top): the SV kernel may never run past
             // the time the SystemC side has rendezvoused to.
             let mut next_time = next_time;
@@ -2289,6 +2314,7 @@ impl Simulator {
                 self.sc_force_same_time_pass = false;
             }
             if next_time > self.time {
+                self.dump_slot_end();
                 self.time = next_time;
                 publish_sim_time(next_time);
                 // Mode B: a pure-SystemC leaf is embedded in the netlist and
@@ -2362,6 +2388,7 @@ impl Simulator {
             // catches NBA feedback loops.)
             let cond_prog_before = self.cond_progress;
             self.run_one_tick(&mut accum, cascade_limit, iters, trace_loop);
+            start = false;
             if self.cond_progress != cond_prog_before {
                 self.stall_iters = 0;
             }
@@ -2399,6 +2426,12 @@ impl Simulator {
                     break;
                 }
             }
+        }
+        // The last slot ends too, unless `$finish` ended it: §20.2 stops the
+        // run inside that slot, and toggle coverage counts nothing written
+        // there, as before.
+        if !self.finished {
+            self.dump_slot_end();
         }
         if verify_inline_bits && !self.signal_inline_bits.is_empty() {
             let mismatches = self.verify_inline_bits_invariant(iters);

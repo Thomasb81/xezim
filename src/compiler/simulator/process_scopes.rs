@@ -1274,6 +1274,37 @@ impl Simulator {
             pid_mark: self.next_pid,
             ..Default::default()
         };
+        // §6.21: a block variable that is not `static` hides the
+        // subroutine's same-named static until the block ends, so its reads
+        // and writes must not reach the static's shared cell.
+        let depth = self.static_local_syncs.len();
+        if !self.static_local_names.is_empty()
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            for s in stmts {
+                if let StatementKind::VarDecl {
+                    lifetime,
+                    declarators,
+                    ..
+                } = &s.kind
+                    && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                {
+                    for d in declarators {
+                        let nm = &d.name.name;
+                        if !self.static_local_names.contains(nm) {
+                            continue;
+                        }
+                        if let Some(i) = syncs.iter().position(|(n, _)| n == nm) {
+                            let hidden = syncs.remove(i);
+                            sv.static_hidden
+                                .get_or_insert_with(|| (depth, Vec::new()))
+                                .1
+                                .push(hidden);
+                        }
+                    }
+                }
+            }
+        }
         for s in stmts {
             let StatementKind::VarDecl {
                 data_type,
@@ -1366,6 +1397,13 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // The statics the block's variables hid are visible again.
+        if let Some((depth, hidden)) = sv.static_hidden.take()
+            && self.static_local_syncs.len() == depth
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            syncs.extend(hidden);
         }
         let forked = self.next_pid != sv.pid_mark;
         for s in stmts {

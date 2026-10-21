@@ -689,6 +689,11 @@ are not listed: their toggles are the testbench's.
   a waveform dump sees it: a signal that goes 0, 1, 0 within one time slot, even
   across delta cycles, does not toggle. The first comparison is with the value
   the signal starts with.
+- Values a VPI client writes are sampled the same way, at the end of the time
+  slot they are written in. One written at time 0 or before it (cocotb writes
+  its first values from `cbStartOfSimulation` and that slot's
+  `cbReadWriteSynch`) is the signal's time-0 value, the baseline its first
+  toggle is counted from.
 - Tracked: every net and variable of an integral type declared in a module or
   interface instance: `logic`, `bit` and `reg` vectors, nets, `int`, `integer`,
   `byte`, `shortint`, `longint`, enums and packed structs (both as plain bit
@@ -708,6 +713,11 @@ methods of a class and the tasks and functions of a package belong to a scope
 named after the package (kind `package`); a class declared outside any package
 or module belongs to `$unit` (kind `unit`), and one declared inside a module to a
 scope named after the module (kind `module`), shared by all of its instances.
+
+The signals declared in a generate block are listed in its instance under their
+names below the block (`u_r[0].r`, `u_if.s`). The names of generate blocks and
+instances, instance arrays included, are scopes, not signals, and have no
+toggle bins.
 
 #### Compared with other simulators
 

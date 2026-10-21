@@ -2605,6 +2605,150 @@ impl Simulator {
             .map(|(_, key)| key.clone())
     }
 
+    /// §6.21/§11.5.1: the `static` local of the current subroutine that a
+    /// select or member write changes in place, and the key of its shared
+    /// cell: `a` in `a[i]`, `a[7:0]`, `a[i*8 +: 8]`, `a.f` or `a.f[1:0]`.
+    /// None for a write to the whole
+    /// variable, which reaches its shared cell by itself, and for any other
+    /// target, including a variable named like another subroutine's static
+    /// or a block variable that hides one.
+    pub(super) fn static_select_target<'a>(
+        &self,
+        lhs: &'a Expression,
+    ) -> Option<(&'a str, String)> {
+        let mut e = lhs;
+        let mut sel = false;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => {
+                    e = expr;
+                    sel = true;
+                }
+                ExprKind::Paren(x) => e = x,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let seg = h.path.first()?;
+        if h.root.is_some() || !(sel || h.path.len() > 1 || !seg.selects.is_empty()) {
+            return None;
+        }
+        let n = seg.name.name.as_str();
+        if !n
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| self.static_local_first[b as usize])
+        {
+            return None;
+        }
+        Some((n, self.packed_local_static_key(n)?))
+    }
+
+    /// Are the indices of the select target `e` literals and variable reads
+    /// alone, so that evaluating them cannot write a variable?
+    pub(super) fn select_indices_plain(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                Self::init_is_plain(index) && Self::select_indices_plain(expr)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::init_is_plain(left)
+                    && Self::init_is_plain(right)
+                    && Self::select_indices_plain(expr)
+            }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                Self::select_indices_plain(expr)
+            }
+            _ => Self::init_is_plain(e),
+        }
+    }
+
+    /// The select target `e` with each index that is not plain (see
+    /// `select_indices_plain`) evaluated once, in order, and replaced by its
+    /// value (§11.4.1). An index that is x/z or does not fit in 64 bits
+    /// selects nothing in a vector (§11.5.1): it sets `bad`, for the caller
+    /// to discard the write, and the indices after it still run.
+    pub(super) fn freeze_select_indices(&mut self, e: &Expression, bad: &mut bool) -> Expression {
+        let index = |sim: &mut Self, x: &Expression, bad: &mut bool| -> Box<Expression> {
+            if Self::init_is_plain(x) {
+                return Box::new(x.clone());
+            }
+            let v = sim.eval_expr(x);
+            let Some(n) = v.to_i64().filter(|_| !v.has_xz()) else {
+                *bad = true;
+                return Box::new(x.clone());
+            };
+            Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: n.to_string(),
+                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                }),
+                x.span,
+            ))
+        };
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index: i } => ExprKind::Index {
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                index: index(self, i, bad),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                kind: *kind,
+                left: index(self, left, bad),
+                right: index(self, right, bad),
+            },
+            ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                member: member.clone(),
+            },
+            ExprKind::Paren(x) => return self.freeze_select_indices(x, bad),
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
+    }
+
+    /// §6.21: copy the `static` local `name` of the current subroutine
+    /// between its frame copy and its live shared cell `key`: into the cell after
+    /// a write in place (`store`), out of it before one (an NBA or another
+    /// activation may have written the cell since the copy was taken). A
+    /// fallback frame's copy comes from a compiled method's register, which
+    /// is newer than the cell, so it is never overwritten.
+    pub(super) fn static_cell_sync(&mut self, name: &str, key: &str, store: bool) {
+        let depth = self.local_stack.len();
+        if !store && depth > 0 && self.fb_frame_depths.last() == Some(&(depth - 1)) {
+            return;
+        }
+        let Some(copy) = self.local_stack.last_mut().and_then(|f| f.get_mut(name)) else {
+            return;
+        };
+        if !store {
+            if let Some(v) = self.static_local_vars.get(key) {
+                *copy = v.clone();
+            }
+            return;
+        }
+        match self.static_local_vars.get_mut(key) {
+            Some(v) => *v = copy.clone(),
+            None => {
+                self.static_local_vars.insert(key.to_string(), copy.clone());
+            }
+        }
+    }
+
     /// A `static_local_syncs` frame name: a pooled buffer holding `name`.
     pub(super) fn sync_frame_name(&mut self, name: &str) -> String {
         let mut s = self.sync_name_pool.pop().unwrap_or_default();

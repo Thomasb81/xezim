@@ -706,6 +706,7 @@ impl Simulator {
                         cd.assoc_properties.insert(pname, is_string_key);
                     }
                     Some(UD::Queue { max_size, .. }) => {
+                        cd.queue_property_names.insert(pname.clone());
                         let cap = max_size
                             .as_ref()
                             .and_then(|e| {
@@ -1726,6 +1727,7 @@ impl Simulator {
         Self::classify_typedef_collection_properties(&mut module);
         let contested_pkg_vars = Self::split_contested_package_vars(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
+        Self::fold_named_sva_members(&mut module);
         // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
         // It doubles as the queue's change proxy in the comb dependency graph:
         // sensitivity registration resolves it to an id, and every mutation
@@ -3749,12 +3751,16 @@ impl Simulator {
             sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
+            sva_preponed_slot: None,
+            sva_owed: false,
+            sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_tick_cache: Vec::new(),
             buf_collapse_write_sets: None,
+            packed_array_copy_values: HashMap::default(),
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),
@@ -4263,6 +4269,7 @@ impl Simulator {
             vcd_id_to_trace: Vec::new(),
             vcd_event_indices: Vec::new(),
             dump_dirty_active: false,
+            dump_full: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
@@ -4626,6 +4633,8 @@ impl Simulator {
             has_modclass: std::cell::Cell::new(None),
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
+            sampled_defaults: HashMap::default(),
+            time0_settled: false,
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),

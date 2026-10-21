@@ -25,6 +25,181 @@ impl Simulator {
         }
     }
 
+    /// §16.5.1: the operands of a named property or sequence are sampled like
+    /// those of an assertion written inline. The parser spells `u.st` as a
+    /// member access, which the elaborator folds into a hierarchical name in
+    /// the top-level process bodies and in every declaration of an inlined
+    /// instance, but not in a top-level or package declaration. Unfolded, a
+    /// reference rooted at the top module (`t.u.st`) is not among the signals
+    /// a concurrent assertion samples, so it read the value the clock edge's
+    /// nonblocking assignments had just written, and a hierarchical clock
+    /// (`@(posedge u.clk)`) named no signal, so the property never ticked.
+    /// Fold those bodies the same way. A body without a member
+    /// access is left alone: rebuilding it changes nothing but where it lives
+    /// in memory, which cost 0.6% more instructions on a design with 288
+    /// named properties.
+    pub(super) fn fold_named_sva_members(module: &mut ElaboratedModule) {
+        if !module.property_decls.values().any(Self::has_member_access) {
+            return;
+        }
+        // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
+        // elaborator's pass over the process bodies does.
+        let unit: std::collections::HashSet<String> = module
+            .signals
+            .keys()
+            .filter(|k| k.starts_with("$unit::"))
+            .cloned()
+            .collect();
+        for body in module.property_decls.values_mut() {
+            if Self::has_member_access(body) {
+                *body = super::elaborate::rewrite_expr(
+                    body,
+                    "",
+                    &HashMap::default(),
+                    &unit,
+                    &HashMap::default(),
+                );
+            }
+        }
+    }
+
+    /// Does `e` hold a member access (`u.st`), clocked bodies included?
+    pub(super) fn has_member_access(e: &Expression) -> bool {
+        let mut hit = false;
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::MemberAccess { .. } => hit = true,
+            ExprKind::SvaClocked { events, body } => {
+                hit |= Self::has_member_access(body)
+                    || events.iter().any(|ev| {
+                        Self::has_member_access(&ev.expr)
+                            || ev.iff.as_ref().is_some_and(Self::has_member_access)
+                    });
+            }
+            ExprKind::NamedArg { expr, .. } => {
+                hit |= expr.as_deref().is_some_and(Self::has_member_access)
+            }
+            _ => {}
+        });
+        hit
+    }
+
+    /// §16.5.1: a reference into a generate block or an instance-array
+    /// element (`blk[1].sig`, `blk[1].mem[2]`) parses as a member access over
+    /// a select, which the elaborator leaves alone even in a process body.
+    /// Unfolded, the assertion neither sampled it nor kept a `$past` history
+    /// of it. Fold each one with constant selects that names a signal or an
+    /// unpacked array into the flat name the scope's own code uses
+    /// (`blk[1].sig`).
+    pub(super) fn sva_fold_scopes(&self, e: &mut Expression) {
+        if matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            if let Some(name) = self.sva_scope_name(e) {
+                let span = e.span;
+                let seg = crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name, span },
+                    selects: Vec::new(),
+                };
+                *e = Self::hier_ident_expr(vec![seg], span);
+                return;
+            }
+        }
+        let mut sub = |x: &mut Expression| self.sva_fold_scopes(x);
+        match &mut e.kind {
+            ExprKind::Unary { operand: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => sub(x),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            }
+            | ExprKind::Range(left, right) => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition: a,
+                then_expr: b,
+                else_expr: c,
+            }
+            | ExprKind::RangeSelect {
+                expr: a,
+                left: b,
+                right: c,
+                ..
+            } => {
+                sub(a);
+                sub(b);
+                sub(c);
+            }
+            ExprKind::Concatenation(xs)
+            | ExprKind::SystemCall { args: xs, .. }
+            | ExprKind::Call { args: xs, .. } => xs.iter_mut().for_each(&mut sub),
+            ExprKind::Replication {
+                count: x,
+                exprs: xs,
+            }
+            | ExprKind::Inside {
+                expr: x,
+                ranges: xs,
+            } => {
+                sub(x);
+                xs.iter_mut().for_each(&mut sub);
+            }
+            _ => {}
+        }
+    }
+
+    /// The storage `blk[1].sig` names (see `sva_fold_scopes`): `None` unless
+    /// the chain has a select, every select is a constant (a generate-block
+    /// or instance-array index fixed at elaboration), and it names a signal
+    /// or an unpacked array. A variable index (`a[i].f`) is evaluated at
+    /// every tick, so folding it would freeze the element it picked.
+    pub(super) fn sva_scope_name(&self, e: &Expression) -> Option<String> {
+        let chain = Self::member_chain_as_hier_ident(e)?;
+        let ExprKind::Ident(h) = &chain.kind else {
+            return None;
+        };
+        let mut sels = h.path.iter().flat_map(|s| &s.selects).peekable();
+        if sels.peek().is_none()
+            || !sels.all(|x| super::elaborate::const_eval_i64_with_params(x, None).is_some())
+        {
+            return None;
+        }
+        let flat = self.member_chain_ident(e)?;
+        let ExprKind::Ident(h) = &flat.kind else {
+            return None;
+        };
+        let path = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // §23.8: the name is looked up in the assertion's scope, then in each
+        // enclosing one (`cg[1].y` in instance `c` is `c.cg[1].y`).
+        let scope = self.active_instance_scope();
+        let mut up = scope.as_str();
+        loop {
+            let name = match up {
+                "" => path.clone(),
+                _ => format!("{up}.{path}"),
+            };
+            if self.signal_name_to_id.contains_key(name.as_str())
+                || self.array_first_id.contains_key(name.as_str())
+                || self.module.arrays.contains_key(&name)
+                || self.module.arrays_2d.contains_key(&name)
+                || self.module.arrays_nd.contains_key(&name)
+            {
+                return Some(name);
+            }
+            if up.is_empty() {
+                return None;
+            }
+            up = up.rsplit_once('.').map_or("", |(p, _)| p);
+        }
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -474,6 +649,18 @@ impl Simulator {
         }
     }
 
+    /// Whether one `and`/`or` operand fails at the end of simulation: a
+    /// resolved Pass/Vacuous holds, a resolved Fail already failed, and a
+    /// still-pending operand fails iff its own evaluation would fail once the
+    /// clock stops.
+    fn sva_op_fails(resolved: &Option<SvaOutcome>, node: &SvaNode, st: &SvaState) -> bool {
+        match resolved {
+            Some(SvaOutcome::Fail) => true,
+            Some(_) => false, // Pass / Vacuous
+            None => Self::sva_fails_at_end(node, st),
+        }
+    }
+
     /// Whether a pending property fails at the end of simulation (§16.12.2–3).
     /// A weak sequence holds when the clock stops; property `not` inverts
     /// that result just as it inverts a completed operand's result.
@@ -489,10 +676,16 @@ impl Simulator {
                 cons.iter()
                     .any(|(delay, cs)| *delay == 0 && Self::sva_fails_at_end(cn, cs))
             }
-            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
-            | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
-                (ra.is_none() && Self::sva_fails_at_end(na, a))
-                    || (rb.is_none() && Self::sva_fails_at_end(nb, b))
+            // §16.12.6: `p && q` (And) fails at end when EITHER operand fails;
+            // `p or q` (Or) fails only when BOTH operands fail. An operand
+            // already resolved to Pass/Vacuous can't fail; one already
+            // resolved to Fail already failed; one still pending fails iff
+            // its own evaluation would fail once the clock stops.
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) || Self::sva_op_fails(rb, nb, b)
+            }
+            (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) && Self::sva_op_fails(rb, nb, b)
             }
             _ => false,
         }
@@ -648,7 +841,12 @@ impl Simulator {
         for it in items {
             match it.slot {
                 Some((k, w, signed)) => {
-                    let v = self.sva_eval_env(&it.expr, &mut env);
+                    // §11.6.1: the right-hand side of an assignment is sized
+                    // with its target, so `x = a + b` keeps the carry when
+                    // `x` is wider than `a` and `b`.
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                    let v = self.eval_expr_ctx(&it.expr, w);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
                     let mut v = v.resize_for_assign(w);
                     v.is_signed = signed;
                     if let Some(slot) = env.get_mut(k) {
@@ -1108,15 +1306,47 @@ impl Simulator {
         }
     }
 
-    /// §9.4.2: a vector clock uses its least significant bit, even when
-    /// other bits are unknown. Keep X and Z distinct for edge transitions.
-    pub(super) fn sva_clock_bit(&self, name: &str) -> u8 {
-        match self.get_signal_value_by_name(name).map(|v| v.get_bit(0)) {
-            Some(LogicBit::Zero) => 0,
-            Some(LogicBit::One) => 1,
-            Some(LogicBit::Z) => 3,
-            _ => 2,
+    fn sva_event_value(&mut self, event: &SvaClockEvent) -> Value {
+        match &event.signal {
+            Some(name) => self
+                .get_signal_value_by_name(name)
+                .unwrap_or_else(|| Value::all_x(1)),
+            None => self.eval_expr(&event.event.expr),
         }
+    }
+
+    /// §9.4.2: edge controls inspect the LSB; an unqualified expression
+    /// event notices any value change, including changes above bit zero.
+    pub(super) fn sva_events_fired(&mut self, events: &mut [SvaClockEvent]) -> bool {
+        let mut fired = false;
+        for event in events {
+            let current = self.sva_event_value(event);
+            let bit = |v: &Value| match v.get_bit(0) {
+                LogicBit::Zero => 0,
+                LogicBit::One => 1,
+                LogicBit::X => 2,
+                LogicBit::Z => 3,
+            };
+            let previous = bit(&event.previous);
+            let now = bit(&current);
+            let changed = match event.event.edge {
+                Some(Edge::Posedge) => (previous == 0 && now != 0) || (previous >= 2 && now == 1),
+                Some(Edge::Negedge) => (previous == 1 && now != 1) || (previous >= 2 && now == 0),
+                Some(Edge::Edge) => previous != now && (previous < 2 || now < 2),
+                None => current != event.previous,
+            };
+            event.previous = current;
+            if changed
+                && event
+                    .event
+                    .iff
+                    .as_ref()
+                    .is_none_or(|g| self.eval_expr(g).is_true())
+            {
+                fired = true;
+            }
+        }
+        fired
     }
 
     /// LRM §16.5: register the clocked site of a concurrent assertion
@@ -1127,9 +1357,7 @@ impl Simulator {
     pub(super) fn register_sva_site(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
-        clock_signal: String,
-        edge: u8,
-        iff: Option<Expression>,
+        events: Vec<EventExpr>,
         body: Expression,
     ) {
         use crate::ast::stmt::AssertionKind;
@@ -1142,6 +1370,7 @@ impl Simulator {
         // Named sequence / property instances INSIDE the body (`a |=> s`)
         // expand here, once.
         let mut body_expanded = self.sva_expand_named(&body, 0);
+        self.sva_fold_scopes(&mut body_expanded);
         let mut lv_init: Vec<Value> = Vec::new();
         let mut lv_types =
             self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);
@@ -1160,15 +1389,55 @@ impl Simulator {
         // when the assertion fires using the sampled-value overlay.
         let mut sampled_ids = Vec::new();
         self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
+        // §16.5.1: an element of an unpacked array is sampled too. A select
+        // with constant indices names its cell now; one whose indices read
+        // signals names it again in each Preponed region, from their sampled
+        // values (`sva_sel_cells`), so only the cells read are copied, never
+        // a whole memory. An index the Preponed region cannot evaluate (a
+        // local variable, a sampled-value function, a call) samples every
+        // cell of its array.
+        let mut sels = Vec::new();
+        self.collect_sva_sels(&body_expanded, &mut sels);
+        let mut var_sels = Vec::new();
+        for mut e in sels {
+            match Self::sva_sel_kind(&e) {
+                Some(true) => {
+                    self.sva_cells(&e, &mut sampled_ids);
+                }
+                Some(false) => {
+                    self.sva_resolve_signals(&mut e);
+                    let dims = Self::sva_elem(&e).and_then(|(h, _)| {
+                        let n = self.resolve_hier_name(h);
+                        self.array_first_id.get(n.as_ref()).copied()
+                    });
+                    var_sels.push((e, dims));
+                }
+                None => self.sva_all_cells(&e, &mut sampled_ids),
+            }
+        }
         sampled_ids.sort_unstable();
         sampled_ids.dedup();
+        let fixed = sampled_ids.len();
+        for (e, _) in &var_sels {
+            self.sva_cells(e, &mut sampled_ids);
+        }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
-        // take the values now, before this slot's nonblocking updates.
+        // take the values now, before this slot's nonblocking updates. In
+        // time slot 0 (where the declarative sites register, after the time-0
+        // settle has run the continuous assignments) a slot-entry value is
+        // the default sampled value (§16.5.1).
         for &id in &sampled_ids {
-            if id < self.signal_table.len() && !self.sva_preponed.contains_key(&id) {
-                self.sva_preponed.insert(id, self.signal_table[id].clone());
+            if !self.sva_preponed.contains_key(&id) {
+                if let Some(v) = self.slot0_default(id).or_else(|| self.sva_cell_value(id)) {
+                    self.sva_preponed.insert(id, v);
+                }
             }
+        }
+        // For the first site these are the slot's only samples: a later delta
+        // of the slot must not retake them (`refresh_sva_preponed`).
+        if self.sva_sites.is_empty() {
+            self.sva_preponed_slot = Some(self.time);
         }
         let mut past_names = Vec::new();
         self.collect_past_arg_names(&body_expanded, &mut past_names);
@@ -1207,16 +1476,48 @@ impl Simulator {
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
-        let cur = self.sva_clock_bit(&clock_signal);
-        let prev_clock = if procedural {
-            match (edge, cur) {
-                (0, 1) => 0,
-                (1, 0) => 1,
-                (2, 0 | 1) => cur ^ 1,
-                _ => cur,
+        let mut clock_events = Vec::with_capacity(events.len());
+        for mut event in events {
+            self.sva_fold_scopes(&mut event.expr);
+            self.sva_resolve_signals(&mut event.expr);
+            if let Some(guard) = &mut event.iff {
+                self.sva_resolve_signals(guard);
             }
-        } else {
-            cur
+            let signal = match &event.expr.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|p| p.selects.is_empty()) => {
+                    Some(self.resolve_hier_name(h).into_owned())
+                }
+                _ => None,
+            };
+            let mut clock_event = SvaClockEvent {
+                event,
+                signal,
+                previous: Value::all_x(1),
+            };
+            clock_event.previous = self.sva_event_value(&clock_event);
+            if procedural {
+                let bit = clock_event.previous.get_bit(0);
+                let opposite = match (clock_event.event.edge, bit) {
+                    (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),
+                    (Some(Edge::Negedge), LogicBit::Zero) => Some(LogicBit::One),
+                    (None | Some(Edge::Edge), LogicBit::Zero) => Some(LogicBit::One),
+                    (None | Some(Edge::Edge), LogicBit::One) => Some(LogicBit::Zero),
+                    _ => None,
+                };
+                if let Some(bit) = opposite {
+                    clock_event.previous.set_bit(0, bit);
+                }
+            }
+            clock_events.push(clock_event);
+        }
+        let clock_signal = clock_events
+            .first()
+            .and_then(|ev| ev.signal.clone())
+            .unwrap_or_default();
+        let edge = match clock_events.first().and_then(|ev| ev.event.edge) {
+            Some(Edge::Posedge) => 0,
+            Some(Edge::Negedge) => 1,
+            _ => 2,
         };
         self.sva_sites.push(SvaClockedSite {
             span_key,
@@ -1227,11 +1528,11 @@ impl Simulator {
             all_matches: a.is_sequence,
             clock_signal,
             edge,
-            iff,
+            events: clock_events,
             past_names,
             node: std::sync::Arc::new(node),
             disable,
-            prev_clock,
+            fired: false,
             attempts: Vec::new(),
             past_snapshots: HashMap::default(),
             pass_action: a.action.as_deref().cloned(),
@@ -1240,6 +1541,8 @@ impl Simulator {
             action_pid,
             m_chain,
             sampled_ids,
+            sels: var_sels,
+            fixed,
             lv_init,
             procedural,
             captured,
@@ -1250,10 +1553,12 @@ impl Simulator {
         });
         // §16.9.3: the assertion's leading clock also clocks sampled calls
         // used only in its action blocks; history starts before the first tick.
-        if let Some(&cid) = self
-            .signal_name_to_id
-            .get(self.sva_sites.last().unwrap().clock_signal.as_str())
         {
+            let cid = self
+                .signal_name_to_id
+                .get(self.sva_sites.last().unwrap().clock_signal.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
             let ec = match edge {
                 1 => 2,
                 2 => 0,
@@ -1370,6 +1675,252 @@ impl Simulator {
         self.m_scope_stack = saved_m_scope;
     }
 
+    /// The root identifier of select chain `e` (`m` of `m[1][j][3:0]`, `sa`
+    /// of `sa[2].x`), when it is a plain name.
+    pub(super) fn sva_sel_root(e: &Expression) -> Option<&HierarchicalIdentifier> {
+        match &e.kind {
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::MemberAccess { expr, .. } => Self::sva_sel_root(expr),
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// §16.5.1: collect the selects of fixed-size unpacked arrays in a
+    /// concurrent assertion's body, outermost only (`p[1][2][3:0]`, not
+    /// `p[1]` as well), and those in their indices (`b[0]` of `a[b[0]]`).
+    pub(super) fn collect_sva_sels(&self, e: &Expression, out: &mut Vec<Expression>) {
+        let chain = matches!(
+            e.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        );
+        if chain
+            && Self::sva_sel_root(e).is_some_and(|h| {
+                let n = self.resolve_hier_name(h);
+                self.array_first_id.contains_key(n.as_ref())
+                    || self.module.arrays.contains_key(n.as_ref())
+                    || self.module.arrays_2d.contains_key(n.as_ref())
+                    || self.module.arrays_nd.contains_key(n.as_ref())
+            })
+        {
+            out.push(e.clone());
+            let mut cur = e;
+            loop {
+                match &cur.kind {
+                    ExprKind::Index { expr, index } => {
+                        self.collect_sva_sels(index, out);
+                        cur = expr;
+                    }
+                    ExprKind::RangeSelect {
+                        expr, left, right, ..
+                    } => {
+                        self.collect_sva_sels(left, out);
+                        self.collect_sva_sels(right, out);
+                        cur = expr;
+                    }
+                    ExprKind::MemberAccess { expr, .. } => cur = expr,
+                    _ => return,
+                }
+            }
+        }
+        let mut sub = |x: &Expression| self.collect_sva_sels(x, out);
+        match &e.kind {
+            ExprKind::Unary { operand: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. } => sub(x),
+            ExprKind::Binary { left, right, .. } => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                sub(condition);
+                sub(then_expr);
+                sub(else_expr);
+            }
+            ExprKind::Index { expr, index } => {
+                sub(expr);
+                sub(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                sub(expr);
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Concatenation(v)
+            | ExprKind::SystemCall { args: v, .. }
+            | ExprKind::Call { args: v, .. } => v.iter().for_each(&mut sub),
+            ExprKind::Replication { count, exprs } => {
+                sub(count);
+                exprs.iter().for_each(&mut sub);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                sub(expr);
+                ranges.iter().for_each(&mut sub);
+            }
+            // The bounds of an `inside` range (`[a[0]:a[1]]`).
+            ExprKind::Range(lo, hi) => {
+                sub(lo);
+                sub(hi);
+            }
+            ExprKind::SvaClocked { body, .. } => sub(body),
+            _ => {}
+        }
+    }
+
+    /// The indices of select chain `e`: constant (`Some(true)`), reading
+    /// signals the Preponed region can evaluate (`Some(false)`), or reading
+    /// something it cannot, such as a local variable, a sampled-value
+    /// function or a call (`None`).
+    pub(super) fn sva_sel_kind(e: &Expression) -> Option<bool> {
+        let mut konst = true;
+        let mut ok = true;
+        let mut check = |x: &Expression| {
+            Self::walk_operands(x, &mut |y| match &y.kind {
+                ExprKind::Number(_)
+                | ExprKind::Paren(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. } => {}
+                ExprKind::Ident(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. } => konst = false,
+                _ => ok = false,
+            })
+        };
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    check(index);
+                    cur = expr;
+                }
+                ExprKind::RangeSelect {
+                    expr, left, right, ..
+                } => {
+                    check(left);
+                    check(right);
+                    cur = expr;
+                }
+                ExprKind::MemberAccess { expr, .. } => cur = expr,
+                _ => break,
+            }
+        }
+        ok.then_some(konst)
+    }
+
+    /// The storage name select chain `e` reads (`m[1][2]`, `sa[2].x`), its
+    /// indices evaluated now; pushes the id of every cell on the way (`p[1]`
+    /// for `p[1][2]` of an array of packed vectors; `sa[2]` and `sa[2].x`;
+    /// each cell of a slice).
+    pub(super) fn sva_cells(&mut self, e: &Expression, out: &mut Vec<usize>) -> Option<String> {
+        let name = match &e.kind {
+            ExprKind::Ident(h) => return Some(self.resolve_hier_name(h).into_owned()),
+            ExprKind::Index { expr, index } => {
+                let base = self.sva_cells(expr, out)?;
+                let i = self.eval_expr(index);
+                if i.has_xz() {
+                    return None;
+                }
+                Self::name_with_index(&base, i.to_i64()?)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = self.sva_cells(expr, out)?;
+                base.push('.');
+                base.push_str(&member.name);
+                base
+            }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                let base = self.sva_cells(expr, out)?;
+                // A part-select of a cell reads that cell.
+                if self.resolve_signal_id(&base).is_some() {
+                    return Some(base);
+                }
+                // A slice of an unpacked array (an array port's connection,
+                // `a[1:2]`) reads the cells in it; no single name follows.
+                let (l, r) = (self.eval_expr(left), self.eval_expr(right));
+                if l.has_xz() || r.has_xz() {
+                    return None;
+                }
+                let (Some(l), Some(r)) = (l.to_i64(), r.to_i64()) else {
+                    return None;
+                };
+                // §11.5.1 permits out-of-range selects. Form the bounds in
+                // wider arithmetic before clipping so even an unused
+                // assertion with an extreme index cannot overflow here.
+                let (l, r) = (i128::from(l), i128::from(r));
+                let (lo, hi) = match kind {
+                    RangeKind::Constant => (l.min(r), l.max(r)),
+                    RangeKind::IndexedUp if r > 0 => (l, l + r - 1),
+                    RangeKind::IndexedDown if r > 0 => (l - r + 1, l),
+                    _ => return None,
+                };
+                // Only the indices the array has.
+                let (alo, ahi) = self.sva_slice_bounds(&base)?;
+                for i in lo.max(i128::from(alo))..=hi.min(i128::from(ahi)) {
+                    if let Some(id) =
+                        self.resolve_signal_id(&Self::name_with_index(&base, i as i64))
+                    {
+                        out.push(id);
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        if let Some(id) = self.resolve_signal_id(&name) {
+            out.push(id);
+        }
+        Some(name)
+    }
+
+    /// The index range of the unpacked array or sub-array `base` (`a`, or
+    /// `m[1]` of a two-dimensional `m`).
+    pub(super) fn sva_slice_bounds(&self, base: &str) -> Option<(i64, i64)> {
+        if let Some(&(_, lo, hi)) = self.array_first_id.get(base) {
+            return Some((lo, hi));
+        }
+        if let Some(&(l, r, _)) = self.module.arrays.get(base) {
+            return Some((l.min(r), l.max(r)));
+        }
+        let (root, _) = base.split_once('[')?;
+        let &(_, (l, r), _) = self.module.arrays_2d.get(root)?;
+        Some((l.min(r), l.max(r)))
+    }
+
+    /// Every cell of the array select chain `e` reads, for an index the
+    /// Preponed region cannot evaluate.
+    pub(super) fn sva_all_cells(&self, e: &Expression, out: &mut Vec<usize>) {
+        let Some(h) = Self::sva_sel_root(e) else {
+            return;
+        };
+        let root = self.resolve_hier_name(h);
+        if let Some(&(first, lo, hi)) = self.array_first_id.get(root.as_ref()) {
+            if hi >= lo {
+                out.extend(first..=first + (hi - lo) as usize);
+            }
+        }
+        let pre = Self::name_with_suffix(&root, "[");
+        out.extend(
+            self.signal_name_to_id
+                .iter()
+                .filter(|(n, _)| n.starts_with(&pre))
+                .map(|(_, &id)| id),
+        );
+    }
+
     /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
     /// referenced signal (base ids of index/part-selects included). These are
     /// the signals whose Preponed slot-entry values must be sampled when the
@@ -1477,6 +2028,11 @@ impl Simulator {
                     self.collect_sva_signal_ids(r, out);
                 }
             }
+            // The bounds of an `inside` range are sampled too (§16.5.1).
+            ExprKind::Range(lo, hi) => {
+                self.collect_sva_signal_ids(lo, out);
+                self.collect_sva_signal_ids(hi, out);
+            }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
             _ => {}
         }
@@ -1562,17 +2118,74 @@ impl Simulator {
     }
 
     pub(super) fn refresh_sva_preponed(&mut self) {
-        if self.sva_sites.is_empty() {
+        // Once per slot (§4.4.2.1): a later delta of the slot keeps them.
+        if self.sva_sites.is_empty() || self.sva_preponed_slot == Some(self.time) {
             return;
         }
+        self.sva_preponed_slot = Some(self.time);
         self.sva_preponed.clear();
         for i in 0..self.sva_sites.len() {
+            if !self.sva_sites[i].sels.is_empty() {
+                self.sva_sel_cells(i);
+            }
             for j in 0..self.sva_sites[i].sampled_ids.len() {
                 let id = self.sva_sites[i].sampled_ids[j];
                 if id < self.signal_table.len() {
                     self.sva_preponed.insert(id, self.signal_table[id].clone());
+                } else if is_packed_id(id) {
+                    self.sva_preponed.insert(id, self.packed.read(id));
                 }
             }
+        }
+    }
+
+    /// The value of cell `id`, in the signal table or the packed arena.
+    pub(super) fn sva_cell_value(&self, id: usize) -> Option<Value> {
+        if is_packed_id(id) {
+            return Some(self.packed.read(id));
+        }
+        self.signal_table.get(id).cloned()
+    }
+
+    /// §16.5.1: rename the cells site `i`'s variable selects read, from
+    /// their indices' values now, which are the sampled ones.
+    #[inline(never)]
+    pub(super) fn sva_sel_cells(&mut self, i: usize) {
+        let sels = std::mem::take(&mut self.sva_sites[i].sels);
+        let mut ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+        ids.truncate(self.sva_sites[i].fixed);
+        // No class context, as at a tick (`tick_sva_sites`).
+        let this = std::mem::take(&mut self.this_stack);
+        let cls = std::mem::take(&mut self.class_context_stack);
+        for (e, dims) in &sels {
+            // An element of a 1-D array, the shape of nearly every select:
+            // its cell by arithmetic.
+            if let (Some((first, lo, hi)), Some((_, idx))) = (*dims, Self::sva_elem(e)) {
+                let i = self.eval_expr(idx);
+                if let Some(i) = i.to_i64().filter(|_| !i.has_xz())
+                    && (lo..=hi).contains(&i)
+                {
+                    ids.push(first + (i - lo) as usize);
+                }
+                continue;
+            }
+            self.sva_cells(e, &mut ids);
+        }
+        self.this_stack = this;
+        self.class_context_stack = cls;
+        self.sva_sites[i].sels = sels;
+        self.sva_sites[i].sampled_ids = ids;
+    }
+
+    /// The array and the index of `mem[k]`, or of a part-select of it.
+    pub(super) fn sva_elem(e: &Expression) -> Option<(&HierarchicalIdentifier, &Expression)> {
+        match &e.kind {
+            ExprKind::RangeSelect { expr, .. } => Self::sva_elem(expr),
+            ExprKind::Index { expr, index } => match &expr.kind {
+                ExprKind::Ident(h) => Some((h, index)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -1581,12 +2194,18 @@ impl Simulator {
     pub(super) fn install_preponed(&mut self, ids: &[usize]) -> Vec<(usize, Value)> {
         let mut saved: Vec<(usize, Value)> = Vec::new();
         for &id in ids {
-            if id >= self.signal_table.len() {
-                continue;
-            }
+            // Only cells of the signal table or the packed arena are sampled.
             if let Some(pre) = self.sva_preponed.get(&id) {
                 let pre = pre.clone();
-                saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
+                if id < self.signal_table.len() {
+                    saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
+                } else {
+                    // Past a `force` too: a forced cell's value can change
+                    // within the slot like any other.
+                    saved.push((id, self.packed.read(id)));
+                    let (v, x) = pre.raw_bits();
+                    self.packed.put_raw(id, v, x);
+                }
             }
         }
         saved
@@ -1595,11 +2214,19 @@ impl Simulator {
     /// Restore the live values swapped out by `install_preponed`.
     pub(super) fn restore_preponed(&mut self, saved: Vec<(usize, Value)>) {
         for (id, v) in saved.into_iter().rev() {
-            self.signal_table[id] = v;
-            self.sync_mirror(id);
+            if id < self.signal_table.len() {
+                self.signal_table[id] = v;
+                self.sync_mirror(id);
+            } else {
+                let (v, x) = v.raw_bits();
+                self.packed.put_raw(id, v, x);
+            }
         }
     }
 
+    // Inlined, so a time slot of a design without assertions pays only the
+    // two tests below.
+    #[inline(always)]
     pub(super) fn tick_sva_sites(&mut self) {
         if self.finished {
             return;
@@ -1619,6 +2246,54 @@ impl Simulator {
         self.class_context_stack = saved_cls;
     }
 
+    /// §4.4.2: the Observed region of a delta. It follows the whole active
+    /// region set, the Post-NBA cbReadWriteSynch routines included, so with
+    /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba`
+    /// finishes that set first; inside it, a delta's Observed region only
+    /// records clock events. Inline in both callers, so a design without
+    /// assertions pays one emptiness check per delta.
+    #[inline(always)]
+    pub(super) fn sva_observed(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
+        }
+        if self.sva_post_nba_busy || self.vpi_synch_due() {
+            self.sva_post_nba();
+        } else {
+            self.tick_sva_sites();
+        }
+    }
+
+    /// Record the assertion clocks' events now, for a tick deferred until
+    /// the slot's due cbReadWriteSynch routines have run (`sva_post_nba`): an
+    /// edge such a routine moves back still starts its attempts.
+    pub(super) fn note_sva_edges(&mut self) {
+        if self.finished || self.sva_sites.is_empty() {
+            return;
+        }
+        let saved_this = std::mem::take(&mut self.this_stack);
+        let saved_cls = std::mem::take(&mut self.class_context_stack);
+        self.sva_note_edges();
+        self.this_stack = saved_this;
+        self.class_context_stack = saved_cls;
+    }
+
+    /// Mark each site whose clock event happened since the last call, with
+    /// its `iff` guard checked then.
+    pub(super) fn sva_note_edges(&mut self) {
+        for i in 0..self.sva_sites.len() {
+            let mut events = std::mem::take(&mut self.sva_sites[i].events);
+            let fired = self.sva_events_fired(&mut events);
+            self.sva_sites[i].events = events;
+            if !fired {
+                self.sva_cancel_disabled(i);
+                continue;
+            }
+            self.sva_sites[i].fired = true;
+            self.sva_owed = true;
+        }
+    }
+
     pub(super) fn tick_sva_sites_inner(&mut self) {
         // §16.14.6.2: the procedural instances queued so far mature (no
         // flush point can drop them any more); each starts an attempt at the
@@ -1630,39 +2305,19 @@ impl Simulator {
                 }
             }
         }
+        // The clock events since the last call, and those a deferred tick
+        // recorded (`note_sva_edges`).
+        self.sva_note_edges();
+        self.sva_owed = false;
         // Use indices so we can call &mut self methods inside the loop
         // without holding a borrow on self.sva_sites.
         for i in 0..self.sva_sites.len() {
             if self.finished {
                 break;
             }
-            let clk_name = &self.sva_sites[i].clock_signal;
-            if clk_name.is_empty() {
+            // Only the sites whose clock event was recorded tick.
+            if !std::mem::take(&mut self.sva_sites[i].fired) {
                 continue;
-            }
-            let cur_clk_bit = self.sva_clock_bit(clk_name);
-            let prev = self.sva_sites[i].prev_clock;
-            // Update prev_clock for next iteration *before* edge logic
-            // so a posedge fires exactly once per 0→1 transition.
-            self.sva_sites[i].prev_clock = cur_clk_bit;
-            let fired = match self.sva_sites[i].edge {
-                // §9.4.2, Table 9-2: X/Z -> 1 and 0 -> X/Z are
-                // positive edges; the converse transitions are negative.
-                1 => (prev == 1 && cur_clk_bit != 1) || (prev >= 2 && cur_clk_bit == 0),
-                2 => prev != cur_clk_bit && (prev < 2 || cur_clk_bit < 2),
-                _ => (prev == 0 && cur_clk_bit != 0) || (prev >= 2 && cur_clk_bit == 1),
-            };
-            if !fired {
-                // §16.12: cancellation does not need a sampling edge.
-                self.sva_cancel_disabled(i);
-                continue;
-            }
-            // `@(posedge clk iff g)`: no tick while the guard is false.
-            if let Some(g) = self.sva_sites[i].iff.clone() {
-                if !self.eval_expr(&g).is_true() {
-                    self.sva_cancel_disabled(i);
-                    continue;
-                }
             }
             let span_key = self.sva_sites[i].stat_key;
             let site_loc = self.sva_sites[i].stat_loc;
@@ -1848,7 +2503,12 @@ impl Simulator {
                 ) {
                     return;
                 }
-                for a in args {
+                // The width or type of a cast (`W'(x)`) is read by name.
+                let skip = usize::from(matches!(
+                    name.as_str(),
+                    "$__xz_size_cast" | "$__xz_named_cast" | "$__xz_type_cast"
+                ));
+                for a in args.iter_mut().skip(skip) {
                     self.sva_resolve_signals(a);
                 }
             }
@@ -1901,6 +2561,21 @@ impl Simulator {
             v.is_real = true;
         }
         v
+    }
+
+    /// The width of an `SVA_SIG_MARKER` read: its signal's declared width, or
+    /// for a local variable (§16.10) its slot's.
+    pub(super) fn sva_sig_width(&self, args: &[Expression]) -> Option<u32> {
+        let k = match &args.first()?.kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                value.parse::<usize>().ok()?
+            }
+            _ => return None,
+        };
+        if args.len() == 2 {
+            return self.sva_lv.get(k).map(|v| v.width);
+        }
+        self.signal_widths.get(k).copied()
     }
 
     /// §16.10: a local variable read (a two-argument `SVA_SIG_MARKER`: the

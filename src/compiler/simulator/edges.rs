@@ -704,9 +704,11 @@ impl Simulator {
                 break;
             }
         }
-        if edge_code.is_none()
-            && let Some(si) = self.active_sva_site
-        {
+        let implicit_site = edge_code
+            .is_none()
+            .then_some(self.active_sva_site)
+            .flatten();
+        if let Some(si) = implicit_site {
             let site = &self.sva_sites[si];
             edge_code = Some(match site.edge {
                 1 => 2,
@@ -716,7 +718,8 @@ impl Simulator {
             clk_id = self
                 .signal_name_to_id
                 .get(site.clock_signal.as_str())
-                .copied();
+                .copied()
+                .or(Some(usize::MAX));
         }
         if edge_code.is_none() {
             // Procedural context + default clocking: infer from it.
@@ -748,7 +751,14 @@ impl Simulator {
         let clk_id = clk_id?;
         let operand = args.first()?.clone();
         let site = expr.span.start;
-        let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
+        let widx = self.sampled_watch_for(
+            site,
+            &operand,
+            edge_code.unwrap_or(0),
+            clk_id,
+            n,
+            implicit_site,
+        )?;
         if let ExprKind::SystemCall { name, .. } = &expr.kind {
             if name == "$past" {
                 self.sampled_watches[widx].gate = args
@@ -791,7 +801,7 @@ impl Simulator {
                 Some(_) if w.slot_time == Some(self.time) && w.slot_val.is_some() => {
                     w.slot_val.clone().unwrap()
                 }
-                Some(sid) => self.preponed_value_of(sid),
+                Some(sid) => self.slot_preponed(sid),
                 None => {
                     let op = operand.clone();
                     self.eval_expr(&op)
@@ -812,6 +822,285 @@ impl Simulator {
             w.hist.get(idx).or(w.default.as_ref()).cloned()
         };
         (cur, past)
+    }
+
+    /// Fill `sampled_defaults` before the time-0 settle, while every variable
+    /// still holds its declaration value or its type's default (§16.5.1). A
+    /// concurrent assertion registers after the settle, and one in a
+    /// procedure only when the procedure reaches it, so its operands are
+    /// found here by name: every signal whose last name segment a concurrent
+    /// assertion (its action blocks included) or a named property or
+    /// sequence spells. That needs no scope resolution, and an extra match
+    /// only costs its entry.
+    pub(super) fn capture_sampled_defaults(&mut self) {
+        let mut names: HashSet<String> = HashSet::default();
+        for b in &self.module.initial_blocks {
+            Self::sva_stmt_names(&b.stmt, false, &mut names);
+        }
+        for p in &self.module.pending_initial {
+            Self::sva_stmt_names(&p.source, false, &mut names);
+        }
+        for b in self.edge_blocks.iter() {
+            Self::sva_stmt_names(&b.stmt, false, &mut names);
+        }
+        for (st, ..) in &self.proc_sampled_blocks {
+            Self::sva_stmt_names(st, false, &mut names);
+        }
+        for body in self.module.property_decls.values() {
+            Self::sva_expr_names(body, &mut names);
+        }
+        if names.is_empty() {
+            return;
+        }
+        for (name, &id) in self.signal_name_to_id.iter() {
+            // An array cell is named `mem[3]`; an assertion spells `mem`. The
+            // cells of a memory too large for per-element names (the packed
+            // arena) are not in this map and keep their current value: only
+            // an `always_comb` or continuous assignment writing one at time
+            // 0 tells the two apart, and copying such a memory is not free.
+            let leaf = name.rsplit(['.', ':']).next().unwrap_or_default();
+            if !names.contains(leaf.split('[').next().unwrap_or_default()) {
+                continue;
+            }
+            if let Some(v) = self.signal_table.get(id) {
+                self.sampled_defaults.insert(id, v.clone());
+            }
+        }
+    }
+
+    /// The name segments the concurrent assertions in `st` spell, in every
+    /// statement that can hold one. With `all` (inside a concurrent
+    /// assertion's action block, whose sampled-value calls the assertion
+    /// clocks) the names of the statements' expressions count too.
+    pub(super) fn sva_stmt_names(st: &Statement, all: bool, out: &mut HashSet<String>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::Assertion(a) => {
+                let sva = a.is_property || a.is_sequence;
+                if sva || all {
+                    Self::sva_expr_names(&a.expr, out);
+                }
+                for s in [&a.action, &a.else_action].into_iter().flatten() {
+                    Self::sva_stmt_names(s, all || sva, out);
+                }
+            }
+            SK::Expr(e) if all => Self::sva_expr_names(e, out),
+            SK::BlockingAssign { rvalue, .. } | SK::NonblockingAssign { rvalue, .. } if all => {
+                Self::sva_expr_names(rvalue, out)
+            }
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().for_each(|s| Self::sva_stmt_names(s, all, out))
+            }
+            SK::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                if all {
+                    Self::sva_expr_names(condition, out);
+                }
+                Self::sva_stmt_names(then_stmt, all, out);
+                if let Some(e) = else_stmt {
+                    Self::sva_stmt_names(e, all, out);
+                }
+            }
+            SK::Case { expr, items, .. } => {
+                if all {
+                    Self::sva_expr_names(expr, out);
+                }
+                items
+                    .iter()
+                    .for_each(|it| Self::sva_stmt_names(&it.stmt, all, out))
+            }
+            SK::RandCase { items } => items
+                .iter()
+                .for_each(|(_, s)| Self::sva_stmt_names(s, all, out)),
+            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => {
+                Self::sva_stmt_names(stmt, all, out)
+            }
+            SK::WaitOrder { pass, fail, .. } => {
+                for s in [pass, fail].into_iter().flatten() {
+                    Self::sva_stmt_names(s, all, out);
+                }
+            }
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::ForeverTail { body }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::RsAction { body } => Self::sva_stmt_names(body, all, out),
+            _ => {}
+        }
+    }
+
+    /// Every name segment `e` spells, clocked bodies included.
+    pub(super) fn sva_expr_names(e: &Expression, out: &mut HashSet<String>) {
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::Ident(h) => out.extend(h.path.iter().map(|s| s.name.name.clone())),
+            ExprKind::SvaClocked { events, body } => {
+                Self::sva_expr_names(body, out);
+                for event in events {
+                    Self::sva_expr_names(&event.expr, out);
+                    if let Some(g) = &event.iff {
+                        Self::sva_expr_names(g, out);
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+
+    /// §16.5.1: a declaration initializer the elaborator could not fold runs
+    /// as a time-0 process: a static initializer, or at the top level a
+    /// synthesized initial block (dummy spans, as `cov_synthesized_initial`
+    /// tells them apart). What it assigns is still the default sampled
+    /// value, so end each such process with `SAMPLED_DEFAULT_MARKER`.
+    pub(super) fn mark_deferred_inits(&mut self) {
+        let dummy = |sp: crate::ast::Span| sp.start == 0 && sp.end == 0;
+        let blocks = self.module.static_init_blocks.iter_mut().map(|b| (b, true));
+        let synthesized = self.module.initial_blocks.iter_mut().filter_map(|b| {
+            let s = &b.stmt;
+            let ok = dummy(s.span)
+                || matches!(&s.kind, StatementKind::BlockingAssign { lvalue, .. } if dummy(lvalue.span));
+            ok.then_some((b, false))
+        });
+        for (b, any) in blocks.chain(synthesized) {
+            let mut targets = Vec::new();
+            if !Self::init_targets(&b.stmt, any, &mut targets) || targets.is_empty() {
+                continue;
+            }
+            let span = crate::ast::Span::dummy();
+            let marker = Statement::new(
+                StatementKind::Expr(Expression::new(
+                    ExprKind::SystemCall {
+                        name: SAMPLED_DEFAULT_MARKER.to_string(),
+                        args: targets,
+                    },
+                    span,
+                )),
+                span,
+            );
+            if let StatementKind::SeqBlock { stmts, .. } = &mut b.stmt.kind {
+                stmts.push(marker);
+                continue;
+            }
+            let st = std::mem::replace(&mut b.stmt, Statement::new(StatementKind::Null, span));
+            b.stmt = Statement::new(
+                StatementKind::SeqBlock {
+                    name: None,
+                    stmts: vec![st, marker],
+                },
+                span,
+            );
+        }
+    }
+
+    /// The targets of the blocking assignments in a deferred declaration
+    /// initializer. With `any` false (a synthesized initial block), false
+    /// unless the block holds nothing else.
+    pub(super) fn init_targets(st: &Statement, any: bool, out: &mut Vec<Expression>) -> bool {
+        match &st.kind {
+            StatementKind::BlockingAssign { lvalue, .. } => {
+                out.push(lvalue.clone());
+                true
+            }
+            StatementKind::SeqBlock { stmts, .. } => {
+                // Every statement is visited: `all` would stop at the first
+                // miss and leave the later targets out.
+                stmts
+                    .iter()
+                    .fold(true, |ok, s| Self::init_targets(s, any, out) && ok)
+            }
+            _ => any,
+        }
+    }
+
+    /// `SAMPLED_DEFAULT_MARKER`: a deferred declaration initializer has run,
+    /// so its targets now hold their default sampled values (§16.5.1).
+    /// Update the ones a concurrent assertion or a procedural watch keeps.
+    pub(super) fn record_sampled_defaults(&mut self, targets: &[Expression]) {
+        let mut ids = Vec::new();
+        for t in targets {
+            let Some(id) = self.get_lhs_signal_id(t) else {
+                continue;
+            };
+            let Some(v) = self.signal_table.get(id).cloned() else {
+                continue;
+            };
+            self.set_sampled_default(id, v);
+            ids.push(id);
+        }
+        self.refresh_expr_defaults(&ids);
+    }
+
+    /// Make `v` the default sampled value of signal `id` (§16.5.1): for the
+    /// watches that read it before their first tick, and as its time-0
+    /// sample for the concurrent assertions.
+    pub(super) fn set_sampled_default(&mut self, id: usize, v: Value) {
+        for w in &mut self.sampled_watches {
+            if w.sig_id == Some(id) && w.default.is_some() {
+                w.default = Some(v.clone());
+            }
+        }
+        if self.time == 0
+            && self.sva_preponed_slot == Some(0)
+            && let Some(p) = self.sva_preponed.get_mut(&id)
+        {
+            *p = v.clone();
+        }
+        if let Some(d) = self.sampled_defaults.get_mut(&id) {
+            *d = v;
+        }
+    }
+
+    /// Re-evaluate the default of each expression watch (`$past(a | b)`)
+    /// that reads one of `ids`, whose default sampled values changed, from
+    /// the default sampled values of its operands.
+    pub(super) fn refresh_expr_defaults(&mut self, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        for i in 0..self.sampled_watches.len() {
+            let w = &self.sampled_watches[i];
+            // Every operand needs its default: a live one would mix values
+            // from after the time-0 settle into a default.
+            if w.sig_id.is_some()
+                || w.default.is_none()
+                || !w.sample_ids.iter().any(|id| ids.contains(id))
+                || !w
+                    .sample_ids
+                    .iter()
+                    .all(|id| self.sampled_defaults.contains_key(id))
+            {
+                continue;
+            }
+            let e = self.sampled_watches[i].expr.clone();
+            let ops = self.sampled_watches[i].sample_ids.clone();
+            let v = self.eval_with_defaults(&e, &ops);
+            self.sampled_watches[i].default = Some(v);
+        }
+    }
+
+    /// `e` evaluated with each signal of `ids` that has a default sampled
+    /// value holding it.
+    pub(super) fn eval_with_defaults(&mut self, e: &Expression, ids: &[usize]) -> Value {
+        let mut saved: Vec<(usize, Value)> = ids
+            .iter()
+            .filter(|&&id| id < self.signal_table.len())
+            .filter_map(|&id| Some((id, self.sampled_defaults.get(&id)?.clone())))
+            .collect();
+        for (id, v) in &mut saved {
+            std::mem::swap(&mut self.signal_table[*id], v);
+        }
+        let v = self.eval_expr(e);
+        for (id, v) in saved.into_iter().rev() {
+            self.signal_table[id] = v;
+        }
+        v
     }
 
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
@@ -1092,6 +1381,29 @@ impl Simulator {
         }
     }
 
+    /// §16.5.1: the sampled value of signal `id` in this slot's Preponed
+    /// region. In time slot 0 that is its default sampled value: the
+    /// preponed snapshot is taken after the time-0 settle has run the
+    /// continuous assignments, so it would read what they drive.
+    #[inline]
+    pub(super) fn slot_preponed(&self, id: usize) -> Value {
+        if self.time == 0
+            && let Some(v) = self.sampled_defaults.get(&id)
+        {
+            return v.clone();
+        }
+        self.preponed_value_of(id)
+    }
+
+    /// §16.5.1: in time slot 0, the default sampled value of signal `id`
+    /// (`sampled_defaults`), when it has one.
+    pub(super) fn slot0_default(&self, id: usize) -> Option<Value> {
+        if self.time != 0 {
+            return None;
+        }
+        self.sampled_defaults.get(&id).cloned()
+    }
+
     pub(super) fn preponed_value_of(&self, id: usize) -> Value {
         if let Some(w) = self.prev_wide.get(&id) {
             return w.clone();
@@ -1127,6 +1439,7 @@ impl Simulator {
         edge_code: u8,
         clk_id: usize,
         depth: usize,
+        clock_site: Option<usize>,
     ) -> Option<usize> {
         if let Some(i) = Self::sampled_site_lookup(
             &self.sampled_watch_site,
@@ -1155,11 +1468,11 @@ impl Simulator {
         // a declaration-initialised operand (`logic [7:0] v = 8'hA5;`) is
         // never written, so its first sample read a stale x. Seed the
         // snapshot from the current value on registration.
-        if !self.edge_signal_ids.contains(&clk_id) {
+        if clk_id != usize::MAX && !self.edge_signal_ids.contains(&clk_id) {
             self.edge_signal_ids.push(clk_id);
             self.seed_prev_from_current(clk_id);
         }
-        if !self.preponed_ids.contains(&clk_id) {
+        if clk_id != usize::MAX && !self.preponed_ids.contains(&clk_id) {
             self.preponed_ids.push(clk_id);
         }
         if let Some(sid) = sig_id {
@@ -1175,14 +1488,47 @@ impl Simulator {
             None
         } else {
             match sig_id {
-                Some(sid) => self.signal_table.get(sid).cloned(),
-                None => Some(self.eval_expr(operand)),
+                // §16.5.1: the value from before time 0, which
+                // `capture_sampled_defaults` kept. A concurrent assertion
+                // registers its watches after the time-0 settle (a net reads
+                // its driver's value by then), and one in a procedure after
+                // the procedure's earlier writes.
+                Some(sid) => self
+                    .sampled_defaults
+                    .get(&sid)
+                    .or(self.signal_table.get(sid))
+                    .cloned(),
+                // An expression's default is computed from its operands'
+                // defaults, kept for every operand so a later change to one
+                // (`refresh_expr_defaults`) can recompute it.
+                None => {
+                    let mut ids = Vec::new();
+                    self.collect_sva_signal_ids(operand, &mut ids);
+                    if !self.time0_settled {
+                        for &id in &ids {
+                            if !self.sampled_defaults.contains_key(&id)
+                                && let Some(v) = self.signal_table.get(id)
+                            {
+                                self.sampled_defaults.insert(id, v.clone());
+                            }
+                        }
+                    }
+                    Some(self.eval_with_defaults(operand, &ids))
+                }
             }
         };
+        let clock_events = clock_site
+            .map(|si| &self.sva_sites[si].events)
+            .filter(|events| {
+                events.len() != 1 || events[0].signal.is_none() || events[0].event.iff.is_some()
+            })
+            .cloned()
+            .unwrap_or_default();
         let i = self.sampled_watches.len();
         self.sampled_watches.push(SampledWatch {
             clk_id,
             edge,
+            clock_events,
             sig_id,
             expr: operand.clone(),
             hist: std::collections::VecDeque::new(),
@@ -1216,11 +1562,11 @@ impl Simulator {
                 let ids = self.sampled_watches[i].sample_ids.clone();
                 let vals = ids
                     .into_iter()
-                    .map(|sid| (sid, self.preponed_value_of(sid)))
+                    .map(|sid| (sid, self.slot_preponed(sid)))
                     .collect();
                 let slot_val = self.sampled_watches[i]
                     .sig_id
-                    .map(|sid| self.preponed_value_of(sid));
+                    .map(|sid| self.slot_preponed(sid));
                 let w = &mut self.sampled_watches[i];
                 w.slot_values = vals;
                 w.slot_val = slot_val;
@@ -1230,7 +1576,15 @@ impl Simulator {
                 let w = &self.sampled_watches[i];
                 (w.clk_id, w.edge)
             };
-            if !self.check_edge_id(clk_id, edge) {
+            let fired = if self.sampled_watches[i].clock_events.is_empty() {
+                self.check_edge_id(clk_id, edge)
+            } else {
+                let mut events = std::mem::take(&mut self.sampled_watches[i].clock_events);
+                let fired = self.sva_events_fired(&mut events);
+                self.sampled_watches[i].clock_events = events;
+                fired
+            };
+            if !fired {
                 continue;
             }
             let mut saved = self.sampled_watches[i].slot_values.clone();

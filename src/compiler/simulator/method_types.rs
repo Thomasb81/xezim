@@ -445,11 +445,16 @@ impl Simulator {
                 // -1 became 0xFFFF_FFFF, `l >= r` picked the wrong branch and
                 // the width came out 0 — which then resized the RHS to nothing,
                 // so a partially out-of-range NBA wrote no bits at all.
-                let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                // An indexed select's width is its constant width alone: its
+                // start is not evaluated here, so one with a side effect
+                // (`v[i++ +: 8]`) runs only where the target is captured.
                 let r = self.eval_expr(right).to_i64().unwrap_or(0);
                 let count = match kind {
                     RangeKind::IndexedUp | RangeKind::IndexedDown => r.max(0) as u32,
-                    RangeKind::Constant => (l - r).unsigned_abs() as u32 + 1,
+                    RangeKind::Constant => {
+                        let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                        (l - r).unsigned_abs() as u32 + 1
+                    }
                 };
                 // §7.4.1: an element range on a packed multi-D lvalue is
                 // count × elem_w bits wide, not count bits — the RHS was

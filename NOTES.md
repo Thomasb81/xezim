@@ -10,12 +10,42 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A hierarchical name that does not resolve is an elaboration error (§23.8),
+  wherever it is written: a read or a write, a continuous assignment, an
+  event control, an assertion, a system task argument, or a task or function
+  that is never called. The message gives the file and line, the name, the
+  scope that does not declare it and the scope the search started from. Such
+  a name was accepted silently: a testbench that wrote to a guessed internal
+  name (`dut.mem_data[3] = ...`) ran as if the write had happened, and a read
+  returned x. A name inside a generate block a constant rules out is not
+  elaborated, so it is not checked. `--no-strict` turns the check off, for
+  designs that relied on the old behaviour.
+* An assertion attempt at time 0 reads default sampled values (§16.5.1): a
+  variable's declaration initializer, else its type's default. It read the
+  values the time-0 continuous assignments and `always_comb` blocks had
+  already driven, so under a clock that rises at time 0 (an HDL clock, or
+  cocotb's Python `Clock`) such an attempt passed. `$past` at the next tick
+  reads the same samples (§16.9.3).
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* Toggle coverage no longer lists the names of the top module's instance
+  arrays, instances in generate blocks and generate blocks as 1-bit signals.
+  They are scopes, not signals, so their bins could never be covered and the
+  top instance's toggle score read low (§23.6). (#441)
+* A value a VPI client writes at time 0 is the toggle-coverage baseline.
+  Values written from the end-of-slot callbacks (`cbReadWriteSynch`,
+  `cbAtEndOfSimTime`) reach toggle coverage and the waveform dumps in their
+  own time slot, not the next one. A value written from
+  `cbStartOfSimulation` is evaluated in the time-0 slot even when nothing
+  else runs there, so the logic it drives no longer reads x until the next
+  slot. cocotb writes its first values from both, so in a design with
+  nothing of its own at time 0 every signal those values reached lost its
+  first toggle. A toggle is counted once per time slot from the slot's net
+  change (§38.36.2, §38.36.3). (#442)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -184,6 +214,125 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§6.16, §6.18, §6.24.3, §11.4.12).
   (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
 
+* Interpreted nonblocking and event-controlled assignments evaluate their
+  right-hand sides at the target width, preserving carries and unary results
+  (§11.6.1). (#399, reported by akashlevy; #407, contributed by akashlevy)
+* Concurrent assertion operands and local match assignments retain their
+  expression context width (§11.6.1, §16.10).
+  (#402, reported by akashlevy; #408, contributed by akashlevy)
+* VPI-driven clocks evaluate assertions in the edge's time slot, with fixed
+  slot-entry samples and Post-NBA callbacks before assertion evaluation
+  (§16.5.1, §4.4.2). (#404, reported by akashlevy; #409, contributed by akashlevy)
+* The cocotb runner honors build arguments, timescales and parameter overrides,
+  including later tests and positional arguments.
+  (#406, reported by akashlevy; #410, contributed by akashlevy)
+* VPI writes through unpacked-array net ports reach every alias. Variable
+  connections retain their propagation timing (§23.3.3.3, §23.3.3.7).
+  (#405, reported by akashlevy; #411, contributed by akashlevy)
+* Sampled-value functions use declaration defaults from before time zero,
+  including deferred initializers and procedural assertions (§16.5.1, §16.9.3).
+  (#403, reported by akashlevy; #412, contributed by akashlevy)
+* Select writes to static subroutine locals update their shared storage and
+  preserve packed member writes (§6.21, §11.5.1).
+  (#413, reported by akashlevy; #414, contributed by akashlevy)
+* Concurrent assertions sample unpacked-array elements, including large
+  memories, variable indices and forced values. Out-of-range slice sampling
+  clips safely at extreme indices (§16.5.1, §11.5.1).
+  (#415, reported by akashlevy; #416, contributed by akashlevy)
+* Named and inline assertions sample generate-block, instance-array and
+  top-rooted references and recognize hierarchical clocks (§16.5.1).
+  (#417, reported by akashlevy; #418, contributed by akashlevy)
+
+* Package-scoped virtual interfaces accept direct declarations and typedefs,
+  preserve qualified copies and equality, and retain independent bindings
+  when names are imported or shadowed (§25.9, §26.2, §26.3).
+* Virtual interfaces in string-keyed associative arrays preserve their keys
+  through member access and handle copies, including inherited properties
+  and method-local keys (§7.8, §25.10).
+* Returned virtual interfaces support member reads, writes, task calls and
+  selected nonblocking targets. Receiver calls run once, and nonblocking
+  targets retain their assignment syntax (§10.4.2, §25.9).
+* Parameterized static collections retain virtual-interface element identity
+  through typedefs, named type arguments, reordering and static methods
+  (§8.25, §25.10).
+* Copying or returning a null virtual interface clears its previous binding.
+  Explicit virtual-interface locals default to null (§25.9, Table 6-7).
+* Instance-targeted binds resolve indexed and nested generate scopes,
+  including constant index expressions and explicit target lists, while
+  leaving sibling instances unbound (§23.11, §27). VPI retains the host's
+  source definition and bound port metadata (§37).
+* Generated module instances use signed genvars, preserving negative indices
+  and terminating descending loops correctly (§27.4).
+
+* Virtual-interface collection copies preserve element identity. Queue edits,
+  associative deletion and dynamic-array allocation use the current values,
+  and absent elements read as null (§7.5–§7.10, §25.10).
+  (#427, reported by Ganesh-TNL)
+* Task `ref`, `output` and `inout` virtual-interface arguments propagate
+  rebinding and null values, preserve input isolation and retain their scope
+  across suspension (§13.5, §25.9).
+* Bind targets resolve against the effective hierarchy and declaration scope,
+  including relative and `$root` paths, instance arrays, interface hosts,
+  active generate branches, type parameters and `defparam` overrides. Repeated
+  binds retain upward module references and VPI port metadata (§23.11, §37).
+  Bare target names prefer the nearest visible instance over a same-named type.
+  Recompile saved designs to refresh their hierarchy metadata.
+
+* Interface static initializers evaluate runtime system functions in each
+  elaborated instance's scope before user processes, including nested,
+  generated, arrayed and bound interfaces. Already deferred initializers
+  retain their once-only side effects (§6.21, §25.3).
+  (#435, reported by AaronKel; #436, contributed by AaronKel)
+
+* Compilation-unit nets retain pull values, drive strengths, resolution and
+  continuous declaration assignments, including when a module shadows a unit
+  name. Explicit unit writes remain distinct from later module declarations.
+  Parser source locations, interface-property parameters, directive recovery
+  and constraint braces and implications are also corrected.
+  (core #55–#63, contributed by AaronKel, Thomasb81 and lwflwf1)
+* User constant functions select generate branches and initialize packed
+  struct fields with their full argument and result widths.
+  (#460 and core #64, contributed by chenbhil)
+* Static virtual-interface comparisons and method receivers share storage
+  through class typedef aliases. Collection identity coverage is retained.
+  (#450 and #456, contributed by Ganesh-TNL)
+* Assertion action scopes, pending property disjunctions and sampled operands
+  follow their declaring instance, end-of-simulation outcome and Preponed
+  values. (#457; #419, #420 and #421, contributed by Thomasb81)
+* Hierarchy diagnostics and time-zero assertion and toggle coverage fixes
+  include scope and foreign-write regression coverage.
+  (#439, #440, #443 and #444, contributed by akashlevy)
+* Continuous assignment sensitivity includes unnamed generate-block reads.
+  (#434, contributed by Thomasb81)
+
+* Source locations preserve original columns after empty and multiple macro
+  expansions, and identify each invocation independently (§22.5). Added
+  virtual-interface recovery and postfix-span regressions.
+  (#397 and #398, reported by lwflwf1)
+
+* Undefined statement macro calls recover as one placeholder, preserving the
+  undefined-macro diagnostic and the following statement (§22.5.1).
+  (#451, reported by lwflwf1)
+* Assertion, property and sequence clocking events accept `or` and comma
+  lists, including nested groups and per-term edge and `iff` conditions.
+  Each qualifying event advances the assertion and its sampled history
+  (§16.5, §9.4.2). Recompile saved designs.
+  (#453, reported by lwflwf1)
+
+* The cocotb runner reloads parameters when another runner rebuilds the same
+  directory. Test overrides persist while the recorded build is unchanged,
+  including empty overrides. (#426, reported by akashlevy)
+
+* Interface-array slices retain their selected instances' parameters, signal
+  widths and connections when passed to array ports or forwarded through
+  another module. (#463)
+* Fixed arrays of associative arrays apply each row's declared key width and
+  signedness to lookups, iteration and traversal, including class properties
+  and automatic task storage. (#464, reported by chenbhil)
+* Continuous assignments and `always_comb` writes preserve the complete width
+  of nested packed elements and sub-arrays, including packed struct elements
+  wider than 32 bits (§7.4.1). (#461, contributed by chenbhil)
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and
@@ -216,11 +365,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Maintenance**
 
+* Core CI runs the parser crate's unit, integration and documentation tests,
+  and verifies its minimum supported Rust version explicitly.
+  (#455, reported by lwflwf1)
+
 * Expanded regression coverage for default-valued array arguments and nested
   associative collections, including repeated calls and queue element isolation.
   (#332 and #333, contributed by Thomasb81)
 * Rust warning cleanup preserves optional native execution and successful
   two-state dynamic operations. (#334, contributed by Thomasb81)
+
+* Shortened simulation windows and optimized dependency test builds reduce
+  regression runtime. Coverage analysis stops on failed or unprofiled tests.
+  (#458, contributed by Thomasb81)
 
 ### 0.11.2 — class, collection and DPI parity fixes, `-uvm`, crash-safe FST dumps (October 2026)
 

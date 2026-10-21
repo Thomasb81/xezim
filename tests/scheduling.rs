@@ -219,6 +219,8 @@ mod static_local_nba_per_instance;
 mod struct_member_read_sensitivity;
 #[path = "scheduling/suspending_loop_depth_and_continue.rs"]
 mod suspending_loop_depth_and_continue;
+#[path = "scheduling/sva_time0_default_samples.rs"]
+mod sva_time0_default_samples;
 #[path = "scheduling/task_body_delay_scaling.rs"]
 mod task_body_delay_scaling;
 #[path = "scheduling/time0_process_order.rs"]
@@ -305,10 +307,14 @@ mod phase_jump_static_latch;
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
 mod static_recursion_shared_cell;
+#[path = "scheduling/sva_context_width.rs"]
+mod sva_context_width;
 #[path = "scheduling/sva_instances_and_sequences.rs"]
 mod sva_instances_and_sequences;
 #[path = "scheduling/sva_local_diagnostics.rs"]
 mod sva_local_diagnostics;
+#[path = "scheduling/sva_past_first_tick.rs"]
+mod sva_past_first_tick;
 #[path = "scheduling/sva_semantics_reference.rs"]
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
@@ -343,5 +349,22 @@ mod action_scopes_386;
 
 #[path = "scheduling/pending_negation_393.rs"]
 mod pending_negation_393;
+#[path = "scheduling/or_end_of_sim_compose_420.rs"]
+mod or_end_of_sim_compose_420;
+#[path = "scheduling/sampled_preponed_421.rs"]
+mod sampled_preponed_421;
+#[path = "scheduling/assertion_m_scope_419.rs"]
+mod assertion_m_scope_419;
 #[path = "scheduling/followed_vacuity_395.rs"]
 mod followed_vacuity_395;
+
+#[path = "scheduling/sva_array_sampling.rs"]
+mod sva_array_sampling;
+
+#[path = "scheduling/sva_named_property_hier_sampling.rs"]
+mod sva_named_property_hier_sampling;
+
+#[path = "scheduling/array_port_connection_timing.rs"]
+mod array_port_connection_timing;
+#[path = "scheduling/sva_event_lists.rs"]
+mod sva_event_lists;
