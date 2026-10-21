@@ -1427,6 +1427,19 @@ impl Simulator {
                 if self.is_interface_instance(head) {
                     return Some(head.clone());
                 }
+                // §25.9: `t.v` where `v` is a module-scope virtual-interface
+                // VARIABLE (a name alias, not a class property) — e.g. an
+                // omitted formal's default `x = t.v`. Resolve through the
+                // module's variable aliases. Narrow to the current module's
+                // own name so a same-named class property still wins.
+                if head == &self.module.name
+                    && let Some(b) = self
+                        .viface_var_aliases
+                        .get(&h.path[1].name.name)
+                        .filter(|b| !b.is_empty())
+                {
+                    return Some(b.clone());
+                }
                 if let Some(p) = self.iface_instance_by_path(rvalue) {
                     return Some(p);
                 }
@@ -1442,6 +1455,17 @@ impl Simulator {
                         // Same §25.9 modport-view case in MemberAccess shape.
                         if self.is_interface_instance(head) {
                             return Some(head.clone());
+                        }
+                        // §25.9: `t.v` where `v` is a module-scope
+                        // virtual-interface VARIABLE alias (an omitted
+                        // formal's default, e.g. `x = t.v`).
+                        if head == &self.module.name
+                            && let Some(b) = self
+                                .viface_var_aliases
+                                .get(&member.name)
+                                .filter(|b| !b.is_empty())
+                        {
+                            return Some(b.clone());
                         }
                     }
                 }
@@ -2765,7 +2789,12 @@ impl Simulator {
                 let last = h.path[h.path.len() - 1].name.name.as_str();
                 (h.path.len() == 2
                     && (self.is_interface_instance(&h.path[0].name.name)
-                        || self.class_member_names().vif_props.contains(last)))
+                        || self.class_member_names().vif_props.contains(last)
+                        // §25.9: `t.v` where `v` is a module-scope
+                        // virtual-interface VARIABLE alias, e.g. an omitted
+                        // formal's default.
+                        || (h.path[0].name.name == self.module.name
+                            && self.viface_var_aliases.contains_key(last))))
                     || self.iface_path_parts().0.contains(last)
             }
             ExprKind::MemberAccess { expr, member } => {
@@ -2776,6 +2805,12 @@ impl Simulator {
                         .vif_props
                         .contains(member.name.as_str())
                     || self.iface_path_parts().0.contains(member.name.as_str())
+                    // §25.9: `t.v` where `v` is a module-scope virtual-interface
+                    // VARIABLE alias, e.g. an omitted formal's default.
+                    || (matches!(&expr.kind, ExprKind::Ident(bh)
+                            if bh.path.len() == 1
+                                && bh.path[0].name.name == self.module.name)
+                        && self.viface_var_aliases.contains_key(member.name.as_str()))
             }
             ExprKind::Index { expr: base, .. } => {
                 if self.vif_tokens_stored && self.static_vif_key(base).is_some() {

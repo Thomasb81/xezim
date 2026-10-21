@@ -570,9 +570,14 @@ impl Simulator {
         // inside the body resolved to a phantom and every access read 0.
         let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
         for (i, port) in fd.ports.iter().enumerate() {
-            if i < args.len() {
+            // §13.5.3: an omitted argument binds the formal's DEFAULT (§10.9.1),
+            // so a virtual-interface formal with a default still aliases the
+            // interface the default names (a supplied actual wins; the default
+            // only fills an omitted slot).
+            let arg = args.get(i).or(port.default.as_ref());
+            if let Some(expr) = arg {
                 if let Some((f, b)) =
-                    self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
+                    self.vif_formal_alias(&port.data_type, &port.name.name, expr)
                 {
                     iface_alias_frame.insert(f, b);
                 }
@@ -1843,7 +1848,14 @@ impl Simulator {
             .enumerate()
             .filter_map(|(i, port)| {
                 if vif_formal_indices.contains(&i) && port.direction != PortDirection::Output {
+                    // §13.5.3: an omitted argument binds the formal's DEFAULT
+                    // (§10.9.1). A virtual-interface formal's default names the
+                    // interface instance the body must dispatch to; resolving
+                    // it alongside a supplied actual keeps the formal bound, so
+                    // `show()` reads the default's interface and an `inout`/
+                    // `output` default copies that binding back to the actual.
                     args.get(i)
+                        .or(port.default.as_ref())
                         .and_then(|a| self.resolve_vif_rhs_name_strict(a))
                         .map(|bound| (i, bound))
                 } else {

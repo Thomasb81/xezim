@@ -1921,11 +1921,17 @@ impl Simulator {
                 let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
                 let plan_fresh = plan.type_gen == self.type_tables_gen;
                 for (i, port) in ports.iter().enumerate() {
-                    if i < args.len() && !(plan_fresh && plan.ports[i].never_vif) {
-                        if let Some((f, b)) =
-                            self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
-                        {
-                            iface_alias_frame.insert(f, b);
+                    if !(plan_fresh && plan.ports[i].never_vif) {
+                        // §13.5.3: an omitted argument binds the formal's
+                        // DEFAULT, so a virtual-interface method formal with a
+                        // default still aliases the interface it names.
+                        let arg = args.get(i).or(port.default.as_ref());
+                        if let Some(expr) = arg {
+                            if let Some((f, b)) = self
+                                .vif_formal_alias(&port.data_type, &port.name.name, expr)
+                            {
+                                iface_alias_frame.insert(f, b);
+                            }
                         }
                     }
                 }
