@@ -371,6 +371,12 @@ impl Simulator {
                     Box::new(self.sva_seq_from_expr(left)),
                     Box::new(self.sva_seq_from_expr(right)),
                 ),
+                // §16.12.12. `s_until` (strong) must eventually match; the
+                // plain `until` (weak) holds regardless if it never does.
+                BinaryOp::Until | BinaryOp::SUntil => SvaSeq::Until(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                ),
                 _ => SvaSeq::Bool(e.clone()),
             },
             // A trailing bare `##N`: a delay with nothing to check.
@@ -461,6 +467,8 @@ impl Simulator {
                         | BinaryOp::Within
                         | BinaryOp::OrMinusArrow
                         | BinaryOp::OrFatArrow
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
                 ) || Self::sva_is_temporal(left)
                     || Self::sva_is_temporal(right)
             }
@@ -959,6 +967,7 @@ impl Simulator {
                     SvaEdge::Sub(comp, t) => {
                         let n = match &**comp {
                             SvaCompound::And(..) | SvaCompound::Intersect(..) => 2,
+                            SvaCompound::Until { .. } => 2,
                             _ => 1,
                         };
                         let mut sub = SvaSubRun {
@@ -1097,6 +1106,51 @@ impl Simulator {
                     Vec::new()
                 };
                 (out, a1 && a2)
+            }
+            SvaCompound::Until { left, right } => {
+                // §16.12.12. The whole matches the tick `right` first
+                // matches, provided `left` held at every earlier tick.
+                // `sub.ever[0]` tracks whether `left` has held so far; on
+                // the first tick (`ticks == 0`) there are no earlier ticks,
+                // so `left` held vacuously. Both operands are re-armed each
+                // tick so a single-cycle boolean operand is re-checked
+                // fresh.
+                let env = std::mem::take(&mut sub.env);
+                let mut out: Vec<SvaEnv> = Vec::new();
+                let on_first_tick = sub.ticks == 0;
+                sub.ticks = sub.ticks.saturating_add(1);
+                let left_held = sub.ever[0] || on_first_tick;
+                let (m2, alive_r) = self.sva_run_advance(right, &mut sub.runs[1], false);
+                if !m2.is_empty() {
+                    if left_held {
+                        for e in &m2 {
+                            out.push(e.clone());
+                        }
+                    }
+                    // The `until` matched (or was broken by `left`); either
+                    // way this compound is done for this attempt.
+                    return (out, false);
+                }
+                // `right` did not match this tick; `left` must hold here.
+                let (m1, alive_l) = self.sva_run_advance(left, &mut sub.runs[0], false);
+                let left_holds_here = !m1.is_empty() || alive_l;
+                if left_holds_here {
+                    // Left holds here: record it and re-arm both operands so
+                    // they are re-checked afresh next tick.
+                    sub.ever[0] = true;
+                    sub.runs[0] = SvaRun::with_env(env.clone());
+                    if !alive_r {
+                        sub.runs[1] = SvaRun::with_env(env);
+                    }
+                    return (out, true);
+                }
+                // `left` failed before `right` matched: the compound is
+                // broken. The weak/strong distinction for whether this is a
+                // hard failure is owned by the enclosing `SvaNode`'s strong
+                // flag (§16.12.12); here the attempt simply produces no
+                // match and dies.
+                sub.ever[0] = false;
+                (out, false)
             }
         }
     }

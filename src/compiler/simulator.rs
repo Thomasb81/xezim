@@ -3601,6 +3601,10 @@ enum SvaSeq {
         min: u64,
         max: u64,
     },
+    /// §16.12.12 `left until right` / `left s_until right`: matches the
+    /// tick `right` first matches, provided `left` held at every earlier
+    /// tick.
+    Until(Box<SvaSeq>, Box<SvaSeq>),
     /// §16.10 / §16.11 match items, run within the cycle: local variable
     /// assignments and subroutine calls (no cycle of its own).
     Assign(Vec<SvaMatchItem>),
@@ -3657,6 +3661,10 @@ enum SvaCompound {
     Delay(u64, u64),
     /// §16.9.2: counted copies of the unit, one cycle apart.
     Repeat(SvaNfa, u64, u64),
+    /// §16.12.12 `left until right` / `left s_until right`: matches the
+    /// tick `right` first matches, provided `left` held at every earlier
+    /// tick.
+    Until { left: SvaNfa, right: SvaNfa },
 }
 
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
@@ -3957,6 +3965,12 @@ impl SvaNfaBuilder {
             }
             SvaSeq::Throughout(e, a) => {
                 self.sub(SvaCompound::Throughout(e.clone(), Self::build(a)))
+            }
+            SvaSeq::Until(a, b) => {
+                self.sub(SvaCompound::Until {
+                    left: Self::build(a),
+                    right: Self::build(b),
+                })
             }
             SvaSeq::Within(a, b) => {
                 // §16.9.10: `(1[*0:$] ##1 a ##1 1[*0:$]) intersect b`.
