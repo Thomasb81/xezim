@@ -1539,6 +1539,21 @@ impl Simulator {
         // cell of its array.
         let mut sels = Vec::new();
         self.collect_sva_sels(&body_expanded, &mut sels);
+        // §16.9.3 / §16.5.1: `$sampled(e)` in an action block reads the
+        // Preponed (slot-entry) value of `e`, whether or not the property
+        // reads `e`. Collect the operands of the action blocks' `$sampled`
+        // calls (their signal ids AND their unpacked-array selects) with the
+        // body's sampled signals BEFORE `fixed` is recorded, so the scalar
+        // operands fall in the retained `[0, fixed)` region and the array
+        // selects flow through the sels pipeline below (issue #509):
+        // `sva_sel_cells` truncates `sampled_ids` to `fixed` and only re-adds
+        // the variable selects' own cells, so anything collected afterwards is
+        // silently dropped on the first Preponed refresh. An unpacked-array
+        // element bypasses collect_sva_signal_ids entirely (its base is not a
+        // signal), so its cells must arrive through the sels pipeline too.
+        for action in [&a.action, &a.else_action].into_iter().flatten() {
+            self.sva_collect_action_sampled(action, &mut sampled_ids, &mut sels);
+        }
         let mut var_sels = Vec::new();
         for mut e in sels {
             match Self::sva_sel_kind(&e) {
@@ -1561,14 +1576,6 @@ impl Simulator {
         let fixed = sampled_ids.len();
         for (e, _) in &var_sels {
             self.sva_cells(e, &mut sampled_ids);
-        }
-        // §16.9.3 / §16.5.1: `$sampled(e)` in an action block reads the
-        // Preponed (slot-entry) value of `e`, whether or not the property
-        // reads `e`. Collect the operands of the action blocks' `$sampled`
-        // calls with the body's sampled signals, so `refresh_sva_preponed`
-        // captures their Preponed snapshots like the property's own operands.
-        for action in [&a.action, &a.else_action].into_iter().flatten() {
-            self.sva_collect_action_sampled(action, &mut sampled_ids);
         }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
@@ -2190,12 +2197,17 @@ impl Simulator {
     /// Collect the signal ids referenced by the `$sampled(...)` calls inside
     /// an assertion action block, so their Preponed snapshots are captured
     /// with the site's other sampled signals (§16.9.3, §16.5.1).
-    pub(super) fn sva_collect_action_sampled(&self, st: &Statement, out: &mut Vec<usize>) {
+    pub(super) fn sva_collect_action_sampled(
+        &self,
+        st: &Statement,
+        out: &mut Vec<usize>,
+        sels: &mut Vec<Expression>,
+    ) {
         use crate::ast::stmt::StatementKind as SK;
         match &st.kind {
             SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
                 for s in stmts {
-                    self.sva_collect_action_sampled(s, out);
+                    self.sva_collect_action_sampled(s, out, sels);
                 }
             }
             SK::If {
@@ -2204,13 +2216,13 @@ impl Simulator {
                 else_stmt,
                 ..
             } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled(then_stmt, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled(then_stmt, out, sels);
                 if let Some(e) = else_stmt {
-                    self.sva_collect_action_sampled(e, out);
+                    self.sva_collect_action_sampled(e, out, sels);
                 }
             }
-            SK::TimingControl { stmt, .. } => self.sva_collect_action_sampled(stmt, out),
+            SK::TimingControl { stmt, .. } => self.sva_collect_action_sampled(stmt, out, sels),
             SK::For {
                 init,
                 condition,
@@ -2220,78 +2232,92 @@ impl Simulator {
                 for init in init {
                     match init {
                         crate::ast::stmt::ForInit::VarDecl { init, .. } => {
-                            self.sva_collect_action_sampled_expr(init, out)
+                            self.sva_collect_action_sampled_expr(init, out, sels)
                         }
                         crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
-                            self.sva_collect_action_sampled_expr(lvalue, out);
-                            self.sva_collect_action_sampled_expr(rvalue, out);
+                            self.sva_collect_action_sampled_expr(lvalue, out, sels);
+                            self.sva_collect_action_sampled_expr(rvalue, out, sels);
                         }
                     }
                 }
                 if let Some(condition) = condition {
-                    self.sva_collect_action_sampled_expr(condition, out);
+                    self.sva_collect_action_sampled_expr(condition, out, sels);
                 }
                 for expr in step {
-                    self.sva_collect_action_sampled_expr(expr, out);
+                    self.sva_collect_action_sampled_expr(expr, out, sels);
                 }
-                self.sva_collect_action_sampled(body, out);
+                self.sva_collect_action_sampled(body, out, sels);
             }
             SK::While { condition, body } | SK::DoWhile { body, condition } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled(body, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled(body, out, sels);
             }
             SK::Repeat { count, body } => {
-                self.sva_collect_action_sampled_expr(count, out);
-                self.sva_collect_action_sampled(body, out);
+                self.sva_collect_action_sampled_expr(count, out, sels);
+                self.sva_collect_action_sampled(body, out, sels);
             }
             SK::Forever { body } | SK::Foreach { body, .. } => {
-                self.sva_collect_action_sampled(body, out)
+                self.sva_collect_action_sampled(body, out, sels)
             }
             SK::Case { expr, items, .. } => {
-                self.sva_collect_action_sampled_expr(expr, out);
+                self.sva_collect_action_sampled_expr(expr, out, sels);
                 for it in items {
                     for pattern in &it.patterns {
-                        self.sva_collect_action_sampled_expr(pattern, out);
+                        self.sva_collect_action_sampled_expr(pattern, out, sels);
                     }
                     if let Some(guard) = &it.guard {
-                        self.sva_collect_action_sampled_expr(guard, out);
+                        self.sva_collect_action_sampled_expr(guard, out, sels);
                     }
-                    self.sva_collect_action_sampled(&it.stmt, out);
+                    self.sva_collect_action_sampled(&it.stmt, out, sels);
                 }
             }
             SK::BlockingAssign { lvalue, rvalue }
             | SK::NonblockingAssign { lvalue, rvalue, .. } => {
-                self.sva_collect_action_sampled_expr(lvalue, out);
-                self.sva_collect_action_sampled_expr(rvalue, out);
+                self.sva_collect_action_sampled_expr(lvalue, out, sels);
+                self.sva_collect_action_sampled_expr(rvalue, out, sels);
             }
             SK::VarDecl { declarators, .. } => {
                 for d in declarators {
                     if let Some(init) = &d.init {
-                        self.sva_collect_action_sampled_expr(init, out);
+                        self.sva_collect_action_sampled_expr(init, out, sels);
                     }
                 }
             }
-            SK::Return(Some(expr)) => self.sva_collect_action_sampled_expr(expr, out),
+            SK::Return(Some(expr)) => self.sva_collect_action_sampled_expr(expr, out, sels),
             SK::Wait { condition, stmt } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled(stmt, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled(stmt, out, sels);
             }
-            SK::Expr(e) => self.sva_collect_action_sampled_expr(e, out),
+            SK::Expr(e) => self.sva_collect_action_sampled_expr(e, out, sels),
             _ => {}
         }
     }
 
-    fn sva_collect_action_sampled_expr(&self, e: &Expression, out: &mut Vec<usize>) {
+    fn sva_collect_action_sampled_expr(
+        &self,
+        e: &Expression,
+        out: &mut Vec<usize>,
+        sels: &mut Vec<Expression>,
+    ) {
         match &e.kind {
             // §16.9.3: `$sampled(e)` — the operand's signals are sampled.
+            // §16.5.1: an element of an unpacked array is sampled too. A
+            // $sampled array element has no resolvable "signal id" (an
+            // unpacked array base is not in signal_name_to_id), so its cells
+            // are collected as selects — exactly like the property body's
+            // array reads — and fed into the sels pipeline (sva_cells for
+            // constant indices, var_sels for variable ones). Without this the
+            // operand's cells are never sampled and $sampled reads the live,
+            // not the Preponed, value.
             ExprKind::SystemCall { name, args } if name == "$sampled" => {
                 for a in args {
                     self.collect_sva_signal_ids(a, out);
+                    self.collect_sva_sels(a, sels);
                 }
             }
             ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
                 for a in args {
-                    self.sva_collect_action_sampled_expr(a, out);
+                    self.sva_collect_action_sampled_expr(a, out, sels);
                 }
             }
             ExprKind::Binary { left, right, .. }
@@ -2299,26 +2325,26 @@ impl Simulator {
                 lvalue: left,
                 rvalue: right,
             } => {
-                self.sva_collect_action_sampled_expr(left, out);
-                self.sva_collect_action_sampled_expr(right, out);
+                self.sva_collect_action_sampled_expr(left, out, sels);
+                self.sva_collect_action_sampled_expr(right, out, sels);
             }
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::MemberAccess { expr: operand, .. } => {
-                self.sva_collect_action_sampled_expr(operand, out)
+                self.sva_collect_action_sampled_expr(operand, out, sels) 
             }
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled_expr(then_expr, out);
-                self.sva_collect_action_sampled_expr(else_expr, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled_expr(then_expr, out, sels);
+                self.sva_collect_action_sampled_expr(else_expr, out, sels);
             }
             ExprKind::Index { expr: base, index } => {
-                self.sva_collect_action_sampled_expr(base, out);
-                self.sva_collect_action_sampled_expr(index, out);
+                self.sva_collect_action_sampled_expr(base, out, sels);
+                self.sva_collect_action_sampled_expr(index, out, sels);
             }
             ExprKind::RangeSelect {
                 expr: base,
@@ -2326,33 +2352,33 @@ impl Simulator {
                 right,
                 ..
             } => {
-                self.sva_collect_action_sampled_expr(base, out);
-                self.sva_collect_action_sampled_expr(left, out);
-                self.sva_collect_action_sampled_expr(right, out);
+                self.sva_collect_action_sampled_expr(base, out, sels);
+                self.sva_collect_action_sampled_expr(left, out, sels);
+                self.sva_collect_action_sampled_expr(right, out, sels);
             }
             ExprKind::Replication { count, exprs } => {
-                self.sva_collect_action_sampled_expr(count, out);
+                self.sva_collect_action_sampled_expr(count, out, sels);
                 for a in exprs {
-                    self.sva_collect_action_sampled_expr(a, out);
+                    self.sva_collect_action_sampled_expr(a, out, sels);
                 }
             }
             ExprKind::Concatenation(exprs) | ExprKind::StreamOp { exprs, .. } => {
                 for a in exprs {
-                    self.sva_collect_action_sampled_expr(a, out);
+                    self.sva_collect_action_sampled_expr(a, out, sels);
                 }
             }
             ExprKind::AssignmentPattern(items) => {
                 for item in items {
-                    self.sva_collect_action_sampled_expr(item.expr(), out);
+                    self.sva_collect_action_sampled_expr(item.expr(), out, sels);
                 }
             }
             ExprKind::NamedArg {
                 expr: Some(expr), ..
-            } => self.sva_collect_action_sampled_expr(expr, out),
+            } => self.sva_collect_action_sampled_expr(expr, out, sels),
             ExprKind::Inside { expr, ranges } => {
-                self.sva_collect_action_sampled_expr(expr, out);
+                self.sva_collect_action_sampled_expr(expr, out, sels);
                 for range in ranges {
-                    self.sva_collect_action_sampled_expr(range, out);
+                    self.sva_collect_action_sampled_expr(range, out, sels);
                 }
             }
             _ => {}

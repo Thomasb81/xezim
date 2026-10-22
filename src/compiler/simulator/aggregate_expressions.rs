@@ -4295,6 +4295,14 @@ impl Simulator {
                     Some(e) => {
                         let mut ids = Vec::new();
                         self.collect_sva_signal_ids(&e, &mut ids);
+                        // §16.5.1: an element of an unpacked array has no
+                        // "signal id" through collect_sva_signal_ids, but its
+                        // Preponed sample lives at the cell's id in
+                        // `sva_preponed`. Collect the cell ids too (sva_cells
+                        // resolves `mem[k]` to its cell id) so install_preponed
+                        // swaps in the Preponed values during the eval below,
+                        // immune to any in-slot writes to that cell.
+                        self.sva_cells(&e, &mut ids);
                         ids.sort_unstable();
                         ids.dedup();
                         let saved = self.install_preponed(&ids);
