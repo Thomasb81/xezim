@@ -1227,6 +1227,67 @@ impl<'a> Ck<'a> {
                 Some(c) => Ty::Class(c.as_str().into()),
                 None => Ty::Unknown,
             },
+            // A cast contributes its target type to the operand's type so the
+            // assignment checks can see through it (§6.19.3: a value of enum
+            // type e_t is still a value of e_t — a cast to a *different* enum
+            // does not make the assignment to that enum legal). `e_t'(x)` is
+            // lowered to `$__xz_named_cast(e_t, x)`; `int'(x)`/`byte'(x)` to
+            // `$__xz_type_cast(int, x)` (both in xezim-parser §6.24.1).
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_named_cast" => {
+                    let mut t = Ty::Unknown;
+                    if let Some(target) = args.first() {
+                        t = self.cast_target_ty(target);
+                    }
+                    t
+                }
+                "$__xz_type_cast" => {
+                    let mut t = Ty::Unknown;
+                    if let Some(target) = args.first() {
+                        t = self.cast_target_ty(target);
+                    }
+                    t
+                }
+                _ => Ty::Unknown,
+            },
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// The type a `$__xz_named_cast`/`$__xz_type_cast` target names — an
+    /// `Ident`/`MemberAccess` spelling a typedef, or a `TypeLiteral`. Used so
+    /// the assignment checks can see an enum-typed cast result (§6.19.3).
+    fn cast_target_ty(&self, target: &Expression) -> Ty {
+        match &target.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty() =>
+            {
+                self.lookup_type(&h.path[0].name.name).unwrap_or(Ty::Unknown)
+            }
+            ExprKind::TypeLiteral(dt) => {
+                // Only a bare named typedef (`e_t`, `pkg::e_t`) is meaningful
+                // here; ranged/composed types (int, packed vectors) reject
+                // enum assignment identically whether cast or not.
+                if let DataType::TypeReference { name, dimensions, type_args, .. } = &**dt
+                    && dimensions.is_empty()
+                    && type_args.is_empty()
+                {
+                    if let Some(scope) = name.single_scope() {
+                        self.env
+                            .packages
+                            .get(&scope.name)
+                            .and_then(|p| p.types.get(name.name.name.as_str()).cloned())
+                            .unwrap_or(Ty::Unknown)
+                    } else {
+                        self.lookup_type(&name.name.name)
+                            .unwrap_or(Ty::Unknown)
+                    }
+                } else {
+                    Ty::Unknown
+                }
+            }
             _ => Ty::Unknown,
         }
     }

@@ -93,6 +93,8 @@ mod division_operand_width;
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
+#[path = "types/enum_cross_cast_assignment.rs"]
+mod enum_cross_cast_assignment;
 #[path = "types/enum_member_per_instance.rs"]
 mod enum_member_per_instance;
 #[path = "types/enum_name_cross_method_local.rs"]
