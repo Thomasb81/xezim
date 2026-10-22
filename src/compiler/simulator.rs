@@ -3786,6 +3786,7 @@ enum SvaState {
     Followed {
         ante: SvaRun,
         ante_alive: bool,
+        nonvacuous: bool,
         cons: Vec<(u32, SvaState)>,
     },
     And {
@@ -3802,7 +3803,15 @@ enum SvaState {
     },
     Until {
         env: SvaEnv,
-        ticks: Vec<SvaUntilTick>,
+        /// Only ticks with an evaluation still pending, or whose failure
+        /// (*left* failed) settled the attempt, are retained. Ticks whose
+        /// left held and right has failed are folded into `nonvacuous` and
+        /// dropped, so the list stays bounded by the pending evaluations
+        /// (issue #510); the folded ticks keep the prefix-holds invariant.
+        ticks: VecDeque<SvaUntilTick>,
+        /// Nonvacuity contributed by folded ticks (and live ones, see
+        /// `sva_advance_until`): §16.14.8, either operand can be nonvacuous.
+        nonvacuous: bool,
         closed: bool,
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.

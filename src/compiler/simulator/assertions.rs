@@ -707,6 +707,53 @@ impl Simulator {
         }
     }
 
+    /// §16.14.8: whether a body operand's attempt is nonvacuous, given how
+    /// far it has resolved. `SvaOutcome` only separates a vacuous success
+    /// from a nonvacuous one; a failure must be judged from the node/state
+    /// itself, because `not` of a vacuous success fails vacuously while a
+    /// failing sequence or implication whose antecedent matched is nonvacuous.
+    fn sva_op_nonvacuous(resolved: &Option<SvaOutcome>, node: &SvaNode, st: &SvaState) -> bool {
+        match resolved {
+            Some(SvaOutcome::Pass) => true,
+            Some(SvaOutcome::Vacuous) => false,
+            Some(SvaOutcome::Fail) | None => Self::sva_attempt_nonvacuous(node, st),
+        }
+    }
+
+    /// §16.14.8: the nonvacuity of an attempt in its current state, whether
+    /// or not it has resolved. A sequence attempt is always nonvacuous; an
+    /// implication is nonvacuous iff some consequent started by a match was
+    /// nonvacuous; each compound operator keeps a recursive rule. For a
+    /// pending operand the value is how far the attempt has established
+    /// nonvacuity, which is enough because a compound body only resolves an
+    /// operand once it has resolved.
+    fn sva_attempt_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
+        match (node, st) {
+            // §16.14.8: an evaluation attempt of a sequence expression is
+            // always nonvacuous, whether the sequence matched or failed.
+            (SvaNode::Seq(..), SvaState::Seq(_)) => true,
+            (
+                SvaNode::Impl { .. } | SvaNode::Followed { .. },
+                SvaState::Impl { nonvacuous, .. } | SvaState::Followed { nonvacuous, .. },
+            ) => *nonvacuous,
+            (SvaNode::Not(inner), SvaState::Not(ist)) => {
+                Self::sva_attempt_nonvacuous(inner, ist)
+            }
+            (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
+            }
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_nonvacuous(ra, na, a) && Self::sva_op_nonvacuous(rb, nb, b)
+            }
+            // §16.14.8: `P iff Q` is nonvacuous iff P and Q have differing
+            // vacuity (one attempt vacuous, the other nonvacuous).
+            (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_nonvacuous(ra, na, a) != Self::sva_op_nonvacuous(rb, nb, b)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a pending property fails at the end of simulation (§16.12.2–3).
     /// A weak sequence holds when the clock stops; property `not` inverts
     /// that result just as it inverts a completed operand's result.
@@ -867,6 +914,7 @@ impl Simulator {
             SvaNode::Followed { .. } => SvaState::Followed {
                 ante: SvaRun::with_env(env.clone()),
                 ante_alive: true,
+                nonvacuous: false,
                 cons: Vec::new(),
             },
             SvaNode::And(a, b) | SvaNode::Iff(a, b) => SvaState::And {
@@ -883,7 +931,8 @@ impl Simulator {
             },
             SvaNode::Until { .. } => SvaState::Until {
                 env: env.clone(),
-                ticks: Vec::new(),
+                ticks: VecDeque::new(),
+                nonvacuous: false,
                 closed: false,
             },
             SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
@@ -1272,7 +1321,16 @@ impl Simulator {
                         continue;
                     }
                     match self.sva_advance(cons_node, &mut cst) {
-                        Some(SvaOutcome::Fail) => failed = true,
+                        Some(SvaOutcome::Fail) => {
+                            failed = true;
+                            // §16.14.8: a nonvacuous consequent keeps the
+                            // implication's attempt nonvacuous even when it
+                            // fails (`a |-> b` with `a` matched is nonvacuous,
+                            // and it decides the vacuity of an enclosing `or`).
+                            if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                *nonvacuous = true;
+                            }
+                        }
                         Some(SvaOutcome::Pass) => *nonvacuous = true,
                         Some(SvaOutcome::Vacuous) => {}
                         None => keep.push((0, cst)),
@@ -1281,7 +1339,12 @@ impl Simulator {
                 for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
-                            Some(SvaOutcome::Fail) => failed = true,
+                            Some(SvaOutcome::Fail) => {
+                                failed = true;
+                                if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                    *nonvacuous = true;
+                                }
+                            }
                             Some(SvaOutcome::Pass) => *nonvacuous = true,
                             Some(SvaOutcome::Vacuous) => {}
                             None => keep.push((0, cst)),
@@ -1315,6 +1378,7 @@ impl Simulator {
                 SvaState::Followed {
                     ante: arun,
                     ante_alive,
+                    nonvacuous,
                     cons,
                 },
             ) => {
@@ -1342,7 +1406,14 @@ impl Simulator {
                     match self.sva_advance(cons_node, &mut cst) {
                         Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
                         Some(SvaOutcome::Vacuous) => vacuous = true,
-                        Some(SvaOutcome::Fail) => {}
+                        Some(SvaOutcome::Fail) => {
+                            // §16.14.8: a subsequent compound that resolves
+                            // this `Followed` needs to know whether a failing
+                            // consequent's attempt was nonvacuous.
+                            if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                *nonvacuous = true;
+                            }
+                        }
                         None => keep.push((0, cst)),
                     }
                 }
@@ -1351,7 +1422,11 @@ impl Simulator {
                         match self.sva_advance(cons_node, &mut cst) {
                             Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
                             Some(SvaOutcome::Vacuous) => vacuous = true,
-                            Some(SvaOutcome::Fail) => {}
+                            Some(SvaOutcome::Fail) => {
+                                if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                    *nonvacuous = true;
+                                }
+                            }
                             None => keep.push((0, cst)),
                         }
                     } else {
@@ -1395,14 +1470,31 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
+                // §16.14.8: a nonvacuous success of either operand already
+                // decides a nonvacuous success for the `or`, regardless of the
+                // other operand.
                 if *ra == Some(SvaOutcome::Pass) || *rb == Some(SvaOutcome::Pass) {
                     return Some(SvaOutcome::Pass);
                 }
-                if *ra == Some(SvaOutcome::Vacuous) || *rb == Some(SvaOutcome::Vacuous) {
-                    return Some(SvaOutcome::Vacuous);
-                }
+                // Otherwise the `or` succeeds unless both operands fail, and
+                // it is nonvacuous if either operand's attempt is nonvacuous
+                // (a failing but nonvacuous operand still makes the `or`
+                // nonvacuous when it succeeds). Do not decide on a vacuous
+                // success while an operand is still pending: a later
+                // nonvacuous result would change the vacuity.
                 match (*ra, *rb) {
-                    (Some(_), Some(_)) => Some(SvaOutcome::Fail),
+                    (Some(_), Some(_)) => {
+                        let fails = *ra == Some(SvaOutcome::Fail) && *rb == Some(SvaOutcome::Fail);
+                        let nonvacuous =
+                            Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b);
+                        Some(if fails {
+                            SvaOutcome::Fail
+                        } else if nonvacuous {
+                            SvaOutcome::Pass
+                        } else {
+                            SvaOutcome::Vacuous
+                        })
+                    }
                     _ => None,
                 }
             }
@@ -1426,8 +1518,8 @@ impl Simulator {
                     _ => None,
                 }
             }
-            (SvaNode::Until { left, right, .. }, SvaState::Until { env, ticks, closed }) => {
-                self.sva_advance_until(left, right, env, ticks, closed)
+            (SvaNode::Until { left, right, .. }, SvaState::Until { env, ticks, nonvacuous, closed }) => {
+                self.sva_advance_until(left, right, env, nonvacuous, ticks, closed)
             }
             (SvaNode::Eventually(e), SvaState::Leaf(env)) => {
                 if self.sva_eval_env(e, env).is_true() {

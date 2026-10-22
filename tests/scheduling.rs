@@ -377,3 +377,9 @@ mod sampled_action_468;
 
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
+
+#[path = "scheduling/or_vacuity_508.rs"]
+mod or_vacuity_508;
+
+#[path = "scheduling/until_folding_510.rs"]
+mod until_folding_510;
