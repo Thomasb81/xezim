@@ -10522,6 +10522,10 @@ impl<'a> BytecodeCompiler<'a> {
                 || self.queue_vars.is_some_and(|m| m.contains(&elem))
                 || self.dynamic_arrays.is_some_and(|m| m.contains(&elem)))
         };
+        let canonical = self.signal_name_to_id.canonical_interface_name(&raw);
+        if canonical != raw && self.arrays.contains_key(canonical.as_ref()) {
+            return dense(&canonical).then(|| canonical.into_owned());
+        }
         if self.arrays.contains_key(&raw) {
             return dense(&raw).then_some(raw);
         }
@@ -10535,6 +10539,23 @@ impl<'a> BytecodeCompiler<'a> {
             let leaf = &hier.path[0].name.name;
             if self.arrays.contains_key(leaf) {
                 return dense(leaf).then_some(leaf.clone());
+            }
+        }
+        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+        // registers under its QUALIFIED key only (`pkg::LIM`, elements
+        // `pkg::LIM[i]`) — bare visibility stays with the import machinery,
+        // unlike package variables, which hoist bare. `hier_raw_name` joins
+        // with '.', so `pkg::LIM` probed as "pkg.LIM" and missed, and the
+        // element read degraded to a bit-select of a phantom scalar. Probe
+        // the '::'-joined two-segment spelling; a dotted hierarchical name
+        // never contains '::', so this cannot capture another name.
+        if hier.path.len() == 2
+            && hier.path.iter().all(|s| s.selects.is_empty())
+            && hier.root.is_none()
+        {
+            let q = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+            if self.arrays.contains_key(&q) {
+                return dense(&q).then_some(q);
             }
         }
         // Top-prefix strip, as `resolve_signal_id` does for scalars: an
@@ -13626,10 +13647,10 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     sub_ctx
                 };
-                let left_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_shift(left));
-                let right_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_shift(right));
+                // §11.8.2: comparison operands determine each other's type
+                // before evaluation, including nested arithmetic, not only shifts.
+                let left_unsigned = joint_unsigned;
+                let right_unsigned = joint_unsigned;
                 let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
@@ -18653,6 +18674,7 @@ impl<'a> BytecodeCompiler<'a> {
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
             ExprKind::Paren(i) => self.expr_signedness(i),
             // §20/§21: an `int`/`integer`-valued system function is SIGNED
             // (`$countones(x) - 8 < 0` is a signed compare); `bit`, `time`
@@ -18681,8 +18703,21 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
-            ExprKind::Index { .. }
-            | ExprKind::RangeSelect { .. }
+            ExprKind::Index { expr, .. } => {
+                // §7.4: an unpacked element retains its declared type; only
+                // a packed bit-select is necessarily unsigned (§11.8.1).
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(e) {
+                    return self.signal_signed.get(id).copied();
+                }
+                if let ExprKind::Ident(h) = &expr.kind
+                    && let Some(name) = self.lookup_array_name(h)
+                {
+                    let first = self.array_first_id?.get(name.as_str())?.0;
+                    return self.signal_signed.get(first).copied();
+                }
+                self.operand_scrub_is_noop(e).then_some(false)
+            }
+            ExprKind::RangeSelect { .. }
             | ExprKind::Concatenation(_)
             | ExprKind::Replication { .. } => Some(false),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -18693,7 +18728,13 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => None,
             },
             ExprKind::Unary { op, operand } => match op {
-                UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.expr_signedness(operand),
+                UnaryOp::Plus
+                | UnaryOp::Minus
+                | UnaryOp::BitNot
+                | UnaryOp::PreIncr
+                | UnaryOp::PreDecr
+                | UnaryOp::PostIncr
+                | UnaryOp::PostDecr => self.expr_signedness(operand),
                 // Reductions and ! are 1-bit unsigned.
                 _ => Some(false),
             },

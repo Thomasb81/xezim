@@ -1854,6 +1854,68 @@ impl Simulator {
         (self.recv_call_memo.len() > base).then_some(base)
     }
 
+    /// §8.4/§23.7: resolve the declared class boundary before following
+    /// object properties. Integral values and unrelated leaf names cannot
+    /// establish a class boundary.
+    pub(super) fn hier_parent_handle(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<usize> {
+        if self.no_class_objects()
+            || hier.path.len() < 3
+            || hier.path.iter().any(|s| !s.selects.is_empty())
+            || self.bare_name_is_class_channel(&hier.path[0].name.name)
+        {
+            return None;
+        }
+        let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
+        for split in (1..segs.len()).rev() {
+            let dotted = segs[..split].join(".");
+            let name = dotted
+                .strip_prefix(&format!("{}.", self.module.name))
+                .unwrap_or(&dotted);
+            let class = self
+                .module
+                .var_decl_types
+                .get(name)
+                .and_then(|dt| self.declared_typeref_name(dt))
+                .or_else(|| {
+                    self.module
+                        .signals
+                        .get(name)
+                        .and_then(|s| s.type_name.clone())
+                })
+                .or_else(|| {
+                    self.signal_name_to_id
+                        .get(name)
+                        .and_then(|id| self.signal_type_names.get(id).cloned())
+                })
+                .and_then(|tn| self.resolve_typeref_class_name_str(&tn));
+            let mut handle = if split == 1 && self.bare_name_is_class_channel(segs[0]) {
+                self.eval_ident_handle(segs[0])
+            } else if class.is_some() {
+                self.get_signal_value_by_name(name)
+                    .and_then(|v| v.to_u64())
+                    .map(|v| v as usize)
+            } else {
+                None
+            };
+            for member in &segs[split..segs.len() - 1] {
+                handle = handle.and_then(|h| {
+                    let tn = self.class_prop_type_name(h, member)?;
+                    self.resolve_typeref_class_name_str(&tn)?;
+                    self.member_handle(h, member)
+                });
+            }
+            if let Some(h) =
+                handle.filter(|&h| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some()))
+            {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
@@ -1874,7 +1936,7 @@ impl Simulator {
     }
 
     /// Declared expression signedness without executing conditional arms or
-    /// calls. Consulted only when a nested shift needs type propagation.
+    /// calls. Context-determined operands need this type before evaluation.
     #[inline(never)]
     pub(super) fn expression_signed_hint(&mut self, expr: &Expression) -> Option<bool> {
         fn joint(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -1907,8 +1969,60 @@ impl Simulator {
                     })
             }),
             ExprKind::Paren(e) => self.expression_signed_hint(e),
+            ExprKind::Index { .. } => {
+                let mut root = expr;
+                let mut indices = 0;
+                loop {
+                    match &root.kind {
+                        ExprKind::Index { expr, .. } => {
+                            indices += 1;
+                            root = expr;
+                        }
+                        ExprKind::Paren(inner) => root = inner,
+                        _ => break,
+                    }
+                }
+                let ExprKind::Ident(h) = &root.kind else {
+                    return None;
+                };
+                if self.frame_bound_bare_name(h).is_some() {
+                    return self
+                        .get_expr_type_name(expr)
+                        .and_then(|name| self.concrete_type_signed(&name));
+                }
+                let name = self.resolve_hier_name(h);
+                let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(name.as_ref()) {
+                    dims.len()
+                } else if self.module.arrays_2d.contains_key(name.as_ref()) {
+                    2
+                } else {
+                    usize::from(
+                        self.module.arrays.contains_key(name.as_ref())
+                            || self.module.dynamic_arrays.contains(name.as_ref())
+                            || self.module.queue_vars.contains(name.as_ref())
+                            || self.is_associative_array(name.as_ref()),
+                    )
+                };
+                if indices > unpacked {
+                    // More indices can enter a nested queue or associative
+                    // row. Only a known scalar signal proves a packed select;
+                    // unknown class/local storage must retain its own type.
+                    return (unpacked == 0 && self.module.signals.contains_key(name.as_ref()))
+                        .then_some(false);
+                }
+                self.module.var_decl_types.get(name.as_ref()).map(|dt| {
+                    super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
+                })
+            }
             ExprKind::Unary {
-                op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+                op:
+                    UnaryOp::Plus
+                    | UnaryOp::Minus
+                    | UnaryOp::BitNot
+                    | UnaryOp::PreIncr
+                    | UnaryOp::PreDecr
+                    | UnaryOp::PostIncr
+                    | UnaryOp::PostDecr,
                 operand,
             } => self.expression_signed_hint(operand),
             ExprKind::Unary { .. } => Some(false),
@@ -2062,15 +2176,73 @@ impl Simulator {
         // prefix and re-enter, as the identifier spelling does below. Scalar
         // `pkg::x` reads keep their own arm (parameters of two packages must
         // not collide through the bare name).
+        //
+        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+        // keeps its QUALIFIED registration only (`pkg::LIM` plus per-element
+        // `pkg::LIM[i]`); stripping the head here resolved the element select
+        // to a bare `LIM` that exists nowhere and read 0. Keep the qualified
+        // spelling when it names a collection — the indexed arms below
+        // resolve the base through `resolve_hier_name`, which returns the
+        // qualified key (package variables still hoist bare as before).
+        let pkg_qual_collection = match &expr.kind {
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                // §26.3 / §7.4: every select belongs to the qualified
+                // collection, including the outer select of a nested index.
+                let mut base = base.as_ref();
+                while let ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::Paren(expr) = &base.kind
+                {
+                    base = expr;
+                }
+                match &base.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() == 2
+                            && h.path[0].selects.is_empty()
+                            && self.module.packages.contains(&h.path[0].name.name) =>
+                    {
+                        self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                            .is_some()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
         if !self.module.packages.is_empty()
             && matches!(
                 expr.kind,
                 ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
             )
+            && !pkg_qual_collection
         {
             if let Some(stripped) = self.strip_package_lvalue(expr) {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
+        }
+        // §6.20.2/§26.3 (issue #425): `(pkg::LIM)[3]` — the Paren wrapper is
+        // semantically transparent, but it defeats every base-shape probe
+        // above and below (including the package strip), so the select fell
+        // through to a bit-select of the whole-array read and returned 0.
+        // Unwrap the wrapper for the package-collection shape and re-enter.
+        if let ExprKind::Index { expr: base, index } = &expr.kind
+            && let ExprKind::Paren(inner) = &base.kind
+            && let ExprKind::Ident(h) = &inner.kind
+            && h.path.len() == 2
+            && h.path[0].selects.is_empty()
+            && self.module.packages.contains(&h.path[0].name.name)
+            && self
+                .pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                .is_some()
+        {
+            let rewritten = Expression::new(
+                ExprKind::Index {
+                    expr: inner.clone(),
+                    index: index.clone(),
+                },
+                expr.span,
+            );
+            return self.eval_expr_ctx(&rewritten, ctx_width);
         }
         // §13.5.2: an indexed / part-selected read through a `ref` formal
         // reads the caller's actual (see `ref_formal_redirect_hier`).
@@ -3054,6 +3226,24 @@ impl Simulator {
                             return val.clone();
                         }
                     }
+                    // §8.4: the object's own storage wins over the signal table.
+                    // `tb.u_leaf.obj.field` used to be looked up as the flat name
+                    // "tb.u_leaf.obj.field", which fell through to the leaf and
+                    // returned tb's own `field` signal — the object was never
+                    // consulted.  Only taken when the parent really is a live
+                    // object AND declares the member, so struct/net paths are
+                    // untouched.
+                    if let Some(h) = self.hier_parent_handle(hier) {
+                        let member_name = hier.path[hier.path.len() - 1].name.name.as_str();
+                        let via = hier.path[hier.path.len() - 2].name.name.as_str();
+                        let mut mval = self.static_read_via_handle(h, Some(via), None, member_name);
+                        if mval.is_none() {
+                            mval = self.read_member_value(h, member_name);
+                        }
+                        if let Some(mval) = mval {
+                            return mval;
+                        }
+                    }
                     // SV-2023: class-handle dereference. If a leading dotted
                     // prefix names a signal storing a class handle (e.g. a
                     // parameterized static like `registry#(byte)::singleton`),
@@ -3643,13 +3833,21 @@ impl Simulator {
                         _ => unreachable!(),
                     }
                 }
-                // Logical implication / equivalence (IEEE §11.4.7).
-                if matches!(op, BinaryOp::LogImplies | BinaryOp::LogEquiv) {
+                // Logical implication / equivalence (IEEE §11.4.7). The SVA
+                // `iff` (§16.12.8), `property_expr1 iff property_expr2`, is
+                // logical equivalence too: true iff both hold or both don't.
+                if matches!(
+                    op,
+                    BinaryOp::LogImplies | BinaryOp::LogEquiv | BinaryOp::Iff
+                ) {
                     let l = self.eval_expr_ctx(left, ctx_width);
                     let r = self.eval_expr_ctx(right, ctx_width);
                     return match op {
                         BinaryOp::LogImplies => l.logic_impl(&r),
                         BinaryOp::LogEquiv => l.logic_equiv(&r),
+                        // §16.12.8: iff compares PROPERTY truth values. An
+                        // unknown Boolean expression is a failed property.
+                        BinaryOp::Iff => Value::from_u64(u64::from(l.is_true() == r.is_true()), 1),
                         _ => unreachable!(),
                     };
                 }
@@ -4013,33 +4211,39 @@ impl Simulator {
                     }
                     pre_r = Some(r0);
                 }
-                // §11.8.2: propagate unsigned type into nested shifts before
-                // their operands widen. Type probes never execute calls.
+                // §11.8.2: propagate unsigned type before nested arithmetic
+                // runs or its operands widen. Type probes never execute calls.
                 let joint_unsigned = if is_arith_or_bitwise
                     || matches!(op, BinaryOp::Div | BinaryOp::Mod)
                     || is_comparison
                 {
                     (!is_comparison && unsigned_context)
-                        || (has_shift
-                            && (pre_l
+                        || (pre_l
+                            .as_ref()
+                            .map(|v| v.is_signed)
+                            .or_else(|| self.expression_signed_hint(left))
+                            == Some(false)
+                            || pre_r
                                 .as_ref()
                                 .map(|v| v.is_signed)
-                                .or_else(|| self.expression_signed_hint(left))
-                                == Some(false)
-                                || pre_r
-                                    .as_ref()
-                                    .map(|v| v.is_signed)
-                                    .or_else(|| self.expression_signed_hint(right))
-                                    == Some(false)))
+                                .or_else(|| self.expression_signed_hint(right))
+                                == Some(false))
                 } else if widens_left {
                     unsigned_context
                 } else {
                     false
                 };
+                let literal_comparison = matches!(
+                    op,
+                    BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
+                );
                 let left_unsigned =
-                    joint_unsigned && (!is_comparison || super::bytecode::has_context_shift(left));
+                    joint_unsigned && !(literal_comparison && Self::expr_is_signed_literal(left));
                 let right_unsigned =
-                    joint_unsigned && (!is_comparison || super::bytecode::has_context_shift(right));
+                    joint_unsigned && !(literal_comparison && Self::expr_is_signed_literal(right));
                 let mut l = match pre_l.take() {
                     Some(mut v) => {
                         if left_unsigned && !v.is_real {
@@ -4240,10 +4444,18 @@ impl Simulator {
                         let opw = self_det_w.max(wl.width);
                         wl.resize(opw).power(&wr)
                     }
-                    BinaryOp::BitAnd => wl.bitwise_and(&wr),
-                    BinaryOp::BitOr => wl.bitwise_or(&wr),
-                    BinaryOp::BitXor => wl.bitwise_xor(&wr),
-                    BinaryOp::BitXnor => wl.bitwise_xor(&wr).bitwise_not(),
+                    // §11.8.1: the integral result is signed when both
+                    // operands are signed. The bit-plane helpers clear it.
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor => {
+                        let mut value = match op {
+                            BinaryOp::BitAnd => wl.bitwise_and(&wr),
+                            BinaryOp::BitOr => wl.bitwise_or(&wr),
+                            BinaryOp::BitXor => wl.bitwise_xor(&wr),
+                            _ => wl.bitwise_xor(&wr).bitwise_not(),
+                        };
+                        value.is_signed = wl.is_signed && wr.is_signed;
+                        value
+                    }
                     BinaryOp::LogAnd => wl.logic_and(&wr),
                     BinaryOp::LogOr => wl.logic_or(&wr),
                     BinaryOp::LogImplies => wl.logic_impl(&wr),
@@ -4310,10 +4522,8 @@ impl Simulator {
                 }
                 let c = self.eval_expr(condition);
                 let arms_unsigned = unsigned_context
-                    || ((super::bytecode::has_context_shift(then_expr)
-                        || super::bytecode::has_context_shift(else_expr))
-                        && (self.expression_signed_hint(then_expr) == Some(false)
-                            || self.expression_signed_hint(else_expr) == Some(false)));
+                    || self.expression_signed_hint(then_expr) == Some(false)
+                    || self.expression_signed_hint(else_expr) == Some(false);
                 let arm_ctx = if arms_unsigned {
                     ctx_width
                         .max(self.lrm_self_width(then_expr).unwrap_or(0))
@@ -4569,6 +4779,17 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §8.25: class constant arrays precede packed-property probes.
+                // The declaration-name cache excludes ordinary indexed reads
+                // before constructing or resolving a class-scope path.
+                if !self.module.classes.is_empty()
+                    && Self::receiver_prop_name(expr).is_some_and(|name| {
+                        self.class_member_names().constant_arrays.contains(name)
+                    })
+                    && let Some(v) = self.class_param_array_element(expr, index)
+                {
+                    return v;
+                }
                 // Element select on a packed multi-dimensional CLASS property.
                 if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
                     // §7.4: an element of an unpacked array property of
@@ -5292,13 +5513,14 @@ impl Simulator {
                                     }
                                     return v;
                                 }
-                                // §7.4.6: out of range on a FIXED array reads
-                                // x at the element width. Falling through
-                                // reached the bit-select fallback, a 1-bit x
-                                // that the store then zero-extended.
+                                // §7.4.6 / Table 7-1: an invalid fixed-array
+                                // index yields the element type's default,
+                                // fitted to its width and signedness.
                                 if !self.module.dynamic_arrays.contains(&*name) {
                                     if let Some(ew) = self.module.arrays.get(&*name).map(|a| a.2) {
-                                        return Value::new(ew.max(1));
+                                        return self
+                                            .assoc_missing_elem_value(&name)
+                                            .unwrap_or_else(|| Value::new(ew.max(1)));
                                     }
                                 }
                             }

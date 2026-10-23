@@ -511,3 +511,18 @@ mod const_fn_call_in_generate_if;
 
 #[path = "types/fixed_assoc_key_types.rs"]
 mod fixed_assoc_key_types;
+
+#[path = "types/body_type_parameters_498.rs"]
+mod body_type_parameters_498;
+
+#[path = "types/procedural_bitwise_sign_500.rs"]
+mod procedural_bitwise_sign_500;
+
+#[path = "types/arithmetic_shift_xz.rs"]
+mod arithmetic_shift_xz;
+
+#[path = "types/child_param_packed_elem_width.rs"]
+mod child_param_packed_elem_width;
+
+#[path = "types/unsigned_context_501.rs"]
+mod unsigned_context_501;

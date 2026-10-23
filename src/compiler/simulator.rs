@@ -2543,6 +2543,7 @@ mod aggregate_expressions;
 mod aggregate_members;
 mod arguments;
 mod assertions;
+mod sva_until;
 mod assignments;
 mod bytecode_runtime;
 mod calls;
@@ -2550,6 +2551,8 @@ mod class_access;
 mod class_members;
 mod class_methods;
 mod class_specialization;
+mod class_array_constants;
+mod property_initialization;
 mod clocking;
 mod collection_methods;
 mod collections;
@@ -3325,6 +3328,22 @@ impl StaticMap {
     }
 }
 
+/// §8.25/§6.20.2 (issue #423): the materialized elements of one class-scope
+/// ARRAY constant of one specialization — a header VALUE parameter declared
+/// with unpacked dimensions (`class C #(int unsigned TBL [4] = '{...})`,
+/// read `C#(..)::TBL[i]`) or a class-body `localparam` array (`LP[i]`).
+/// Lazily built on first element read by
+/// `Simulator::materialize_class_param_array`; `lo`/`hi` preserve bounds;
+/// `default` carries the declared element type for invalid/unknown indices.
+#[derive(Debug, Clone)]
+struct ClassParamArray {
+    lo: i64,
+    hi: i64,
+    descending: bool,
+    default: Value,
+    elems: Vec<Value>,
+}
+
 impl std::ops::Deref for StaticMap {
     type Target = HashMap<String, Value>;
     fn deref(&self) -> &Self::Target {
@@ -3394,6 +3413,8 @@ struct ClassMemberNames {
     /// Every static property and class `localparam` name: the only names
     /// `static_prop_key` can resolve.
     static_or_param: HashSet<String>,
+    /// Names of class constant arrays and fixed static arrays.
+    constant_arrays: HashSet<String>,
     /// Names `plain_ident_read` leaves to the full path: static, vif and
     /// struct-capable properties, and the UVM activity constants.
     ident_slow: HashSet<String>,
@@ -3633,6 +3654,10 @@ enum SvaSeq {
         min: u64,
         max: u64,
     },
+    /// §16.12.12 `left until right` / `left s_until right`: matches the
+    /// tick `right` first matches, provided `left` held at every earlier
+    /// tick.
+    Until(Box<SvaSeq>, Box<SvaSeq>),
     /// §16.10 / §16.11 match items, run within the cycle: local variable
     /// assignments and subroutine calls (no cycle of its own).
     Assign(Vec<SvaMatchItem>),
@@ -3689,6 +3714,10 @@ enum SvaCompound {
     Delay(u64, u64),
     /// §16.9.2: counted copies of the unit, one cycle apart.
     Repeat(SvaNfa, u64, u64),
+    /// §16.12.12 `left until right` / `left s_until right`: matches the
+    /// tick `right` first matches, provided `left` held at every earlier
+    /// tick.
+    Until { left: SvaNfa, right: SvaNfa },
 }
 
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
@@ -3752,6 +3781,13 @@ enum SvaNode {
     },
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
+    Iff(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.12: arbitrary properties are started at each candidate tick.
+    Until {
+        left: Box<SvaNode>,
+        right: Box<SvaNode>,
+        strong: bool,
+    },
     /// §16.12.6 `s_eventually e`: holds once `e` samples true.
     Eventually(Expression),
     /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
@@ -3761,8 +3797,8 @@ enum SvaNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SvaOutcome {
     Pass,
-    /// An implication whose antecedent never matched: holds, but fires no
-    /// pass action (§16.12.1).
+    /// A vacuous success (§16.14.8), including an implication whose
+    /// antecedent never matched or whose consequents all passed vacuously.
     Vacuous,
     Fail,
 }
@@ -3775,7 +3811,7 @@ enum SvaState {
     Impl {
         ante: SvaRun,
         ante_alive: bool,
-        matched_any: bool,
+        nonvacuous: bool,
         /// Consequent evaluations `(ticks until they start, state)`.
         cons: Vec<(u32, SvaState)>,
     },
@@ -3796,8 +3832,22 @@ enum SvaState {
         ra: Option<SvaOutcome>,
         rb: Option<SvaOutcome>,
     },
+    Until {
+        env: SvaEnv,
+        ticks: Vec<SvaUntilTick>,
+        closed: bool,
+    },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
+}
+
+/// One candidate start point of a property-valued until operand.
+#[derive(Debug, Clone)]
+struct SvaUntilTick {
+    left: SvaState,
+    right: SvaState,
+    left_result: Option<SvaOutcome>,
+    right_result: Option<SvaOutcome>,
 }
 
 /// Thompson-style construction of `SvaNfa` fragments.
@@ -3990,6 +4040,10 @@ impl SvaNfaBuilder {
             SvaSeq::Throughout(e, a) => {
                 self.sub(SvaCompound::Throughout(e.clone(), Self::build(a)))
             }
+            SvaSeq::Until(a, b) => self.sub(SvaCompound::Until {
+                left: Self::build(a),
+                right: Self::build(b),
+            }),
             SvaSeq::Within(a, b) => {
                 // §16.9.10: `(1[*0:$] ##1 a ##1 1[*0:$]) intersect b`.
                 let span = crate::ast::Span::dummy();
@@ -4537,6 +4591,9 @@ struct BlockScopeSave {
     declarations: Vec<DeclShadow>,
     /// The enclosing frame's string-kind overlay, not the global name table.
     string_kinds: Vec<(String, Option<bool>)>,
+    /// Virtual-interface aliases and auxiliary slots hidden by this block.
+    vif_aliases: Vec<(String, Option<String>)>,
+    vif_slots: Vec<(String, Option<Value>)>,
     /// A suspend-aware for loop closes its variable scope at the same sentinel.
     loop_vars: Vec<LoopVarSnapshot>,
     owns_loop_frame: bool,
@@ -4576,6 +4633,8 @@ struct TaskCleanup {
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
+    /// §13.5.3: omitted outputs copy back in the declaration's scope.
+    default_output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     /// §25.9: flat binding slots shadowed by this task's formals.
     saved_vif_formals: Vec<(String, Option<Value>)>,
     assoc_params: Vec<(String, String, bool)>,
@@ -6865,6 +6924,13 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: StaticMap,
+    /// §8.25/§6.20.2 (issue #423): lazily materialized per-specialization
+    /// elements of class-scope ARRAY constants (header value parameters
+    /// with unpacked dims, class localparam arrays), keyed
+    /// `DeclClass#canon_sig::name` — or `DeclClass::name`-shaped default
+    /// bindings when no specialization is active. See
+    /// `materialize_class_param_array`.
+    class_param_arrays: HashMap<String, ClassParamArray>,
     /// Per-frame overlay for class/typedef types of frame-locals. The
     /// global var_class_types/var_typedef_types are keyed by BARE name and
     /// shared across every process, so a class-typed local declared in one
@@ -6948,6 +7014,9 @@ pub struct Simulator {
     /// Recursion guard for evaluating call-bearing instance-property
     /// initializers at construction (see `evaluate_call_init_at_construct`).
     construct_init_depth: u32,
+    /// Classes awaiting their §8.7 initialization for each constructing object.
+    pending_class_initializers:
+        HashMap<usize, Vec<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>>>,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,

@@ -2442,6 +2442,8 @@ impl Simulator {
 
         let n = names.len();
         let mut signal_name_to_id = NameMap::with_capacity(n);
+        signal_name_to_id
+            .set_interface_aliases(module.name.clone(), module.interface_port_aliases.clone());
         // Ports the elaborator left out as unobserved: a lookup that misses
         // is checked against them (see `names::ElidedPorts`).
         if module.elided_port_count > 0 {
@@ -3858,6 +3860,7 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
+            class_param_arrays: HashMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
             spec_scope_stack: Vec::new(),
@@ -3916,6 +3919,7 @@ impl Simulator {
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
             construct_init_depth: 0,
+            pending_class_initializers: HashMap::default(),
             var_class_types: HashMap::default(),
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
