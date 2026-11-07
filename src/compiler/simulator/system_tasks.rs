@@ -843,6 +843,23 @@ impl Simulator {
                     },
                 }
             }
+            "$sc_export_sig" | "$sc_import_sig" => {
+                self.exec_sc_map_task(name, args);
+            }
+            "$sc_step" => {
+                let ticks = if args.is_empty() {
+                    1
+                } else {
+                    self.eval_expr(&args[0]).to_u64().unwrap_or(1)
+                };
+                self.sc_step_sv_top(ticks);
+            }
+            "$sc_finish" => {
+                if let Some(b) = self.sc_bridge.as_ref() {
+                    unsafe { (b.shim.model_finish)() };
+                }
+                self.finished = true;
+            }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
                     // §21.7.2.1: the file name is any string-valued expression

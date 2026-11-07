@@ -1078,6 +1078,32 @@ impl Simulator {
             }
             let _ = writeln!(hdr, "$upscope $end");
         }
+        // ── SystemC co-sim scope ──
+        // The bridge's registry signals appear as their own scope, sibling of
+        // the SV top, with id codes continuing after the SystemVerilog ones.
+        // Values update at each exchange (not on SV writes), so the per-change
+        // path below compares against each writer's own mirror.
+        let sc_codes: Vec<Arc<str>> = match self.sc_bridge.as_ref() {
+            Some(b) if !b.trace.is_empty() => {
+                let _ = writeln!(hdr, "$scope module systemc_bridge $end");
+                let mut codes = Vec::with_capacity(b.trace.len());
+                for (i, row) in b.trace.iter().enumerate() {
+                    let code: Arc<str> =
+                        Arc::from(Self::vcd_id_code(code_of_backing.len() + i));
+                    let _ = writeln!(
+                        hdr,
+                        "$var wire {} {} {} $end",
+                        row.width.max(1),
+                        code,
+                        Self::sc_trace_leaf(&row.name)
+                    );
+                    codes.push(code);
+                }
+                let _ = writeln!(hdr, "$upscope $end");
+                codes
+            }
+            _ => Vec::new(),
+        };
         let _ = writeln!(hdr, "$enddefinitions $end");
 
         // Build the compact per-cycle trace table: (signal_table index, code).
@@ -1115,6 +1141,16 @@ impl Simulator {
             prev.push(self.signal_table[sid].clone());
             kinds.push(kind);
             trace.push((sid, code));
+        }
+        // SystemC rows: initial mirror value in the checkpoint + seed the
+        // per-writer prev so only genuine changes emit.
+        if !sc_codes.is_empty() {
+            let b = self.sc_bridge.as_mut().unwrap();
+            for (i, row) in b.trace.iter_mut().enumerate() {
+                row.vcd_code = Some(sc_codes[i].clone());
+                row.vcd_prev = Some(row.mirror.clone());
+                super::vcd_sink::write_vcd_value(&mut hdr, &row.mirror, &sc_codes[i]);
+            }
         }
         let _ = writeln!(hdr, "$end");
 
@@ -1380,6 +1416,20 @@ impl Simulator {
             // Full scan: walk every dumped trace slot.
             for idx in 0..self.vcd_trace.len() {
                 check_slot!(idx);
+            }
+        }
+
+        // SystemC bridge rows: the mirror updates at each exchange, not on SV
+        // writes, so these slots never appear in the dirty set.
+        if let Some(b) = self.sc_bridge.as_mut() {
+            for row in b.trace.iter_mut() {
+                let Some(code) = row.vcd_code.clone() else {
+                    continue;
+                };
+                if row.vcd_prev.as_ref() != Some(&row.mirror) {
+                    row.vcd_prev = Some(row.mirror.clone());
+                    changes.push((code, row.mirror.clone()));
+                }
             }
         }
 
@@ -1873,6 +1923,31 @@ impl Simulator {
             ));
         }
 
+        // ── SystemC co-sim rows (bridge registry mirror) ──
+        // Own module scope `/systemc_bridge` and its own id range, appended
+        // after the SystemVerilog dictionary.
+        let sc_xt: Vec<(Arc<str>, u32)> = match self.sc_bridge.as_ref() {
+            Some(b) if !b.trace.is_empty() => {
+                modules.push(("mSC".to_string(), "/systemc_bridge".to_string()));
+                let mut out = Vec::with_capacity(b.trace.len());
+                for (i, row) in b.trace.iter().enumerate() {
+                    let sid = Self::xtrace_id_code(entries.len() + i);
+                    let w = row.width.max(1);
+                    let type_str = if w == 1 { "bit".to_string() } else { format!("u{}", w) };
+                    signal_records.push(format!(
+                        "S,{},mSC,{},{},enc=delta,width={}",
+                        sid,
+                        Self::sc_trace_leaf(&row.name),
+                        type_str,
+                        w
+                    ));
+                    out.push((Arc::from(sid.as_str()), w));
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+
         // Header per §6. The §18 BNF orders `@producer` after `@profile`, but
         // the spec's own Appendix-A example (and every xezim-produced trace in
         // the wild, including the 0.1.2 reference dumps) puts it third; the
@@ -1955,6 +2030,14 @@ impl Simulator {
         self.xtrace_id_to_trace = self.build_dump_id_to_trace(&trace);
         self.enable_dump_dirty_tracking();
         self.xtrace_trace = trace;
+        // SystemC rows: bind dictionary ids and seed the per-writer prev.
+        if !sc_xt.is_empty() {
+            let b = self.sc_bridge.as_mut().unwrap();
+            for (i, row) in b.trace.iter_mut().enumerate() {
+                row.xt_sid = Some(sc_xt[i].0.clone());
+                row.xt_prev = Some(row.mirror.clone());
+            }
+        }
         self.xtrace_writer = Some(w);
         self.xtrace_last_time = self.time;
         self.xtrace_snapshot_pending = true;
@@ -2081,6 +2164,20 @@ impl Simulator {
             None => {
                 for idx in 0..self.xtrace_trace.len() {
                     check_xt_slot!(idx);
+                }
+            }
+        }
+
+        // SystemC bridge rows: mirror updates at each exchange, never on SV
+        // writes, so they bypass the dirty set.
+        if let Some(b) = self.sc_bridge.as_mut() {
+            for row in b.trace.iter_mut() {
+                let Some(sid) = row.xt_sid.clone() else {
+                    continue;
+                };
+                if row.xt_prev.as_ref() != Some(&row.mirror) {
+                    row.xt_prev = Some(row.mirror.clone());
+                    changes.push((sid, row.mirror.clone(), false, false));
                 }
             }
         }
@@ -2569,6 +2666,24 @@ impl Simulator {
             );
         }
 
+        // ── SystemC co-sim scope (bridge registry mirror) ──
+        let _ = header.scope("systemc_bridge", "", FstScopeType::Module);
+        let mut sc_fst: Vec<(usize, FstSignalId)> = Vec::new();
+        if let Some(b) = self.sc_bridge.as_ref() {
+            for (i, row) in b.trace.iter().enumerate() {
+                if let Ok(fid) = header.var(
+                    &Self::sc_trace_leaf(&row.name),
+                    fst_writer::FstSignalType::bit_vec(row.width.max(1)),
+                    fst_writer::FstVarType::Wire,
+                    fst_writer::FstVarDirection::Implicit,
+                    None,
+                ) {
+                    sc_fst.push((i, fid));
+                }
+            }
+        }
+        let _ = header.up_scope();
+
         let mut body = match header.finish() {
             Ok(b) => b,
             Err(e) => {
@@ -2590,6 +2705,14 @@ impl Simulator {
         }
         for (_, fid) in &events {
             let _ = body.signal_change(*fid, b"0");
+        }
+        // SystemC rows: initial mirror values + bind ids.
+        for (i, fid) in &sc_fst {
+            let b = self.sc_bridge.as_mut().unwrap();
+            let row = &mut b.trace[*i];
+            row.fst_id = Some(*fid);
+            row.fst_prev = Some(row.mirror.clone());
+            let _ = body.signal_change(*fid, &Self::fst_format_value(&row.mirror, row.width.max(1)));
         }
 
         // Incremental change detection, shared with the VCD and XTrace writers
@@ -2658,6 +2781,20 @@ impl Simulator {
                 let fid = self.fst_events[idx].1;
                 changes.push((fid, Value::ones(1), 1));
                 changes.push((fid, Value::zero(1), 1));
+            }
+        }
+
+        // SystemC bridge rows: mirror updates at each exchange, never on SV
+        // writes, so they bypass the dirty set.
+        if let Some(b) = self.sc_bridge.as_mut() {
+            for row in b.trace.iter_mut() {
+                let Some(fid) = row.fst_id else {
+                    continue;
+                };
+                if row.fst_prev.as_ref() != Some(&row.mirror) {
+                    row.fst_prev = Some(row.mirror.clone());
+                    changes.push((fid, row.mirror.clone(), row.width.max(1)));
+                }
             }
         }
         if changes.is_empty() {

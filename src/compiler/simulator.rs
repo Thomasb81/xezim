@@ -3144,6 +3144,7 @@ mod process_control;
 mod process_scopes;
 mod processes;
 mod profiling;
+mod sc_sim;
 mod sensitivity;
 mod settling;
 mod setup;
@@ -10293,6 +10294,39 @@ pub struct Simulator {
     vcd_limit_hit: bool,
     /// XEZIM_BSP_SHADOW=1: number of time>0 settles compared so far.
     bsp_shadow_checks: u64,
+    /// SystemC co-simulation bridge (`--sc-source`/`--sc-lib`; master
+    /// inferred). `None` (the default) leaves every SystemC code path dormant
+    /// — nothing here depends on SystemC being installed, and the UVM
+    /// regressions never touch it.
+    #[serde(skip)]
+    pub sc_bridge: Option<crate::sc_bridge::ScBridge>,
+    /// SC-top link to the SystemC host thread (set only when the inferred
+    /// master is SystemC).
+    #[serde(skip)]
+    pub sc_link: Option<std::sync::Arc<crate::sc_bridge::ScLink>>,
+    /// Last-staged SC-top export snapshot (sv_id -> raw word), used to detect
+    /// SV-side exports the SystemC side hasn't consumed yet and drive one
+    /// more exchange so outputs are delivered even when SystemC is idle.
+    pub sc_last_exports: Vec<(usize, Vec<u64>)>,
+    /// Mode B: a pure-SystemC leaf was attached inside the SV netlist. When
+    /// set, the simulator auto-steps the SC kernel at each SV time advance
+    /// (matching the reference simulators, where the SV testbench drives clock
+    /// and phase and the SC leaf responds at its sensitive edges) instead of
+    /// requiring explicit `$sc_step` calls.
+    pub sc_mode_b: bool,
+    /// The SV simulation time (in ticks) at the last automatic CDB exchange,
+    /// used to advance the SC kernel by exactly the elapsed ticks each step.
+    pub sc_last_exchange_time: u64,
+    /// Set when SV time advanced under Mode B; the actual CDB exchange runs
+    /// AFTER the new time-slot's SV nets have settled (so the SC leaf sees the
+    /// post-edge clock/base values), then imports SC outputs back into the
+    /// same slot.
+    pub sc_exchange_pending: bool,
+    /// Set right after a Mode B exchange imported SC output changes; forces the
+    /// outer loop to run one more full pass at the SAME timestamp so `$monitor`
+    /// and dependent logic observe the SC-driven value in the slot it was
+    /// produced (matching the reference simulators). Cleared on consumption.
+    pub sc_force_same_time_pass: bool,
     /// Buffered stdout sink for $display/$write. Lazily initialized on first
     /// write; runs its own background writer unless XEZIM_DUMP_INLINE=1.
     #[serde(skip)]

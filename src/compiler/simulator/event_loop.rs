@@ -2272,6 +2272,26 @@ impl Simulator {
         }
         while !self.finished && iters < max_iters {
             iters += 1;
+            // ── SystemC co-sim rendezvous (SC top) ──────────────────────────
+            // The SystemC kernel is the time master: never advance past its
+            // current cap, and when this kernel reaches the cap, exchange.
+            // The rendezvous blocks until the SystemC slice completes, so a
+            // quiescent SV side simply parks here instead of spinning.
+            if self.sc_link.is_some()
+                && self.time >= self.sc_link.as_ref().unwrap().current_cap()
+                // Let the t=0 initial-block slot run before the first
+                // exchange: an import delivered while the design is still
+                // executing its initials would arm every @/always block at
+                // the delivered value and be silently swallowed (the LRM's
+                // value-change semantics). After t=0 has drained, a change
+                // is a change.
+                && !(self.time == 0 && self.event_queue.next_time() == Some(0))
+            {
+                if !self.sc_rendezvous() {
+                    self.finished = true;
+                    break;
+                }
+            }
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
                 && HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
             {
@@ -2526,6 +2546,16 @@ impl Simulator {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
                 }
+                // SC top: SV is quiescent but the SystemC master may still
+                // have slices to run (or imports to deliver) — exchange
+                // instead of ending the run. Once the SystemC kernel is
+                // quiescent too, nothing can ever resume this kernel: end.
+                if self.sc_link.is_some() && self.sc_exchange_alive() {
+                    if self.sc_rendezvous() {
+                        continue;
+                    }
+                    self.finished = true;
+                }
                 break;
             }
             // Deadlock: only waiters remain but nothing can ever wake them.
@@ -2542,6 +2572,17 @@ impl Simulator {
             {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
+                }
+                // SC top: what looks like a deadlock locally is often just
+                // this kernel waiting for the SystemC master to drive it.
+                // Keep exchanging only while the SystemC side can still
+                // produce activity; once it is quiescent, those waiters can
+                // never fire and the run is genuinely over.
+                if self.sc_link.is_some() && self.sc_exchange_alive() {
+                    if self.sc_rendezvous() {
+                        continue;
+                    }
+                    self.finished = true;
                 }
                 break;
             }
@@ -2583,7 +2624,7 @@ impl Simulator {
                     u64::MAX
                 }
             });
-            let next_time = if start { self.time } else { next_time };
+            let mut next_time = if start { self.time } else { next_time };
 
             if next_time > self.max_time {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -2627,6 +2668,13 @@ impl Simulator {
             if next_time > self.time && self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                 continue;
             }
+            if self.sc_force_same_time_pass {
+                // A Mode B exchange just imported SC output changes; hold time
+                // still for one more full pass so `$monitor`/dependents see the
+                // SC-driven value in the slot it was produced.
+                next_time = self.time;
+                self.sc_force_same_time_pass = false;
+            }
             if next_time > self.time {
                 self.dump_slot_end();
                 // The slot is complete and every process is parked in traced
@@ -2643,6 +2691,16 @@ impl Simulator {
                 self.growth_trace();
                 self.time = next_time;
                 publish_sim_time(next_time);
+                // Mode B: a pure-SystemC leaf is embedded in the netlist and
+                // the SV testbench drives it with plain SV (clock generators,
+                // `always`). Record that an exchange is due; it is performed
+                // AFTER run_one_tick settles this slot, so the SC leaf sees the
+                // post-edge clock/base values and its outputs land in the SAME
+                // time slot (matching the reference simulators, which need no
+                // `$sc_step`).
+                if self.sc_mode_b && self.sc_bridge.is_some() {
+                    self.sc_exchange_pending = self.time > self.sc_last_exchange_time;
+                }
                 // Lines printed near the end of a burst stay buffered until the
                 // next line; release them once they are stale (core #49).
                 if let Some(sink) = self.stdout_sink.as_mut() {
@@ -2709,6 +2767,26 @@ impl Simulator {
             start = false;
             if self.cond_progress != cond_prog_before {
                 self.stall_iters = 0;
+            }
+            // Mode B deferred exchange: now that this time slot's SV nets have
+            // settled, advance the SC kernel by the elapsed ticks (delivering
+            // the post-edge clock/inputs) and pull its outputs back into the
+            // netlist at the SAME time — matching the reference simulators,
+            // where a posedge-{triggered} SC output is visible in the same
+            // slot it is produced.
+            if self.sc_exchange_pending {
+                self.sc_exchange_pending = false;
+                let elapsed = self.time - self.sc_last_exchange_time;
+                if self.sc_mode_b && self.sc_bridge.is_some() && elapsed > 0 {
+                    self.sc_last_exchange_time = self.time;
+                    self.sc_step_sv_top_mode_b(elapsed);
+                    // SC outputs may have changed SV nets; force one more full
+                    // pass at the same time so `$monitor`/dependent logic
+                    // observe the SC-driven value in this slot.
+                    if self.table_modified {
+                        self.sc_force_same_time_pass = true;
+                    }
+                }
             }
             // The genuine library owns the full phase schedule
             // Periodic invariant check — every 1000 iters; bail on
