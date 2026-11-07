@@ -67,6 +67,7 @@ pub mod compiler;
 pub mod env_vars;
 pub mod hier_ref_lint;
 pub mod intra_delay;
+pub mod sc_bridge;
 pub mod should_fail_lint;
 pub mod type_lint;
 
@@ -1271,6 +1272,23 @@ pub fn simulate_multi(
     // SAFETY: see above — transfer-once of a self-contained value.
     unsafe impl Send for SendResult {}
     std::thread::scope(|scope| {
+        // SystemC co-simulation, SC top: the SystemC kernel (sc_main + our
+        // shim) runs on its own thread and rendezvouses with the simulation
+        // worker through the link below. The link must be installed BEFORE
+        // the worker starts, since the worker's Simulator picks it up at
+        // simulate() entry.
+        let _sc_join = if sc_bridge::sc_top() == sc_bridge::ScTop::Sc
+            && sc_bridge::sc_options().is_some()
+        {
+            let link = std::sync::Arc::new(sc_bridge::ScLink::new());
+            // SC top owns time: the SV kernel must rendezvous before its
+            // first time step (cap 0), not free-run.
+            link.set_cap(0);
+            sc_bridge::store_pending_link(link.clone());
+            Some(scope.spawn(move || sc_bridge::run_sc_top_thread(link)))
+        } else {
+            None
+        };
         std::thread::Builder::new()
             .name("xezim-sim".to_string())
             .stack_size(stack_mb * 1024 * 1024)

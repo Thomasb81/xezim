@@ -398,6 +398,30 @@ fn print_usage() {
     eprintln!("  --fst-repack[=N] gzip-wrap the finished FST on a clean close (GTKWave's");
     eprintln!("                   repack-on-close; deflate level N, 1..9, default 6). About");
     eprintln!("                   1.5x smaller; readers inflate it on open.");
+    eprintln!("SystemC co-simulation (needs SYSTEMC_HOME pointing at a SystemC 2.3+/3.x install):");
+    eprintln!("  --sc-source <file>  User C++ source. Compiled with xezim's sc_shim.cc into a");
+    eprintln!("                   shared object at startup. Repeatable. The co-simulation");
+    eprintln!("                   master is inferred from the source: a TU defining");
+    eprintln!("                   xsc_model_build is a passive model (xezim testbench drives");
+    eprintln!("                   time via $sc_step); a TU defining sc_main owns the run and");
+    eprintln!("                   xezim simulates the DUT on demand; a prebuilt SC-master .so");
+    eprintln!("                   is detected by its strong sc_main symbol (weak = passive).");
+    eprintln!("  --sc-include <dir>  Extra -I directory for the SystemC model. Repeatable.");
+    eprintln!("  --sc-cxxflag <flag> Extra compiler flag for the SystemC model. Repeatable.");
+    eprintln!("  --sc-lib <so>    Use a prebuilt model shared object (built from the user TU");
+    eprintln!("                   + xezim's sc_shim.cc) instead of compiling --sc-source.");
+    eprintln!("  --sc-module <Name>  systemC SC_MODULE to instantiate when a pure");
+    eprintln!("                   systemVerilog testbench is master. xezim derives the");
+    eprintln!("                   wrapper (signals by name) from the SV top's ports; the");
+    eprintln!("                   module's crossing ports must share those names. Requires no");
+    eprintln!("                   --sc-source (the module definition can be a --sc-source");
+    eprintln!("                   TU). Pure systemC + pure systemVerilog, no xsc_bind.");
+    eprintln!("                   The master (sv or sc) is inferred from the sources /");
+    eprintln!("                   prebuilt lib: a prebuilt SC-master .so is detected by");
+    eprintln!("                   its strong sc_main symbol (weak = passive model), a");
+    eprintln!("                   source by its sc_main / xsc_model_build definition.");
+    eprintln!("                   XEZIM_SC_QUANTUM caps the ticks SystemC runs ahead per");
+    eprintln!("                   exchange (default 1000, sc master only).");
     eprintln!("  -xezim_env <file>  (--xezim-env) Set XEZIM_* variables from a file before");
     eprintln!("                   anything reads them: NAME=value, export NAME=value,");
     eprintln!("                   setenv NAME value, unsetenv NAME. Overrides the shell.");
@@ -2320,6 +2344,11 @@ fn run_main() -> i32 {
     // `--wave-suppress` / `--wave-suppress-module` / `--wave-suppress-file`:
     // the waveform EXCLUDE list, shared by VCD, FST and XTrace.
     let mut wave_suppress: Vec<String> = Vec::new();
+    let mut sc_sources: Vec<String> = Vec::new();
+    let mut sc_includes: Vec<String> = Vec::new();
+    let mut sc_cxxflags: Vec<String> = Vec::new();
+    let mut sc_libs: Vec<String> = Vec::new();
+    let mut sc_module: Option<String> = None;
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
@@ -3070,6 +3099,55 @@ fn run_main() -> i32 {
                     &arg["--wave-suppress-module=".len()..]
                 ));
             }
+            // ── SystemC co-simulation (runtime-optional; needs SYSTEMC_HOME) ──
+            "--sc-source" => {
+                i += 1;
+                if i < args.len() {
+                    sc_sources.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-source=") => {
+                sc_sources.push(arg["--sc-source=".len()..].to_string());
+            }
+            "--sc-include" => {
+                i += 1;
+                if i < args.len() {
+                    sc_includes.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-include=") => {
+                sc_includes.push(arg["--sc-include=".len()..].to_string());
+            }
+            "--sc-cxxflag" => {
+                i += 1;
+                if i < args.len() {
+                    sc_cxxflags.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-cxxflag=") => {
+                sc_cxxflags.push(arg["--sc-cxxflag=".len()..].to_string());
+            }
+            "--sc-lib" => {
+                i += 1;
+                if i < args.len() {
+                    sc_libs.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-lib=") => {
+                sc_libs.push(arg["--sc-lib=".len()..].to_string());
+            }
+            "--sc-module" => {
+                i += 1;
+                if i < args.len() {
+                    sc_module = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --sc-module requires a SystemC SC_MODULE name");
+                    return 2;
+                }
+            }
+            _ if arg.starts_with("--sc-module=") => {
+                sc_module = Some(arg["--sc-module=".len()..].to_string());
+            }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
@@ -3584,6 +3662,23 @@ fn run_main() -> i32 {
     // Library search config (`-v` files, `+libext+` extensions) — consumed by
     // the core resolver that satisfies unresolved instantiations from `-y`
     // directories and `-v` files.
+    // ── SystemC co-simulation configuration (set once, before any compile) ──
+    // The master is derived, never user-picked: a prebuilt .so is probed via
+    // its dynamic symbols (strong sc_main = SC master), otherwise the sources'
+    // entry points decide (xsc_model_build = passive SV top). `sc_options()`
+    // reads the computed `master`, so the kernels can never disagree.
+    if !sc_sources.is_empty() || !sc_libs.is_empty() || sc_module.is_some() {
+        let master = xezim::sc_bridge::infer_master(&sc_sources, &sc_libs);
+        xezim::sc_bridge::set_sc_options(xezim::sc_bridge::ScOptions {
+            master,
+            sources: sc_sources.clone(),
+            include_dirs: sc_includes.clone(),
+            cxxflags: sc_cxxflags.clone(),
+            libs: sc_libs.clone(),
+            quantum: xezim::sc_bridge::quantum_from_env(),
+            sc_module,
+        });
+    }
     if nospecify {
         xezim::compiler::simulator::set_nospecify(true);
         if sdf_file.is_some() {
@@ -3824,6 +3919,35 @@ suppressed but the explicit SDF annotation still applies."
         source_files.push("<xz_multitop>".to_string());
         file_labels.push("<xz_multitop>".to_string());
         top_module = Some(wrap_name.to_string());
+    }
+
+    // Mode B (pure-SystemC leaf inside the SV netlist): the SV testbench
+    // instantiates the SC module directly (`ringbuf u(.clock(c),...);`). The
+    // elaborator has no SystemVerilog `module ringbuf` to inline, so we
+    // synthesize an empty-body placeholder mirroring the SC module's
+    // reflected `sc_in`/`sc_out`/`sc_inout` ports and inject it as an extra
+    // source. The normal elaboration/port-connection pipeline then runs
+    // unchanged; the bridge drives the SC leaf's port signals directly.
+    if let Some((mod_name, srcs, is_sv_master)) = {
+        let o = xezim::sc_bridge::sc_options();
+        o.as_ref().map(|o| {
+            (
+                o.sc_module.clone(),
+                o.sources.clone(),
+                o.master == xezim::sc_bridge::ScTop::Sv,
+            )
+        })
+    } {
+        if is_sv_master {
+            if let Some(mname) = mod_name {
+                let mports = xezim::sc_bridge::sc_module_ports(&mname, &srcs);
+                let placeholder =
+                    xezim::sc_bridge::synthesize_placeholder(&mname, &mports);
+                sources.push(placeholder);
+                source_files.push(format!("<sc_placeholder:{mname}>"));
+                file_labels.push(format!("<sc_placeholder:{mname}>"));
+            }
+        }
     }
 
     let (mut preprocessed_sources, mut line_maps, mut pp_state) =

@@ -858,6 +858,18 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_RS_STATS", "Print resize/copy statistics for Values"),
     (
+        "XEZIM_SC_QUANTUM",
+        "SystemC co-simulation: max ticks the SystemC kernel runs ahead per exchange (sc master, default 1000)",
+    ),
+    (
+        "XEZIM_SC_SHIM_INC",
+        "Build-time override for the include directory of the bundled SystemC shim sources",
+    ),
+    (
+        "XEZIM_SC_SHIM_SRC",
+        "Build-time override for the bundled SystemC shim source path (sc_shim.cc)",
+    ),
+    (
         "XEZIM_SETTLE_LEVELS",
         "Settle: print levelization depth of the comb graph",
     ),
