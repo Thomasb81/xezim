@@ -55,6 +55,31 @@ pub struct ScOptions {
     /// systemC module to instantiate for a pure-SV top (`--sc-module <Name>`).
     /// Triggers auto-derived `xsc_model_build` for the SV master direction.
     pub sc_module: Option<String>,
+    /// All SystemC modules to support for placeholder/leaf instantiation
+    /// (explicit repeatable `--sc-module` flags + discovered `SC_MODULE(...)`
+    /// definitions in `--sc-source`).
+    pub sc_modules: Vec<String>,
+    /// SystemVerilog module names instantiated from C++ (`#include "xez_<Mod>.h"`
+    /// or `#include "xez_sv.h"`), for multi-hop `SC -> SV` wrappers.
+    pub sv_modules: Vec<String>,
+}
+
+impl ScOptions {
+    /// Return every configured or discovered SystemC module name (deduped, order preserved).
+    pub fn all_sc_modules(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(m) = &self.sc_module {
+            if !m.is_empty() {
+                out.push(m.clone());
+            }
+        }
+        for m in &self.sc_modules {
+            if !m.is_empty() && !out.contains(m) {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
 }
 
 static SC_OPTIONS: std::sync::OnceLock<std::sync::Mutex<Option<ScOptions>>> =
@@ -81,6 +106,17 @@ pub fn shim_source() -> &'static str {
 
 pub fn shim_include_dir() -> &'static str {
     option_env!("XEZIM_SC_SHIM_INC").unwrap_or("src/sc_shim")
+}
+
+pub fn has_xsc_model_build(sources: &[String]) -> bool {
+    for p in sources {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            if fn_is_defined(&text, "xsc_model_build") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Infer which kernel owns the run. This replaces the removed `--sc-top`
@@ -494,18 +530,19 @@ pub struct ScPort {
 /// (`infer_sc_top_from_text`); it is deliberately conservative and is only a
 /// *hint* consumed when real Mode B is enabled.
 pub fn sc_module_ports(sc_module: &str, sources: &[String]) -> Vec<ScPort> {
+    sc_module_ports_in(sc_module, sources, &[])
+}
+
+pub fn sc_module_ports_in(
+    sc_module: &str,
+    sources: &[String],
+    include_dirs: &[String],
+) -> Vec<ScPort> {
     let mut out = Vec::new();
-    // Find the SC_MODULE(<name>) block start in any source file. A module may
-    // span multiple occurrences (instantiation !== declaration), and the
-    // declaration is the one whose body lists ports — but simply scanning the
-    // first block headed by SC_MODULE(<name>) is enough for our generated
-    // examples.
-    for path in sources {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    for path in expand_sc_files(sources, include_dirs) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Locate the declaration: `SC_MODULE(<name>) {` ... matching `};` at
-        // column 0 (the SystemC macro convention).
         let needle = format!("SC_MODULE({})", sc_module);
         let Some(hit) = text.find(&needle) else {
             continue;
@@ -514,7 +551,7 @@ pub fn sc_module_ports(sc_module: &str, sources: &[String]) -> Vec<ScPort> {
         let mut depth = 0usize;
         let mut in_string = false;
         let mut in_block = false;
-        let mut body_end = rest.len() - 1; // safety default
+        let mut body_end = rest.len().saturating_sub(1);
         for (i, ch) in rest.char_indices() {
             match ch {
                 '"' if !in_string && (i == 0 || rest[..i].chars().last() != Some('\\')) => {
@@ -548,7 +585,7 @@ pub fn sc_module_ports(sc_module: &str, sources: &[String]) -> Vec<ScPort> {
         for port in scan_sc_port_members(body) {
             out.push(port);
         }
-        break; // only the first matching source file
+        break;
     }
     out
 }
@@ -833,12 +870,16 @@ fn sc_type_width(ty: &str, _name: &str) -> Option<(u32, u32)> {
         }
     }
     match core_free {
-        "bool" => Some((1, 1)),
+        "bool" | "sc_logic" => Some((1, 1)),
+        "uint8_t" => Some((8, 1)),
+        "uint16_t" => Some((16, 2)),
+        "int" | "uint32_t" | "unsigned" | "unsignedint" => Some((32, 4)),
         "uint64" | "uint64_t" => Some((64, 8)),
-        "int" => Some((32, 4)),
         _ => {
-            // sc_uint<N>, sc_bv<N>, sc_lv<N>, sc_reg<N>
-            if let Some(d) = angle_num(core_free.strip_prefix("sc_uint")) {
+            // sc_uint<N>, sc_int<N>, sc_bv<N>, sc_lv<N>, sc_reg<N>
+            if let Some(d) = angle_num(core_free.strip_prefix("sc_uint"))
+                .or_else(|| angle_num(core_free.strip_prefix("sc_int")))
+            {
                 let align = ((d + 7) / 8).max(1);
                 return Some((d, align));
             }
@@ -854,6 +895,250 @@ fn sc_type_width(ty: &str, _name: &str) -> Option<(u32, u32)> {
             None
         }
     }
+}
+
+/// Expand `sources` with any locally `#include "..."`d headers found relative to
+/// each source or inside `include_dirs`.
+pub fn expand_sc_files(sources: &[String], include_dirs: &[String]) -> Vec<String> {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue: Vec<String> = sources.to_vec();
+    let mut out = Vec::new();
+    while let Some(path) = queue.pop() {
+        let canon = std::fs::canonicalize(&path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.clone());
+        if !visited.insert(canon) {
+            continue;
+        }
+        out.push(path.clone());
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let parent = std::path::Path::new(&path).parent();
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("#include") {
+                let rest = rest.trim();
+                if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.split('"').next()) {
+                    if let Some(p) = parent {
+                        let cand = p.join(inner);
+                        if cand.is_file() {
+                            queue.push(cand.to_string_lossy().into_owned());
+                            continue;
+                        }
+                    }
+                    for dir in include_dirs {
+                        let cand = std::path::Path::new(dir).join(inner);
+                        if cand.is_file() {
+                            queue.push(cand.to_string_lossy().into_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Discover all `SC_MODULE(<Name>)` names declared in `sources` (and local headers).
+pub fn discover_sc_module_names(sources: &[String], include_dirs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in expand_sc_files(sources, include_dirs) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        while i < n {
+            match bytes[i] {
+                b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                    while i < n && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < n {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if text[i..].starts_with("SC_MODULE")
+                && (i == 0 || !is_ident_char(bytes[i - 1]))
+                && (i + 9 >= n || !is_ident_char(bytes[i + 9]))
+            {
+                let mut j = i + 9;
+                while j < n && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'(' {
+                    j += 1;
+                    while j < n && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let start = j;
+                    while j < n && is_ident_char(bytes[j]) {
+                        j += 1;
+                    }
+                    if j > start {
+                        let name = text[start..j].to_string();
+                        while j < n && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < n && bytes[j] == b')' {
+                            j += 1;
+                            while j < n && bytes[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            if j < n && bytes[j] == b'{' && !out.contains(&name) {
+                                out.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Scan SystemVerilog source texts for `module <Name>` definitions.
+pub fn discover_sv_module_names_in_sv(sv_sources: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for text in sv_sources {
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        while i < n {
+            match bytes[i] {
+                b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                    while i < n && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < n {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if text[i..].starts_with("module")
+                && (i == 0 || !is_ident_char(bytes[i - 1]))
+                && (i + 6 >= n || !is_ident_char(bytes[i + 6]))
+            {
+                let mut j = i + 6;
+                while j < n && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if text[j..].starts_with("automatic") || text[j..].starts_with("static") {
+                    while j < n && is_ident_char(bytes[j]) {
+                        j += 1;
+                    }
+                    while j < n && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                }
+                let start = j;
+                while j < n && is_ident_char(bytes[j]) {
+                    j += 1;
+                }
+                if j > start {
+                    let name = text[start..j].to_string();
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Discover SV module names that C++ sources request via `#include "xez_<Mod>.h"`
+/// or `#include "xez_sv.h"` (which exposes all SV modules).
+pub fn discover_sv_modules_in_sc(
+    sc_sources: &[String],
+    include_dirs: &[String],
+    sv_sources: &[String],
+) -> Vec<String> {
+    let defined_sv = discover_sv_module_names_in_sv(sv_sources);
+    let mut want_all = false;
+    let mut out = Vec::new();
+    for path in expand_sc_files(sc_sources, include_dirs) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("#include") else {
+                continue;
+            };
+            let rest = rest.trim();
+            let Some(hdr) = rest.strip_prefix('"').and_then(|s| s.split('"').next()) else {
+                continue;
+            };
+            if hdr == "xez_sv.h" {
+                want_all = true;
+                break;
+            }
+            if let Some(mod_name) = hdr.strip_prefix("xez_").and_then(|s| s.strip_suffix(".h")) {
+                if mod_name != "top"
+                    && defined_sv.iter().any(|m| m == mod_name)
+                    && !out.iter().any(|m| m == mod_name)
+                {
+                    out.push(mod_name.to_string());
+                }
+            }
+        }
+        if want_all {
+            break;
+        }
+    }
+    if want_all {
+        return defined_sv;
+    }
+    out
 }
 
 /// Parse `N` from a string that may begin `<N>` (an angle-bracket integer).

@@ -242,33 +242,77 @@ impl Simulator {
             return;
         }
         // ── SystemC co-simulation setup ─────────────────────────────────
-        // SC top: take the link to the SystemC host thread and publish the
-        // tick length it maps time against. The model .so is compiled and
-        // loaded over there; we only get its function table.
-        //
-        // Auto-derived wrapper: the top module's ports are known now (post
-        // elaboration), so record them and publish the generated wrapper to
-        // the SystemC host thread (which waits on it before compiling).
-        self.sc_link = crate::sc_bridge::take_pending_link();
-        if crate::sc_bridge::sc_options().is_some() || self.sc_link.is_some() {
-            let _tp = self.collect_top_ports();
-            crate::sc_bridge::set_top_ports(_tp);
-        }
-        crate::sc_bridge::generate_wrapper(
-            &crate::sc_bridge::sc_options().unwrap_or_default(),
-            self.sc_link.as_ref(),
-            &[],
-        );
-        if let Some(link) = self.sc_link.as_ref() {
-            link.set_tick_s(self.module.tick_s);
-            match link.take_shim() {
-                Some(shim) => match crate::sc_bridge::ScBridge::init_sc_top(shim) {
+        // If `simulate_multi_inner` already bootstrapped `sc_bridge` (and
+        // multi-hop SC leaves / SV islands), just attach signals on this
+        // `Simulator`; otherwise perform standalone setup here.
+        if let Some(mut b) = self.sc_bridge.take() {
+            if self.sc_link.is_none() {
+                self.sc_link = crate::sc_bridge::take_pending_link();
+            }
+            self.sc_attach_instance_ports(&mut b);
+            self.sc_attach_island_ports(&mut b);
+            self.sc_auto_attach(&mut b);
+            self.sc_bridge = Some(b);
+        } else {
+            self.sc_link = crate::sc_bridge::take_pending_link();
+            if crate::sc_bridge::sc_options().is_some() || self.sc_link.is_some() {
+                let _tp = self.collect_top_ports();
+                crate::sc_bridge::set_top_ports(_tp);
+            }
+            crate::sc_bridge::generate_wrapper(
+                &crate::sc_bridge::sc_options().unwrap_or_default(),
+                self.sc_link.as_ref(),
+                &[],
+            );
+            if let Some(link) = self.sc_link.as_ref() {
+                link.set_tick_s(self.module.tick_s);
+                match link.take_shim() {
+                    Some(shim) => match crate::sc_bridge::ScBridge::init_sc_top(shim) {
+                        Ok(mut b) => {
+                            self.sc_attach_instance_ports(&mut b);
+                            self.sc_attach_island_ports(&mut b);
+                            self.sc_auto_attach(&mut b);
+                            self.sc_bridge = Some(b);
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            self.finished = true;
+                            return;
+                        }
+                    },
+                    None => {
+                        eprintln!(
+                            "[xezim-sc] SystemC model unavailable; continuing without co-simulation"
+                        );
+                    }
+                }
+            } else if let Some(opts) = crate::sc_bridge::sc_options() {
+                if opts.master == crate::sc_bridge::ScTop::Sc {
+                    eprintln!(
+                        "Error: a SystemC-master run requires the source path (xezim passes \n  sources directly; a precompiled bytecode model cannot host the SystemC \n  master link)"
+                    );
+                    self.finished = true;
+                    return;
+                }
+                let leaf_instances: Vec<String> = self
+                    .sc_leaf_instances()
+                    .into_iter()
+                    .map(|(inst, _)| inst)
+                    .collect();
+                let bundle = crate::sc_bridge::generate_wrapper(&opts, None, &leaf_instances);
+                let mut params: Vec<(String, String)> = Vec::new();
+                for (pname, pval) in self.module.parameters.iter() {
+                    params.push((pname.clone(), super::sc_sim::sc_param_value_text(pval)));
+                }
+                match crate::sc_bridge::ScBridge::init_sv_top(
+                    &opts,
+                    self.module.tick_s,
+                    &bundle,
+                    &params,
+                ) {
                     Ok(mut b) => {
-                        // The auto-derived wrapper binds the SC side's registry
-                        // signals under the SV top's own port names, so the
-                        // name-matched auto rows (registry name == SV signal
-                        // name) cover the crossing bidirectionally — no
-                        // explicit per-signal mapping is needed.
+                        self.sc_attach_instance_ports(&mut b);
+                        self.sc_attach_island_ports(&mut b);
                         self.sc_auto_attach(&mut b);
                         self.sc_bridge = Some(b);
                     }
@@ -277,57 +321,6 @@ impl Simulator {
                         self.finished = true;
                         return;
                     }
-                },
-                None => {
-                    // The SystemC host thread never produced a model (its
-                    // compile/load error was already reported). Run the SV
-                    // side standalone rather than hang.
-                    eprintln!(
-                        "[xezim-sc] SystemC model unavailable; continuing without co-simulation"
-                    );
-                }
-            }
-        } else if let Some(opts) = crate::sc_bridge::sc_options() {
-            if opts.master == crate::sc_bridge::ScTop::Sc {
-                eprintln!(
-                    "Error: a SystemC-master run requires the source path (xezim passes \n  sources directly; a precompiled bytecode model cannot host the SystemC \n  master link)"
-                );
-                self.finished = true;
-                return;
-            }
-            // SV top: compile + load the model .so and run the user's build
-            // function now, so a build error aborts before any SV output.
-            // Discover the Mode B SC-leaf instances FIRST so the generated
-            // model emits one SC object per netlist site (§5 multi-instance);
-            // `sc_attach_instance_ports` reuses the same discovery to map the
-            // per-instance registry keys.
-            let leaf_instances = self.sc_leaf_instances();
-            let bundle = crate::sc_bridge::generate_wrapper(&opts, None, &leaf_instances);
-            // Parameter passing (SV → SC): hand the SV top module's
-            // parameters (name → value text) to the SC side so a pure-SystemC
-            // model can read them with the standard `sc_get_int_param` /
-            // `sc_get_param` family — matching the reference simulators'
-            // `vlog_to_sc` parameter passing. Forwarded into the shim BEFORE
-            // the SC module's ctor runs (init_sv_top -> xsc_model_build).
-            let mut params: Vec<(String, String)> = Vec::new();
-            for (pname, pval) in self.module.parameters.iter() {
-                params.push((pname.clone(), super::sc_sim::sc_param_value_text(pval)));
-            }
-            match crate::sc_bridge::ScBridge::init_sv_top(
-                &opts,
-                self.module.tick_s,
-                &bundle,
-                &params,
-            ) {
-                Ok(mut b) => {
-                    self.sc_auto_attach(&mut b);
-                    self.sc_attach_instance_ports(&mut b);
-                    self.sc_bridge = Some(b);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    self.finished = true;
-                    return;
                 }
             }
         }
@@ -367,6 +360,9 @@ impl Simulator {
             self.vpi_start_of_simulation();
             // A value a routine wrote there left work for the time-0 slot.
             start = self.dirty_any;
+        }
+        if self.sc_mode_b && self.dirty_any {
+            start = true;
         }
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
@@ -447,6 +443,11 @@ impl Simulator {
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
+        if self.sc_link.is_some() {
+            if let Some(b) = self.sc_bridge.as_ref() {
+                unsafe { (b.shim.sv_set_finished)() };
+            }
+        }
         // Barrier before the caller prints its own summary. `$display` output
         // is on a writer thread; the `[PROF]`/`[PHASE]` lines and the trailing
         // "Simulation finished at time N" are not, and under `--log` all of them

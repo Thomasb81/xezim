@@ -3145,6 +3145,7 @@ mod process_scopes;
 mod processes;
 mod profiling;
 mod sc_sim;
+pub(crate) use sc_sim::sc_param_value_text;
 mod sensitivity;
 mod settling;
 mod setup;
@@ -10304,10 +10305,19 @@ pub struct Simulator {
     /// master is SystemC).
     #[serde(skip)]
     pub sc_link: Option<std::sync::Arc<crate::sc_bridge::ScLink>>,
-    /// Last-staged SC-top export snapshot (sv_id -> raw word), used to detect
-    /// SV-side exports the SystemC side hasn't consumed yet and drive one
-    /// more exchange so outputs are delivered even when SystemC is idle.
-    pub sc_last_exports: Vec<(usize, Vec<u64>)>,
+    /// Last-staged export snapshot (sv_id -> (val_words, xz_words)), used to
+    /// detect SV-side exports that changed since the last exchange.
+    #[serde(skip)]
+    pub sc_last_exports: Vec<(usize, Vec<u64>, Vec<u64>)>,
+    /// Multi-hop embedded SV islands `(wire_prefix, sc_inst_name, sv_mod, ports)`
+    /// discovered during pre-simulation bootstrap.
+    #[serde(skip)]
+    pub sc_islands: Vec<(String, String, String, Vec<crate::sc_bridge::TopPort>)>,
+    /// Set by `sc_apply_imports` when at least one SV signal actually changed
+    /// value, so the outer event loop knows whether another same-time pass is
+    /// needed to propagate multi-hop combinational/sequential fanout.
+    #[serde(skip)]
+    pub sc_last_import_changed: bool,
     /// Mode B: a pure-SystemC leaf was attached inside the SV netlist. When
     /// set, the simulator auto-steps the SC kernel at each SV time advance
     /// (matching the reference simulators, where the SV testbench drives clock

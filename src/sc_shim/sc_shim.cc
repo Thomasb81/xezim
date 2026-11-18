@@ -34,6 +34,8 @@
 
 extern "C" int sc_main(int argc, char* argv[]);        // provided by the user TU (SC top)
 extern "C" void xsc_model_build();                     // provided by the user TU (SV top)
+extern "C" int xsc_create_leaf(const char* mod_type, const char* sv_inst_path,
+                               const char* sc_obj_name);
 
 // SystemC 3.x links a reference to sc_main into libsystemc itself (the kernel
 // drives elaboration/simulation from it), so the model .so must export it even
@@ -44,6 +46,11 @@ extern "C" void xsc_model_build();                     // provided by the user T
 __attribute__((weak)) int sc_main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     return 0;
+}
+__attribute__((weak)) int xsc_create_leaf(const char* mod_type, const char* sv_inst_path,
+                                          const char* sc_obj_name) {
+    (void)mod_type; (void)sv_inst_path; (void)sc_obj_name;
+    return -1;
 }
 #endif
 
@@ -58,19 +65,28 @@ namespace {
 struct XscSig {
     std::string name;
     int width;  // bits
-    std::function<void(const std::uint64_t*, int)> write;  // SV -> SC
-    std::function<void(std::uint64_t*, int)> read;         // SC -> SV
+    std::function<void(const std::uint64_t*, const std::uint64_t*, int)> write4;  // SV -> SC
+    std::function<void(std::uint64_t*, std::uint64_t*, int)> read4;               // SC -> SV
 };
 
 std::mutex g_reg_mu;
 std::vector<XscSig> g_reg;
 
-// Export staging (SV thread writes, SC thread applies). One slot per
-// registry entry, sized ceil(width/64) words.
+// Export/import staging with 2 planes per signal: `val` + `xz`.
 std::vector<std::vector<std::uint64_t>> g_exp_stage;
+std::vector<std::vector<std::uint64_t>> g_exp_xz_stage;
 std::vector<std::vector<std::uint64_t>> g_imp_stage;
+std::vector<std::vector<std::uint64_t>> g_imp_xz_stage;
 // Per-slot dirty flags: which exports were staged since the last apply.
 std::vector<char> g_exp_dirty;
+
+// Registered SV islands constructed from C++ (e.g. `sv_leaf u("u")` inside
+// an SC_MODULE or sc_main).
+struct XscIsland {
+    std::string sc_inst;
+    std::string sv_mod;
+};
+std::vector<XscIsland> g_islands;
 
 int words_for(int width) { return (width + 63) / 64; }
 
@@ -164,9 +180,9 @@ const char* param_get_string(const char* name, const char* fallback, int* found)
 
 namespace xezim {
 namespace detail {
-void reg_signal(const char* name, int width,
-                std::function<void(const std::uint64_t*, int)>&& writer,
-                std::function<void(std::uint64_t*, int)>&& reader) {
+void reg_signal4(const char* name, int width,
+                 std::function<void(const std::uint64_t*, const std::uint64_t*, int)>&& writer,
+                 std::function<void(std::uint64_t*, std::uint64_t*, int)>&& reader) {
     std::lock_guard<std::mutex> lk(g_reg_mu);
     for (const auto& s : g_reg)
         if (s.name == name) {
@@ -176,12 +192,15 @@ void reg_signal(const char* name, int width,
     XscSig s;
     s.name = name;
     s.width = width;
-    s.write = std::move(writer);
-    s.read = std::move(reader);
+    s.write4 = std::move(writer);
+    s.read4 = std::move(reader);
     g_reg.push_back(std::move(s));
-    g_exp_stage.emplace_back(words_for(width), 0);
+    const int nw = words_for(width);
+    g_exp_stage.emplace_back(nw, 0);
+    g_exp_xz_stage.emplace_back(nw, 0);
     g_exp_dirty.push_back(0);
-    g_imp_stage.emplace_back(words_for(width), 0);
+    g_imp_stage.emplace_back(nw, 0);
+    g_imp_xz_stage.emplace_back(nw, 0);
 }
 }  // namespace detail
 }  // namespace xezim
@@ -230,6 +249,7 @@ std::condition_variable g_link_cv;
 // not-yet-staged exports, and the SV kernel can never run twice per slice.
 std::uint64_t g_exp_posted = 0;
 std::uint64_t g_imp_done = 0;
+std::uint64_t g_sv_settled_round = 0;
 bool g_sv_finished = false;
 bool g_sc_done = false;
 std::uint64_t g_cap = 0;      // SystemC master's current time (ticks)
@@ -240,6 +260,15 @@ std::uint64_t g_quantum = 1000;
 // true so a combinational SV output that settled after the previous slice is
 // flushed to SystemC before the testbench's sc_start() returns.
 bool g_sv_pending_exports = false;
+
+// Pre-sc_start multi-hop bootstrap state (SC-top mode).
+bool g_sc_bootstrap_ready = false;
+bool g_bootstrap_done = false;
+bool g_leaf_req_pending = false;
+int g_leaf_req_rc = 0;
+std::string g_leaf_req_mod;
+std::string g_leaf_req_sv_path;
+std::string g_leaf_req_sc_name;
 
 const XscHostCb* g_cb = nullptr;
 
@@ -252,7 +281,8 @@ void apply_exports() {
     for (size_t i = 0; i < g_reg.size(); ++i) {
         if (g_exp_dirty[i]) {
             g_exp_dirty[i] = 0;
-            g_reg[i].write(g_exp_stage[i].data(), (int)g_exp_stage[i].size());
+            g_reg[i].write4(g_exp_stage[i].data(), g_exp_xz_stage[i].data(),
+                            (int)g_exp_stage[i].size());
         }
     }
 }
@@ -263,19 +293,45 @@ void capture_imports() {
     // live sc_signal is safe here: this runs on the SystemC simulation thread.
     std::lock_guard<std::mutex> lk(g_link_mu);
     for (size_t i = 0; i < g_reg.size(); ++i)
-        g_reg[i].read(g_imp_stage[i].data(), (int)g_imp_stage[i].size());
+        g_reg[i].read4(g_imp_stage[i].data(), g_imp_xz_stage[i].data(),
+                       (int)g_imp_stage[i].size());
 }
 
 // Run zero-time delta cycles while a process triggered by an event exactly at
 // the current time needs to commit its signal writes before the caller reads
-// the registry. A few drain iterations are enough for the usual edge-triggered
-// `sc_out` write; the loop stops as soon as no further activity is pending at
-// the current time so we never advance the clock here.
+// the registry. Stops as soon as no further activity is pending at the
+// current time so we never advance the clock here.
 void drain_current_deltas() {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 256; ++i) {
         if (!sc_core::sc_pending_activity_at_current_time()) break;
         sc_core::sc_start(sc_core::SC_ZERO_TIME, sc_core::SC_RUN_TO_TIME);
     }
+}
+
+// Before the very first sc_start() in SC-top mode, let the SV thread inspect
+// registered SV islands and spawn any nested SystemC leaf modules on this
+// (sc_main) thread so all SC_MODULEs exist before SystemC elaboration.
+bool await_sc_bootstrap() {
+    std::unique_lock<std::mutex> lk(g_link_mu);
+    if (g_bootstrap_done) return !g_sv_finished;
+    g_sc_bootstrap_ready = true;
+    g_link_cv.notify_all();
+    while (!g_bootstrap_done && !g_sv_finished) {
+        if (g_leaf_req_pending) {
+            std::string mod = g_leaf_req_mod;
+            std::string svp = g_leaf_req_sv_path;
+            std::string scn = g_leaf_req_sc_name;
+            lk.unlock();
+            int rc = xsc_create_leaf(mod.c_str(), svp.c_str(), scn.c_str());
+            lk.lock();
+            g_leaf_req_rc = rc;
+            g_leaf_req_pending = false;
+            g_link_cv.notify_all();
+        } else {
+            g_link_cv.wait(lk);
+        }
+    }
+    return !g_sv_finished;
 }
 
 // The SC-side slice step (SC top). Rendezvous protocol per slice:
@@ -366,6 +422,7 @@ bool slice_once() {
 // finishes. This is what `xsc_cosim_run()` (and a testbench that calls it
 // directly instead of interposed `sc_start()`) drives.
 void slice_loop() {
+    if (!await_sc_bootstrap()) return;
     while (slice_once()) {}
     // SV side finished ($finish / max-time / both kernels quiescent): end
     // the kernel so sc_main can return. Between-runs sc_stop() from
@@ -457,22 +514,47 @@ void xsc_write_export(int idx, const std::uint64_t* w, int n) {
     std::lock_guard<std::mutex> lk(g_link_mu);
     if (idx < 0 || (size_t)idx >= g_exp_stage.size()) return;
     auto& dst = g_exp_stage[idx];
-    for (int j = 0; j < n && j < (int)dst.size(); ++j) dst[j] = w[j];
+    auto& dxz = g_exp_xz_stage[idx];
+    for (int j = 0; j < n && j < (int)dst.size(); ++j) {
+        dst[j] = w[j];
+        dxz[j] = 0;
+    }
+    g_exp_dirty[idx] = 1;
+}
+
+void xsc_write_export4(int idx, const std::uint64_t* w, const std::uint64_t* xz, int n) {
+    std::lock_guard<std::mutex> lk(g_link_mu);
+    if (idx < 0 || (size_t)idx >= g_exp_stage.size()) return;
+    auto& dst = g_exp_stage[idx];
+    auto& dxz = g_exp_xz_stage[idx];
+    for (int j = 0; j < n && j < (int)dst.size(); ++j) {
+        dst[j] = w[j];
+        dxz[j] = xz ? xz[j] : 0ULL;
+    }
     g_exp_dirty[idx] = 1;
 }
 
 void xsc_read_import(int idx, std::uint64_t* w, int n) {
     if (idx < 0 || (size_t)idx >= g_imp_stage.size()) return;
-    // Read from the staged import snapshot, not the live SystemC signal:
-    // this is invoked from the SV worker thread, and reading a real sc_signal
-    // from a non-SystemC thread races with the kernel (elaboration swaps the
-    // port interface in/out, so a concurrent read can hit a pure-virtual
-    // method). The snapshot is written by capture_imports() on the SC thread
-    // before this side is released, so it is stable here.
     std::lock_guard<std::mutex> lk(g_link_mu);
     const auto& words = g_imp_stage[idx];
+    const auto& xz = g_imp_xz_stage[idx];
     const size_t avail = words.size();
-    for (int i = 0; i < n && (size_t)i < avail; ++i) w[i] = words[i];
+    for (int i = 0; i < n && (size_t)i < avail; ++i) {
+        w[i] = words[i] & ~xz[i];
+    }
+}
+
+void xsc_read_import4(int idx, std::uint64_t* w, std::uint64_t* xz_out, int n) {
+    if (idx < 0 || (size_t)idx >= g_imp_stage.size()) return;
+    std::lock_guard<std::mutex> lk(g_link_mu);
+    const auto& words = g_imp_stage[idx];
+    const auto& xz = g_imp_xz_stage[idx];
+    const size_t avail = words.size();
+    for (int i = 0; i < n && (size_t)i < avail; ++i) {
+        w[i] = words[i];
+        if (xz_out) xz_out[i] = xz[i];
+    }
 }
 
 void xsc_step(std::uint64_t ticks) {
@@ -586,22 +668,16 @@ void xsc_cosim_run(void) { slice_loop(); }
 // pending export (xsc_sv_pending_exports). A g_sv_finished return means the
 // whole run ended ($finish / both quiescent / sc_main done).
 void xsc_cosim_step(void) {
-    // Drain-to-quiescence: each sc_start() delivers one clock/edge step and
-    // then flushes the SV side's settled outputs to SystemC before returning.
-    // A single step is insufficient because the SV applies the imported
-    // stimulus and settles its combinational fanout only after that step's
-    // close_slice(); the settled value reaches SystemC only via a follow-up
-    // slice, so the first slice is always followed by at least one flush
-    // slice. After that flush the flag is stable (the SV cleared/pending-set
-    // is done), so we continue only while SystemC has projected activity or
-    // the SV still has a pending delivery (a deeper combinational chain). A
-    // g_sv_finished return means the whole run ended ($finish / both quiescent
-    // / sc_main done).
+    if (!await_sc_bootstrap()) return;
     int guard = 0;
-    bool first = true;
     while (guard++ < 4096) {
         if (!slice_once()) return;  // SV finished: end of run.
-        if (first) { first = false; continue; }  // guarantee the flush slice.
+        {
+            std::unique_lock<std::mutex> lk(g_link_mu);
+            const std::uint64_t round = g_imp_done;
+            g_link_cv.wait(lk, [&] { return g_sv_settled_round >= round || g_sv_finished; });
+            if (g_sv_finished) return;
+        }
         if (!xsc_has_pending() && !xsc_sv_pending_exports()) return;
     }
     // Bounded guard reached: treat as quiescent rather than spin forever.
@@ -642,8 +718,12 @@ void xsc_sv_set_finished(void) {
 // to decide whether another flush slice is needed. Set under g_link_mu so the
 // read in xsc_sv_pending_exports() never races the update.
 void xsc_sv_set_pending(int pending) {
-    std::lock_guard<std::mutex> lk(g_link_mu);
-    g_sv_pending_exports = pending != 0;
+    {
+        std::lock_guard<std::mutex> lk(g_link_mu);
+        g_sv_pending_exports = pending != 0;
+        g_sv_settled_round = g_imp_done;
+    }
+    g_link_cv.notify_all();
 }
 
 // SystemC master's current time in ticks, as of the last completed slice.
@@ -691,6 +771,65 @@ const char* xsc_param_value(int idx) {
     std::lock_guard<std::mutex> lk(g_param_mu);
     if (idx < 0 || (size_t)idx >= g_params.size()) return nullptr;
     return g_params[(size_t)idx].second.c_str();
+}
+
+// ── Multi-hop SV islands + leaf spawning + pre-start bootstrap ──────────────
+
+void xsc_reg_sv_island(const char* sc_inst, const char* sv_mod) {
+    if (!sc_inst || !sv_mod) return;
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    for (const auto& isl : g_islands) {
+        if (isl.sc_inst == sc_inst) return;
+    }
+    g_islands.push_back(XscIsland{sc_inst, sv_mod});
+}
+
+int xsc_island_count(void) {
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    return (int)g_islands.size();
+}
+
+const char* xsc_island_sc_name(int idx) {
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    if (idx < 0 || (size_t)idx >= g_islands.size()) return nullptr;
+    return g_islands[(size_t)idx].sc_inst.c_str();
+}
+
+const char* xsc_island_sv_mod(int idx) {
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    if (idx < 0 || (size_t)idx >= g_islands.size()) return nullptr;
+    return g_islands[(size_t)idx].sv_mod.c_str();
+}
+
+int xsc_spawn_leaf(const char* mod_type, const char* sv_inst_path, const char* sc_obj_name) {
+    return xsc_create_leaf(mod_type, sv_inst_path, sc_obj_name);
+}
+
+int xsc_sv_await_bootstrap(void) {
+    std::unique_lock<std::mutex> lk(g_link_mu);
+    g_link_cv.wait(lk, [] { return g_sc_bootstrap_ready || g_sc_done; });
+    return g_sc_done ? 1 : 0;
+}
+
+int xsc_sv_request_create_leaf(const char* mod_type, const char* sv_inst_path,
+                               const char* sc_obj_name) {
+    if (!mod_type || !sv_inst_path || !sc_obj_name) return -1;
+    std::unique_lock<std::mutex> lk(g_link_mu);
+    g_leaf_req_mod = mod_type;
+    g_leaf_req_sv_path = sv_inst_path;
+    g_leaf_req_sc_name = sc_obj_name;
+    g_leaf_req_pending = true;
+    g_link_cv.notify_all();
+    g_link_cv.wait(lk, [] { return !g_leaf_req_pending || g_sc_done; });
+    return g_sc_done ? -1 : g_leaf_req_rc;
+}
+
+void xsc_sv_finish_bootstrap(void) {
+    {
+        std::lock_guard<std::mutex> lk(g_link_mu);
+        g_bootstrap_done = true;
+    }
+    g_link_cv.notify_all();
 }
 
 }  // extern "C"

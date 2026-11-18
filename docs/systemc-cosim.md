@@ -47,9 +47,32 @@ $ xezim --simulate -s sv_top --sc-source tb.cc -I <xezim>/src/sc_shim dut.sv
   `sc_main` stays a plain SystemC program; arguments are accepted and
   dropped.
 
-Supported port types: 2-state, ≤ 64 bits (`logic`, `bit`, `logic [63:0]`);
-wider ports are not exposed through the wrapper. This mirrors the reference
-simulators' pure-SystemC / Verilator `Vtop` integration.
+Supported port types: full **4-state** (`0`/`1`/`X`/`Z`) of **arbitrary width**
+(`logic`, `wire`, `bit`, `logic [N-1:0]`). In `XezTop` and `xez_<SvMod>.h`,
+ports are backed by `xezim::XezSignal<W>` (`sc_signal<sc_dt::sc_lv<W>>`
+wrapper), so both `sc_dt::sc_lv<W>` 4-state reads/writes and legacy
+`uint64_t` / `bool` reads work seamlessly. 2-state SV/SC signal types (`bit`,
+`bool`, `uint64_t`, `sc_uint<W>`, `sc_bv<W>`) coerce `X`/`Z` to `0`, while
+4-state types (`logic`, `sc_lv<W>`, `sc_logic`) preserve `X` and `Z` end-to-end.
+
+## Multi-hop sandwiching (`SV ↔ SC ↔ SV ↔ ...` / `SC ↔ SV ↔ SC ↔ ...`)
+
+SystemVerilog and SystemC modules can be nested to arbitrary depth in either
+master mode:
+
+- **SV → SC at any depth:** every `SC_MODULE(<Name>)` defined in `--sc-source`
+  (or listed via repeatable `--sc-module <Name>`) gets a synthesized SV
+  placeholder and is instantiated per hierarchical site (using `ElabInstance`),
+  with multi-hop SV `port_aliases` / `input_port_actuals` chains chased to the
+  backing flat signal.
+- **SC → SV at any depth:** any `SC_MODULE` or `sc_main` can `#include
+  "xez_<SvMod>.h"` (or `#include "xez_sv.h"`) and instantiate `<SvMod>` like a
+  normal `sc_module` (`sv_leaf u("u")`). Before simulation starts, an iterative
+  fixed-point bootstrap discovers all C++-instantiated SV islands and any
+  nested SV-instantiated SC leaves (`xsc_create_leaf`) to any depth.
+- **Same-timestamp delta convergence:** both `SV`-master Mode B and `SC`-master
+  `xsc_cosim_step` iterate zero-time delta exchanges until SV and SC reach a
+  fixed point at the current timestamp.
 
 See `examples/sc_cosim/` for runnable reference examples.
 
@@ -107,8 +130,10 @@ int sc_main(int, char**) { /* build, bind, run */ }
 
 - `xezim::xsc_bind(name, signal)` registers a signal in the co-simulation
   **registry** under `name`. SV code references the same name.
-- Widths ≤ 64 bits only (enforced with an error). `sc_lv` bits map to 2-state:
-  `X`/`Z` read as `0`; SV `X`/`Z` written into an `sc_lv` become `0`.
+- Arbitrary vector widths (`>= 1` bit, no 64/128/4096-bit cap), full **4-state**
+  (`0`/`1`/`X`/`Z`): `sc_lv<W>` and `sc_logic` preserve `X`/`Z` in both
+  directions; 2-state C++ types (`bool`, integrals, `sc_uint<W>`, `sc_bv<W>`)
+  coerce `X`/`Z` to `0`.
 
 ### SV top: build a SystemC model
 

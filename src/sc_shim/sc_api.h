@@ -33,90 +33,203 @@ namespace xezim {
 namespace detail {
 // Registry entry registration (implemented in sc_shim.cc). Not part of the
 // user API — use the xsc_bind() overloads below.
-void reg_signal(const char* name, int width,
-                std::function<void(const std::uint64_t*, int)>&& writer,
-                std::function<void(std::uint64_t*, int)>&& reader);
+void reg_signal4(const char* name, int width,
+                 std::function<void(const std::uint64_t*, const std::uint64_t*, int)>&& writer,
+                 std::function<void(std::uint64_t*, std::uint64_t*, int)>&& reader);
+
+inline void reg_signal(const char* name, int width,
+                       std::function<void(const std::uint64_t*, int)>&& writer,
+                       std::function<void(std::uint64_t*, int)>&& reader) {
+    reg_signal4(
+        name, width,
+        [w = std::move(writer)](const std::uint64_t* val, const std::uint64_t*, int n) {
+            w(val, n);
+        },
+        [r = std::move(reader)](std::uint64_t* val, std::uint64_t* xz, int n) {
+            for (int j = 0; j < n; ++j) xz[j] = 0;
+            r(val, n);
+        });
+}
 }  // namespace detail
 
-/// Bind an sc_signal<bool> under `name`. Width 1.
+/// Bind an sc_signal<bool> under `name`. Width 1 (2-state: SV X/Z -> false).
 inline void xsc_bind(const char* name, sc_core::sc_signal<bool>& sig) {
-    detail::reg_signal(
+    detail::reg_signal4(
         name, 1,
-        [&sig](const std::uint64_t* w, int) { sig.write(w[0] != 0); },
-        [&sig](std::uint64_t* w, int) { w[0] = sig.read() ? 1 : 0; });
-}
-
-/// Bind an sc_signal of any small integer type (unsigned, int, std::uint64_t,
-/// ...) under `name`. The crossing word is 64 bits; values are sign/zero
-/// extended by the caller's type. (`bool` has its own overload above.)
-template <typename T,
-          typename = std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>>
-inline void xsc_bind(const char* name, sc_core::sc_signal<T>& sig) {
-    detail::reg_signal(
-        name, 64,
-        [&sig](const std::uint64_t* w, int) { sig.write(static_cast<T>(w[0])); },
-        [&sig](std::uint64_t* w, int) { w[0] = static_cast<std::uint64_t>(sig.read()); });
-}
-
-/// Bind an sc_signal<sc_dt::sc_lv<W>> under `name` (1 <= W <= 4096).
-/// Bit i of the sc_lv maps to bit i of the co-simulation word stream
-/// (word j holds bits [64j, 64j+63], LSB first — SystemVerilog order).
-template <int W>
-inline void xsc_bind(const char* name, sc_core::sc_signal<sc_dt::sc_lv<W>>& sig) {
-    static_assert(W >= 1 && W <= 4096, "xsc_bind: width must be 1..4096");
-    constexpr int NW = (W + 63) / 64;
-    detail::reg_signal(
-        name, W,
-        [&sig](const std::uint64_t* w, int) {
-            sc_dt::sc_lv<W> v;
-            for (int b = 0; b < W; ++b)
-                v.set_bit(b, (w[b / 64] >> (b % 64)) & 1 ? sc_dt::Log_1 : sc_dt::Log_0);
-            sig.write(v);
+        [&sig](const std::uint64_t* w, const std::uint64_t* x, int) {
+            const std::uint64_t known = w[0] & ~(x ? x[0] : 0ULL);
+            sig.write((known & 1ULL) != 0);
         },
-        [&sig](std::uint64_t* w, int) {
-            for (int j = 0; j < NW; ++j) w[j] = 0;
-            const sc_dt::sc_lv<W> v = sig.read();
-            for (int b = 0; b < W; ++b)
-                if (v.get_bit(b) == sc_dt::Log_1) w[b / 64] |= std::uint64_t(1) << (b % 64);
+        [&sig](std::uint64_t* w, std::uint64_t* x, int) {
+            w[0] = sig.read() ? 1 : 0;
+            x[0] = 0;
         });
 }
 
-/// Bind an `sc_signal<sc_dt::sc_uint<W>>` under `name`. `sc_uint<N>` is a
-/// 2-state unsigned word type (not a C++ integral, so the generic `T` overload
-/// above does not match it); it is exactly uintN_t on the value bound side.
-/// Bit i maps to bit i of the 64-bit crossing word (LSB first); for a crossing
-/// wider than one word the registry moves a whole word stream (see `sc_lv`).
+/// Bind an sc_signal of any small integer type (unsigned, int, std::uint64_t,
+/// ...) under `name`. Width 64 (2-state: SV X/Z bits coerce to 0).
+template <typename T,
+          typename = std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>>
+inline void xsc_bind(const char* name, sc_core::sc_signal<T>& sig) {
+    detail::reg_signal4(
+        name, 64,
+        [&sig](const std::uint64_t* w, const std::uint64_t* x, int) {
+            const std::uint64_t known = w[0] & ~(x ? x[0] : 0ULL);
+            sig.write(static_cast<T>(known));
+        },
+        [&sig](std::uint64_t* w, std::uint64_t* x, int) {
+            w[0] = static_cast<std::uint64_t>(sig.read());
+            x[0] = 0;
+        });
+}
+
+/// Bind an sc_signal<sc_dt::sc_logic> under `name`. Width 1, full 4-state
+/// (0/1/X/Z preserved in both directions).
+inline void xsc_bind(const char* name, sc_core::sc_signal<sc_dt::sc_logic>& sig) {
+    detail::reg_signal4(
+        name, 1,
+        [&sig](const std::uint64_t* w, const std::uint64_t* x, int) {
+            const bool vb = (w[0] & 1ULL) != 0;
+            const bool xb = x && ((x[0] & 1ULL) != 0);
+            const sc_dt::sc_logic_value_t lv = xb
+                ? (vb ? sc_dt::Log_Z : sc_dt::Log_X)
+                : (vb ? sc_dt::Log_1 : sc_dt::Log_0);
+            sig.write(sc_dt::sc_logic(lv));
+        },
+        [&sig](std::uint64_t* w, std::uint64_t* x, int) {
+            const sc_dt::sc_logic v = sig.read();
+            const sc_dt::sc_logic_value_t lv = v.value();
+            w[0] = (lv == sc_dt::Log_1 || lv == sc_dt::Log_Z) ? 1ULL : 0ULL;
+            x[0] = (lv == sc_dt::Log_X || lv == sc_dt::Log_Z) ? 1ULL : 0ULL;
+        });
+}
+
+/// Bind an sc_signal<sc_dt::sc_lv<W>> under `name` (arbitrary width W >= 1).
+/// Full 4-state: 0=(v=0,xz=0), 1=(v=1,xz=0), X=(v=0,xz=1), Z=(v=1,xz=1).
+template <int W>
+inline void xsc_bind(const char* name, sc_core::sc_signal<sc_dt::sc_lv<W>>& sig) {
+    static_assert(W >= 1, "xsc_bind: width must be >= 1");
+    constexpr int NW = (W + 63) / 64;
+    detail::reg_signal4(
+        name, W,
+        [&sig](const std::uint64_t* w, const std::uint64_t* x, int) {
+            sc_dt::sc_lv<W> v;
+            for (int b = 0; b < W; ++b) {
+                const bool vb = ((w[b / 64] >> (b % 64)) & 1ULL) != 0;
+                const bool xb = x && (((x[b / 64] >> (b % 64)) & 1ULL) != 0);
+                const sc_dt::sc_logic_value_t bit = xb
+                    ? (vb ? sc_dt::Log_Z : sc_dt::Log_X)
+                    : (vb ? sc_dt::Log_1 : sc_dt::Log_0);
+                v.set_bit(b, bit);
+            }
+            sig.write(v);
+        },
+        [&sig](std::uint64_t* w, std::uint64_t* x, int) {
+            for (int j = 0; j < NW; ++j) { w[j] = 0; x[j] = 0; }
+            const sc_dt::sc_lv<W> v = sig.read();
+            for (int b = 0; b < W; ++b) {
+                const auto bit = v.get_bit(b);
+                if (bit == sc_dt::Log_1 || bit == sc_dt::Log_Z)
+                    w[b / 64] |= std::uint64_t(1) << (b % 64);
+                if (bit == sc_dt::Log_X || bit == sc_dt::Log_Z)
+                    x[b / 64] |= std::uint64_t(1) << (b % 64);
+            }
+        });
+}
+
+/// Bind an `sc_signal<sc_dt::sc_uint<W>>` under `name` (2-state: SV X/Z -> 0).
 template <int W>
 inline void xsc_bind(const char* name, sc_core::sc_signal<sc_dt::sc_uint<W>>& sig) {
     static_assert(W >= 1 && W <= 64, "xsc_bind: sc_uint width must be 1..64");
-    detail::reg_signal(
+    detail::reg_signal4(
         name, W,
-        [&sig](const std::uint64_t* w, int) {
-            sig.write(sc_dt::sc_uint<W>(w[0] & ((W >= 64) ? ~std::uint64_t(0) : ((std::uint64_t(1) << W) - 1))));
+        [&sig](const std::uint64_t* w, const std::uint64_t* x, int) {
+            const std::uint64_t known = w[0] & ~(x ? x[0] : 0ULL);
+            const std::uint64_t mask = (W >= 64) ? ~std::uint64_t(0) : ((std::uint64_t(1) << W) - 1);
+            sig.write(sc_dt::sc_uint<W>(known & mask));
         },
-        [&sig](std::uint64_t* w, int) { w[0] = static_cast<std::uint64_t>(sig.read()); });
+        [&sig](std::uint64_t* w, std::uint64_t* x, int) {
+            w[0] = static_cast<std::uint64_t>(sig.read());
+            x[0] = 0;
+        });
 }
 
-/// Bind an `sc_signal<sc_dt::sc_bv<W>>` under `name`. 2-state equivalent of
-/// the `sc_lv` overload.
+/// Bind an `sc_signal<sc_dt::sc_bv<W>>` under `name` (2-state: SV X/Z -> 0).
 template <int W>
 inline void xsc_bind(const char* name, sc_core::sc_signal<sc_dt::sc_bv<W>>& sig) {
-    static_assert(W >= 1 && W <= 4096, "xsc_bind: sc_bv width must be 1..4096");
+    static_assert(W >= 1, "xsc_bind: sc_bv width must be >= 1");
     constexpr int NW = (W + 63) / 64;
-    detail::reg_signal(
+    detail::reg_signal4(
         name, W,
-        [&sig](const std::uint64_t* w, int) {
+        [&sig](const std::uint64_t* w, const std::uint64_t* x, int) {
             sc_dt::sc_bv<W> v;
-            for (int b = 0; b < W; ++b)
-                v[b] = ((w[b / 64] >> (b % 64)) & 1) ? sc_dt::SC_LOGIC_1 : sc_dt::SC_LOGIC_0;
+            for (int b = 0; b < W; ++b) {
+                const bool vb = ((w[b / 64] >> (b % 64)) & 1ULL) != 0;
+                const bool xb = x && (((x[b / 64] >> (b % 64)) & 1ULL) != 0);
+                v[b] = (vb && !xb) ? sc_dt::SC_LOGIC_1 : sc_dt::SC_LOGIC_0;
+            }
             sig.write(v);
         },
-        [&sig](std::uint64_t* w, int) {
-            for (int j = 0; j < NW; ++j) w[j] = 0;
+        [&sig](std::uint64_t* w, std::uint64_t* x, int) {
+            for (int j = 0; j < NW; ++j) { w[j] = 0; x[j] = 0; }
             const sc_dt::sc_bv<W> v = sig.read();
             for (int b = 0; b < W; ++b)
                 if (v[b] == sc_dt::SC_LOGIC_1) w[b / 64] |= std::uint64_t(1) << (b % 64);
         });
+}
+
+/// 4-state wrapper value returned by `XezSignal<W>::read()`: behaves as an
+/// `sc_dt::sc_lv<W>` while implicitly converting to `uint64_t` / `bool` (with
+/// X/Z coerced to 0) so existing integer testbenches compile unchanged.
+template <int W>
+struct XezLv : public sc_dt::sc_lv<W> {
+    using sc_dt::sc_lv<W>::sc_lv;
+    XezLv() : sc_dt::sc_lv<W>() {}
+    XezLv(const sc_dt::sc_lv<W>& v) : sc_dt::sc_lv<W>(v) {}
+    XezLv(const sc_dt::sc_bv<W>& v) : sc_dt::sc_lv<W>(v) {}
+    operator std::uint64_t() const {
+        std::uint64_t acc = 0;
+        const int lim = W < 64 ? W : 64;
+        for (int i = 0; i < lim; ++i) {
+            if (this->get_bit(i) == sc_dt::Log_1) acc |= (std::uint64_t(1) << i);
+        }
+        return acc;
+    }
+};
+
+/// 4-state SystemC port backing signal used by auto-derived SV wrappers
+/// (`XezTop` and embedded `xez_<SvMod>.h` modules). Wraps `sc_signal<sc_lv<W>>`
+/// so 0/1/X/Z flow end-to-end while preserving `write(int/bool/const char*)`,
+/// `uint64_t q = sig.read()`, and direct binding to `sc_in/sc_out<sc_lv<W>>`.
+template <int W>
+struct XezSignal {
+    sc_core::sc_signal<sc_dt::sc_lv<W>> sig;
+    explicit XezSignal(const char* name) : sig(name) {}
+    XezLv<W> read() const { return XezLv<W>(sig.read()); }
+    void write(const sc_dt::sc_lv<W>& v) { sig.write(v); }
+    void write(const sc_dt::sc_bv<W>& v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(const char* s) { sig.write(sc_dt::sc_lv<W>(s)); }
+    void write(bool v) { sig.write(sc_dt::sc_lv<W>(v ? 1 : 0)); }
+    void write(int v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(unsigned int v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(long v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(unsigned long v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(long long v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(unsigned long long v) { sig.write(sc_dt::sc_lv<W>(v)); }
+    void write(const sc_dt::sc_logic& l) {
+        sc_dt::sc_lv<W> v(0);
+        v[0] = l;
+        sig.write(v);
+    }
+    operator sc_core::sc_signal<sc_dt::sc_lv<W>>&() { return sig; }
+    operator const sc_core::sc_signal<sc_dt::sc_lv<W>>&() const { return sig; }
+    const sc_core::sc_event& default_event() const { return sig.default_event(); }
+    const sc_core::sc_event& value_changed_event() const { return sig.value_changed_event(); }
+};
+
+template <int W>
+inline void xsc_bind(const char* name, XezSignal<W>& s) {
+    xsc_bind(name, s.sig);
 }
 
 // ── Module parameter registry accessors (parameter passing) ─────────────────
@@ -231,5 +344,14 @@ extern "C" void xsc_set_param_at(int idx, const char* name, const char* value);
 extern "C" int xsc_param_count(void);
 extern "C" const char* xsc_param_name(int idx);
 extern "C" const char* xsc_param_value(int idx);
+
+// ── Multi-hop SV island registration (C++ SC_MODULE instantiating SV) ───────
+extern "C" void xsc_reg_sv_island(const char* sc_inst, const char* sv_mod);
+
+namespace xezim {
+inline void xsc_register_sv_island(const char* sc_inst, const char* sv_mod) {
+    xsc_reg_sv_island(sc_inst, sv_mod);
+}
+}  // namespace xezim
 
 #endif  // XEZIM_SC_API_H

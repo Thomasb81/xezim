@@ -137,7 +137,7 @@ examples run as-is with `SYSTEMC_HOME=/usr`.
 | 2. Pure SystemC | `sc_param_sink.cc` (a standalone SC_MODULE) | works standalone |
 | 3. SystemC → SystemVerilog (SC top instantiates SV) | `sv_incr`/`sc_tb_sv_incr.cc` (combinational), `sv_adder` (registered) | works — combinational + registered DUT verified, both byte-for-byte against the reference simulator |
 | 4. SystemVerilog → SystemC (SV top instantiates SC) | `sv_param_top.sv`/`sc_param_sink.cc`; `sv_leaf_top.sv`/`inc_leaf.cc` (netlist leaf, Mode B) | works — port + param passing + netlist-leaf verified (Mode B one-shot same-slot probe: deferred, see [§7](#7-deferred-mode-b-one-shot-sample-parity----on-hold-p1)) |
-| 5. Sandwich (SC→SV→SC / SV→SC→SV) | — | multi-instance Mode-B leaf **done** (`q0=43 q1=2` verified); >1-hop sandwich still needs per-site SC-module discovery (see [Continuation work §5](#5-sandwich-and-multi-sc-instances)) |
+| 5. Sandwich (SC→SV→SC / SV→SC→SV) | `tests/sc_cosim_multihop_4state.rs` | **works** — arbitrary-depth `SV↔SC↔SV↔SC↔SV` & `SC↔SV↔SC↔SV` with multi-instance isolation and 4-state (`0/1/X/Z`) verified (see [§5](#5-sandwich-and-multi-sc-instances)) |
 
 The master is inferred from the C++ source: a TU defining `sc_main` is SC
 master; a TU defining a plain `SC_MODULE` (no `sc_main`/`xsc_model_build`) is
@@ -350,40 +350,30 @@ combinational top crossing both directions (bit 80 set, i.e. the high word)
 returns `TAG_PASS dout_lo=1 dout_hi=10000`; auto-regression:
 `sc_top_auto_wrapper_wide_crossing`.
 
-**Remaining:** the boundary is still 2-state (`sc_lv` X/Z → 0) and capped at
-128 bits — wider/XZ top ports are still declined; the `sc_in<bool>` /
-`sc_in<sc_uint>` auto-width-mirroring gap (a 1-bit top port becoming `bool`,
-richer SC datatypes like `sc_int`/`sc_fixed`) remains open.
+**Update:** 4-state (`0`/`1`/`X`/`Z`) transport is now **implemented** end-to-end
+across `sc_lv<W>`, `sc_logic`, and `XezSignal<W>` at **arbitrary width** (with
+2-state SV/SC types cleanly coercing `X`/`Z` to `0`); the `sc_in<bool>` /
+`sc_in<sc_uint>` vs `sc_lv` auto-width-mirroring gap and richer datatypes like
+`sc_int`/`sc_fixed` remain open.
 
-### 5. Sandwich and multi-SC instances
+### 5. Sandwich and multi-SC instances — **complete**
 
-**Goal:** enable use-case 5 (SV↔SC↔SV / SC↔SV↔SC) and more than one SC leaf
-in an SV netlist.
+**Goal:** enable use-case 5 (SV↔SC↔SV / SC↔SV↔SC at arbitrary depth) and
+multiple SC module types/instances in an SV netlist.
 
-**Current state:** the multi-instance Mode-B leaf part is **done (this
-branch)** — see the fixes below — leaving only the >1-hop *sandwich* depth
-(arbitrary SC module types at multiple sites) open. The single Mode-B leaf
-(`--sc-module X --sc-source X.cc`) works, and the Rust-side instance-discovery
-walk (`sc_leaf_instances` + `sc_attach_instance_ports` in `waveforms.rs`)
-iterates every `<inst>.<port>` prefix.
-
-**Implemented (this branch):**
-1. **Instance-aware model generation:** the discovered instance names are fed
-   into `render_sv_leaf_model` (`wrapper.rs`), which now emits one SC object
-   per netlist site (`static <module> mod_<instance>("mod_<instance>")`), with
-   ports bound as `<instance>.<port>`.
-2. **Distinct registry namespaces:** each SC object registers its signals under
-   its `<instance>.<port>` key, and `sc_attach_instance_ports` maps rows by
-   that same key — so two sites of the same module keep independent SC state.
-   Verified: a two-`inc_leaf` top now returns `q0=43 q1=2` (independent
-   registers) instead of the pre-fix `q0=2 q1=2` (shared object).
-
-**Remaining:** the **sandwich depth (>1 hop)** additionally needs the
-SV-netlist discovery to accept *arbitrary* SC module types at multiple sites
-(not just the single `--sc-module`), i.e. walking the elaborated hierarchy for
-placeholders and reflecting each one's module type from its source. Once that
-machinery exists, an ARBITRARY SC module at an arbitrary SV site forms the
->1-hop sandwich, and a multi-module top can name a per-site `--sc-module`.
+**Implemented:**
+1. **Multi-module & deep-hierarchy `SV → SC`:** repeatable `--sc-module` +
+   automatic `SC_MODULE` discovery from `--sc-source`, `ElabInstance`-based
+   per-site discovery at any SV hierarchy depth, and multi-hop `net_of` chain
+   chasing.
+2. **`SC → SV` embedded islands (`xez_<SvMod>.h` / `xez_sv.h`):** C++ modules
+   instantiate SV submodules at any depth, registered via
+   `xsc_register_sv_island` and bootstrapped to fixed point alongside
+   `xsc_create_leaf`.
+3. **Same-timestamp delta fixed-point convergence:** Mode B and `xsc_cosim_step`
+   iterate zero-time delta hops until both kernels settle. Verified in
+   `tests/sc_cosim_multihop_4state.rs` (5-layer `SV→SC→SV→SC→SV` multi-instance
+   and 4-layer `SC→SV→SC→SV`, combinational + clocked + 4-state `X`/`Z`).
 
 ### 6. Hardening & observability (smaller)
 

@@ -2348,7 +2348,7 @@ fn run_main() -> i32 {
     let mut sc_includes: Vec<String> = Vec::new();
     let mut sc_cxxflags: Vec<String> = Vec::new();
     let mut sc_libs: Vec<String> = Vec::new();
-    let mut sc_module: Option<String> = None;
+    let mut sc_modules: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
@@ -3139,14 +3139,14 @@ fn run_main() -> i32 {
             "--sc-module" => {
                 i += 1;
                 if i < args.len() {
-                    sc_module = Some(args[i].clone());
+                    sc_modules.push(args[i].clone());
                 } else {
                     eprintln!("Error: --sc-module requires a SystemC SC_MODULE name");
                     return 2;
                 }
             }
             _ if arg.starts_with("--sc-module=") => {
-                sc_module = Some(arg["--sc-module=".len()..].to_string());
+                sc_modules.push(arg["--sc-module=".len()..].to_string());
             }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
@@ -3667,7 +3667,7 @@ fn run_main() -> i32 {
     // its dynamic symbols (strong sc_main = SC master), otherwise the sources'
     // entry points decide (xsc_model_build = passive SV top). `sc_options()`
     // reads the computed `master`, so the kernels can never disagree.
-    if !sc_sources.is_empty() || !sc_libs.is_empty() || sc_module.is_some() {
+    if !sc_sources.is_empty() || !sc_libs.is_empty() || !sc_modules.is_empty() {
         let master = xezim::sc_bridge::infer_master(&sc_sources, &sc_libs);
         xezim::sc_bridge::set_sc_options(xezim::sc_bridge::ScOptions {
             master,
@@ -3676,7 +3676,9 @@ fn run_main() -> i32 {
             cxxflags: sc_cxxflags.clone(),
             libs: sc_libs.clone(),
             quantum: xezim::sc_bridge::quantum_from_env(),
-            sc_module,
+            sc_module: sc_modules.first().cloned(),
+            sc_modules: sc_modules.clone(),
+            sv_modules: Vec::new(),
         });
     }
     if nospecify {
@@ -3921,32 +3923,83 @@ suppressed but the explicit SDF annotation still applies."
         top_module = Some(wrap_name.to_string());
     }
 
-    // Mode B (pure-SystemC leaf inside the SV netlist): the SV testbench
-    // instantiates the SC module directly (`ringbuf u(.clock(c),...);`). The
-    // elaborator has no SystemVerilog `module ringbuf` to inline, so we
-    // synthesize an empty-body placeholder mirroring the SC module's
-    // reflected `sc_in`/`sc_out`/`sc_inout` ports and inject it as an extra
-    // source. The normal elaboration/port-connection pipeline then runs
-    // unchanged; the bridge drives the SC leaf's port signals directly.
-    if let Some((mod_name, srcs, is_sv_master)) = {
-        let o = xezim::sc_bridge::sc_options();
-        o.as_ref().map(|o| {
-            (
-                o.sc_module.clone(),
-                o.sources.clone(),
-                o.master == xezim::sc_bridge::ScTop::Sv,
-            )
-        })
-    } {
-        if is_sv_master {
-            if let Some(mname) = mod_name {
-                let mports = xezim::sc_bridge::sc_module_ports(&mname, &srcs);
-                let placeholder =
-                    xezim::sc_bridge::synthesize_placeholder(&mname, &mports);
+    // Multi-hop SystemC placeholder synthesis + SV-island module discovery:
+    // discover every SC_MODULE in `--sc-source` (plus explicit `--sc-module`
+    // flags) and every SV module requested by `#include "xez_<SvMod>.h"` or
+    // `#include "xez_sv.h"`, then synthesize empty-body SV placeholders for all
+    // SC modules not already defined in SV (in BOTH SV-top and SC-top modes, so
+    // `SC -> SV -> SC -> ...` elaborates cleanly).
+    if let Some(mut opts) = xezim::sc_bridge::sc_options() {
+        let sv_defined = xezim::sc_bridge::discover_sv_module_names_in_sv(&sources);
+        let discovered_sc =
+            xezim::sc_bridge::discover_sc_module_names(&opts.sources, &opts.include_dirs);
+        let explicit_sc: std::collections::HashSet<String> =
+            opts.sc_modules.iter().cloned().collect();
+        let mut all_sc = opts.sc_modules.clone();
+        for m in discovered_sc {
+            if !all_sc.contains(&m) && !sv_defined.contains(&m) {
+                all_sc.push(m);
+            }
+        }
+        let sv_mods = xezim::sc_bridge::discover_sv_modules_in_sc(
+            &opts.sources,
+            &opts.include_dirs,
+            &sources,
+        );
+        let sv_mentions = |ident: &str| -> bool {
+            let nb = ident.as_bytes();
+            let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            sources.iter().any(|src| {
+                let b = src.as_bytes();
+                let mut i = 0;
+                while i + nb.len() <= b.len() {
+                    if &b[i..i + nb.len()] == nb
+                        && (i == 0 || !is_id(b[i - 1]))
+                        && (i + nb.len() >= b.len() || !is_id(b[i + nb.len()]))
+                    {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
+            })
+        };
+        let referenced_sc: Vec<String> = all_sc
+            .iter()
+            .filter(|m| !sv_defined.contains(*m) && (explicit_sc.contains(*m) || sv_mentions(m)))
+            .cloned()
+            .collect();
+        opts.sc_module = opts
+            .sc_modules
+            .first()
+            .cloned()
+            .or_else(|| referenced_sc.first().cloned());
+        opts.sc_modules = referenced_sc.clone();
+        opts.sv_modules = sv_mods.clone();
+        xezim::sc_bridge::set_sc_options(opts.clone());
+
+        for mname in &referenced_sc {
+            let mports = xezim::sc_bridge::sc_module_ports_in(
+                mname,
+                &opts.sources,
+                &opts.include_dirs,
+            );
+            if !mports.is_empty() || explicit_sc.contains(mname) {
+                let placeholder = xezim::sc_bridge::synthesize_placeholder(mname, &mports);
                 sources.push(placeholder);
                 source_files.push(format!("<sc_placeholder:{mname}>"));
                 file_labels.push(format!("<sc_placeholder:{mname}>"));
             }
+        }
+
+        if opts.master == xezim::sc_bridge::ScTop::Sc
+            && top_module.is_none()
+            && !sv_mods.is_empty()
+        {
+            sources.push("module __xez_cosim_root;\nendmodule\n".to_string());
+            source_files.push("<sc_cosim_root>".to_string());
+            file_labels.push("<sc_cosim_root>".to_string());
+            top_module = Some("__xez_cosim_root".to_string());
         }
     }
 

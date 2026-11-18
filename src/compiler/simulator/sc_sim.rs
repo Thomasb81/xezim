@@ -12,7 +12,7 @@ use crate::{log_eprintln as eprintln, log_println as println};
 /// Render a SystemVerilog parameter value to the text form the SystemC side's
 /// `sc_get_param` family expects (mirrors the reference simulators' `vlog_to_sc`
 /// parameter passing).
-pub(super) fn sc_param_value_text(v: &xezim_core::Value) -> String {
+pub(crate) fn sc_param_value_text(v: &xezim_core::Value) -> String {
     if v.is_real {
         let d = v.to_f64();
         if d == d.trunc() && d.abs() < 1e9 {
@@ -85,14 +85,6 @@ impl Simulator {
             return;
         };
         let width = self.signal_table[sv_id].width;
-        if width > 64 {
-            eprintln!(
-                "Error: {}: signals wider than 64 bits are not supported",
-                name
-            );
-            self.finished = true;
-            return;
-        }
         let dir = if name == "$sc_export_sig" {
             crate::sc_bridge::ScDir::Export
         } else {
@@ -141,14 +133,6 @@ impl Simulator {
             let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
                 continue;
             };
-            if w > 128 {
-                eprintln!(
-                    "Warning: SystemC registry signal '{}' ({} bits) exceeds the \
-                     128-bit crossing limit; not auto-attached",
-                    name, w
-                );
-                continue;
-            }
             // Direction-aware attach: an SV input port receives from SystemC
             // (Import), an SV output port drives SystemC (Export), and an
             // inout is genuinely bidirectional (Auto). Without this, an SV
@@ -164,58 +148,32 @@ impl Simulator {
         }
     }
 
-    /// Mode B: discover the netlist SC-leaf instance prefixes, e.g. `u0`/`u1`
-    /// for two `inc_leaf u0(...)/u1(...)` sites, plus the single-instance
-    /// `u`. Reuses the same elaboration-agenda the port-application walk reads
-    /// (`port_aliases`, `input_port_actuals`, `continuous_assigns`,
-    /// `signal_name_to_id`) so the generated leaf model can be built with one
-    /// SC object per instance before the bridge maps them.
-    pub(crate) fn sc_leaf_instances(&self) -> Vec<String> {
-        use crate::sc_bridge::sc_module_ports;
-        let Some(opts) = crate::sc_bridge::sc_options() else {
-            return Vec::new();
-        };
-        let Some(mname) = opts.sc_module.clone() else {
-            return Vec::new();
-        };
-        let ports = sc_module_ports(&mname, &opts.sources);
-        if ports.is_empty() {
-            return Vec::new();
+    fn sc_flat_path(e: &crate::ast::expr::Expression) -> Option<String> {
+        if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
+            Some(
+                h.path
+                    .iter()
+                    .map(|s| s.name.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        } else {
+            None
         }
-        let scnames: std::collections::HashSet<&str> =
-            ports.iter().map(|p| p.name.as_str()).collect();
-        fn flat_path(e: &crate::ast::expr::Expression) -> Option<String> {
-            if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
-                Some(
-                    h.path
-                        .iter()
-                        .map(|s| s.name.name.to_string())
-                        .collect::<Vec<_>>()
-                        .join("."),
-                )
-            } else {
-                None
-            }
-        }
-        // net_of: `<inst>.<port>` → the SV net carrying that port's value
-        // (see `sc_attach_instance_ports` for the three routing rules).
+    }
+
+    fn sc_build_net_of(&self, scnames: &std::collections::HashSet<String>) -> std::collections::HashMap<String, String> {
         let mut net_of: std::collections::HashMap<String, String> = Default::default();
         for (key, actual) in &self.module.port_aliases {
             net_of.insert(key.clone(), actual.clone());
         }
-        // In main, `input_port_actuals` entries are `(<inst>.<port> formal,
-        // actual expr, two_state)` — the formal is the FULL path (e.g.
-        // `u.clock`), not the bare instance prefix. Key `net_of` directly by
-        // the formal path so each SC input port resolves to its connected SV
-        // net by NAME (not positionally, which the old branch's bare-instance
-        // keys implied).
         for port in &self.module.input_port_actuals {
-            if let Some(a) = flat_path(port.actual()) {
+            if let Some(a) = Self::sc_flat_path(port.actual()) {
                 net_of.insert(port.formal().to_string(), a);
             }
         }
         for ca in &self.module.continuous_assigns {
-            if let (Some(lhs), Some(rhs)) = (flat_path(&ca.lhs), flat_path(&ca.rhs)) {
+            if let (Some(lhs), Some(rhs)) = (Self::sc_flat_path(&ca.lhs), Self::sc_flat_path(&ca.rhs)) {
                 if let Some(idx) = lhs.rfind('.') {
                     let por = &lhs[idx + 1..];
                     if scnames.contains(por) && !por.contains('.') {
@@ -224,11 +182,85 @@ impl Simulator {
                 }
             }
         }
-        // Candidate instance prefixes: any `<inst>.<scport>` net name.
+        net_of
+    }
+
+    /// Chase multi-hop `port_aliases` / `input_port_actuals` chains to the
+    /// backing flat signal id in `signal_name_to_id`.
+    fn sc_resolve_net(
+        &self,
+        net_of: &std::collections::HashMap<String, String>,
+        start: &str,
+    ) -> Option<usize> {
+        let mut cur = start;
+        for _ in 0..64 {
+            if let Some(&id) = self.signal_name_to_id.get(cur) {
+                if !net_of.contains_key(cur) {
+                    return Some(id);
+                }
+                // Even if present in both, prefer the downstream root alias if
+                // it resolves to a valid signal.
+                if let Some(next) = net_of.get(cur) {
+                    if next != cur {
+                        cur = next.as_str();
+                        continue;
+                    }
+                }
+                return Some(id);
+            }
+            let next = net_of.get(cur)?;
+            if next == cur {
+                break;
+            }
+            cur = next.as_str();
+        }
+        self.signal_name_to_id.get(cur).copied()
+    }
+
+    /// Discover all netlist SC-leaf `(instance_path, module_name)` pairs at
+    /// arbitrary hierarchy depth using `self.module.instances` (with a flat
+    /// fallback for single-level synthetic tests).
+    pub(crate) fn sc_leaf_instances(&self) -> Vec<(String, String)> {
+        use crate::sc_bridge::sc_module_ports_in;
+        let Some(opts) = crate::sc_bridge::sc_options() else {
+            return Vec::new();
+        };
+        let sc_mods = opts.all_sc_modules();
+        if sc_mods.is_empty() {
+            return Vec::new();
+        }
+        let sc_set: std::collections::HashSet<&str> =
+            sc_mods.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for inst in &self.module.instances {
+            if sc_set.contains(inst.def_name.as_str())
+                && !sc_module_ports_in(&inst.def_name, &opts.sources, &opts.include_dirs).is_empty()
+                && seen.insert(inst.path.clone())
+            {
+                out.push((inst.path.clone(), inst.def_name.clone()));
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+        // Fallback: single-level net-prefix discovery when `instances` is absent.
+        let Some(mname) = opts.sc_module.clone() else {
+            return Vec::new();
+        };
+        let ports = sc_module_ports_in(&mname, &opts.sources, &opts.include_dirs);
+        if ports.is_empty() {
+            return Vec::new();
+        }
+        let scnames: std::collections::HashSet<String> =
+            ports.iter().map(|p| p.name.clone()).collect();
+        let net_of = self.sc_build_net_of(&scnames);
         let mut prefixes: std::collections::BTreeSet<String> = Default::default();
-        for key in net_of.keys().map(String::as_str).chain(
-            self.signal_name_to_id.keys().map(|k| k.as_ref()),
-        ) {
+        for key in net_of
+            .keys()
+            .map(String::as_str)
+            .chain(self.signal_name_to_id.keys().map(|k| k.as_ref()))
+        {
             if let Some(idx) = key.rfind('.') {
                 let (pre, por) = key.split_at(idx);
                 let por = &por[1..];
@@ -237,110 +269,44 @@ impl Simulator {
                 }
             }
         }
-        prefixes.into_iter().collect()
+        prefixes.into_iter().map(|p| (p, mname.clone())).collect()
     }
 
-    /// Mode B: bind each pure-SystemC *leaf* instance's port signals to the
-    /// `u.dout` for `ringbuf u(.data_out(q))`). For each instance we find in
-    /// the netlist that carries ALL of the SC module's ports, we attach its
-    /// port signals to the registry under the bare port names.
-    ///
-    /// Direction: `ScPort.dir` is the SC module's own port kind
-    /// (`sc_in` → Import of SC's view = SV exports into SC; `sc_out` → SC
-    /// imports into SV). At the row level an SC `sc_in` (SC *reads* SV) is an
-    /// **Export** row (SV→SC) and an SC `sc_out` (SC *drives* SV) is an
-    /// **Import** row (SC→SV); `sc_inout`/`sc_signal` stay Auto. That is the
-    /// complement of `ScPort.dir`.
+    /// Bind each pure-SystemC leaf instance's port signals at arbitrary SV
+    /// hierarchy depth (`u.dout`, `sub.u.dout`, `__xez_isl_0.u.dout`, ...)
+    /// into the co-simulation registry.
     pub(crate) fn sc_attach_instance_ports(&mut self, b: &mut crate::sc_bridge::ScBridge) {
-        use crate::sc_bridge::{sc_module_ports, ScDir, ScPort};
+        use crate::sc_bridge::{sc_module_ports_in, ScDir, ScPort, ScTop};
         let Some(opts) = crate::sc_bridge::sc_options() else {
             return;
         };
-        let Some(mname) = opts.sc_module.clone() else {
-            return;
-        };
-        // Reflect the SC module's ports from its C++ source.
-        let ports = sc_module_ports(&mname, &opts.sources);
-        if ports.is_empty() {
+        let leaves = self.sc_leaf_instances();
+        if leaves.is_empty() {
             return;
         }
-        // Discover SC leaf instances. A leaf's SV-side values live on the
-        // nets at its instantiation site. The elaborator handles a port
-        // connection as follows:
-        //   * OUTPUT whole-net actual → `port_aliases` entry `<inst>.<port>`
-        //     ↦ actual net (u.dout → dout).
-        //   * INPUT whole-net actual → an implicit continuous assign
-        //     `assign <inst>.<port> = <actual>` and the port net is NOT
-        //     materialised in the flat signal table (it collapses into the
-        //     actual). We recover the actual from that assign's RHS.
-        //   * bit-select / concat actual → the placeholder's own port signal
-        //     `<inst>.<port>` stays in the flat signal table.
-        // Every SC port must map to exactly one SV net by one of these three
-        // routes; an instance is genuine only when ALL ports resolve.
-        let scnames: std::collections::HashSet<&str> =
-            ports.iter().map(|p| p.name.as_str()).collect();
-        fn flat_path(e: &crate::ast::expr::Expression) -> Option<String> {
-            if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
-                Some(
-                    h.path
-                        .iter()
-                        .map(|s| s.name.name.to_string())
-                        .collect::<Vec<_>>()
-                        .join("."),
-                )
-            } else {
-                None
+        let mut port_cache: std::collections::HashMap<String, Vec<ScPort>> = Default::default();
+        let mut scnames: std::collections::HashSet<String> = Default::default();
+        for (_, mname) in &leaves {
+            let ports = port_cache
+                .entry(mname.clone())
+                .or_insert_with(|| sc_module_ports_in(mname, &opts.sources, &opts.include_dirs));
+            for p in ports.iter() {
+                scnames.insert(p.name.clone());
             }
         }
-        // net_of: `<inst>.<port>` → the SV net carrying that port's value.
-        //   * OUTPUT whole-net actual → `port_aliases` (u.dout → dout).
-        //   * INPUT whole-net actual → the port net is *elided* and the value
-        //     lives on the actual; the elaborator records (inst, actual) in
-        //     `input_port_actuals` in the placeholder's input-port order.
-        //   * bit-select / concat actual → the placeholder's own port signal
-        //     `<inst>.<port>` stays in the signal table.
-        let mut net_of: std::collections::HashMap<String, String> = Default::default();
-        for (key, actual) in &self.module.port_aliases {
-            net_of.insert(key.clone(), actual.clone());
-        }
-        // The reflected inputs are recorded once per `<inst>.<port>` formal in
-        // `input_port_actuals` (main keys it by the FULL path, not the bare
-        // instance). Key `net_of` directly by that formal path so each SC input
-        // port resolves to its connected SV net by NAME. (`sc_inout` is not
-        // elided.)
-        for port in &self.module.input_port_actuals {
-            if let Some(a) = flat_path(port.actual()) {
-                net_of.insert(port.formal().to_string(), a);
-            }
-        }
-        // Route B: non-elided inputs appear as `assign <inst>.<port> = <net>`.
-        for ca in &self.module.continuous_assigns {
-            if let (Some(lhs), Some(rhs)) = (flat_path(&ca.lhs), flat_path(&ca.rhs)) {
-                if let Some(idx) = lhs.rfind('.') {
-                    let por = &lhs[idx + 1..];
-                    if scnames.contains(por) && !por.contains('.') {
-                        net_of.entry(lhs.clone()).or_insert_with(|| rhs.clone());
-                    }
-                }
-            }
-        }
-        // Candidate instance prefixes: discovered once, shared with the
-        // model-generation step so each site gets an independent SC object.
-        let prefixes = self.sc_leaf_instances();
-        for inst in &prefixes {
-            // A genuine leaf only when EVERY SC port resolves to an SV net
-            // underneath this instance.
+        let net_of = self.sc_build_net_of(&scnames);
+        self.sync_table_to_hashmap();
+        let mapped: std::collections::HashSet<String> =
+            b.rows.iter().map(|r| r.sc_name.clone()).collect();
+        for (inst, mname) in &leaves {
+            let Some(ports) = port_cache.get(mname) else {
+                continue;
+            };
             let mut all_ok = true;
             let mut bindings: Vec<(usize, &ScPort)> = Vec::new();
-            for p in &ports {
+            for p in ports {
                 let sv_name = format!("{}.{}", inst, p.name);
-                // Resolve: input-assign/alias net, else the placeholder's own
-                // port signal (bit-select/concat actuals).
-                let net = net_of
-                    .get(sv_name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| sv_name.clone());
-                let Some(&id) = self.signal_name_to_id.get(net.as_str()) else {
+                let Some(id) = self.sc_resolve_net(&net_of, &sv_name) else {
                     all_ok = false;
                     break;
                 };
@@ -349,17 +315,13 @@ impl Simulator {
             if !all_ok {
                 continue;
             }
-            // A genuine SC leaf is present: enable automatic per-time-step
-            // exchange and restart the exchange-time baseline at t=0.
-            self.sc_mode_b = true;
-            self.sc_last_exchange_time = 0;
+            if opts.master == ScTop::Sv {
+                self.sc_mode_b = true;
+                self.sc_last_exchange_time = 0;
+            }
             for (id, p) in bindings {
-                if p.width > 128 {
-                    eprintln!(
-                        "Warning: SystemC leaf port '{}' ({} bits) exceeds the 128-bit \
-crossing limit; not attached",
-                        p.name, p.width
-                    );
+                let reg_key = format!("{}.{}", inst, p.name);
+                if mapped.contains(&reg_key) {
                     continue;
                 }
                 // Complement mapping: SC sc_in → Export (SV→SC), sc_out →
@@ -369,10 +331,46 @@ crossing limit; not attached",
                     ScDir::Export => ScDir::Import,
                     ScDir::Auto => ScDir::Auto,
                 };
-                // Registry key is per-instance (`<inst>.<port>`), matching the
-                // generated model's per-instance `xsc_bind`, so distinct
-                // netlist sites do not collapse onto one shared SC signal.
-                b.add_map(id, p.width, format!("{}.{}", inst, p.name), dir);
+                b.add_map(id, p.width, reg_key, dir);
+            }
+        }
+    }
+
+    /// Attach ports of multi-hop embedded SV islands instantiated inside C++
+    /// (`xez_<SvMod>.h`). Each island's ports are materialized in the SV top as
+    /// `<wire_prefix>_<port_ident>` and bound in the C++ registry under
+    /// `<sc_inst_name>.<port_name>`.
+    pub(crate) fn sc_attach_island_ports(&mut self, b: &mut crate::sc_bridge::ScBridge) {
+        use crate::sc_bridge::{ScDir, ScPortDir, ScTop};
+        if self.sc_islands.is_empty() {
+            return;
+        }
+        self.sync_table_to_hashmap();
+        let islands = self.sc_islands.clone();
+        let is_sv_master = crate::sc_bridge::sc_options()
+            .is_some_and(|o| o.master == ScTop::Sv);
+        let mapped: std::collections::HashSet<String> =
+            b.rows.iter().map(|r| r.sc_name.clone()).collect();
+        for (wire_pfx, sc_inst, _sv_mod, ports) in &islands {
+            for p in ports {
+                let sv_sig = format!("{wire_pfx}_{}", p.ident());
+                let Some(&sv_id) = self.signal_name_to_id.get(sv_sig.as_str()) else {
+                    continue;
+                };
+                let sc_name = format!("{sc_inst}.{}", p.name);
+                if mapped.contains(&sc_name) {
+                    continue;
+                }
+                let dir = match p.dir {
+                    ScPortDir::In => ScDir::Import,   // SC drives SV island input
+                    ScPortDir::Out => ScDir::Export,  // SV island output drives SC
+                    ScPortDir::Inout => ScDir::Auto,
+                };
+                b.add_map(sv_id, p.width.max(1), sc_name, dir);
+                if is_sv_master {
+                    self.sc_mode_b = true;
+                    self.sc_last_exchange_time = 0;
+                }
             }
         }
     }
@@ -385,6 +383,9 @@ crossing limit; not attached",
         self.sync_table_to_hashmap();
         let mut out = Vec::new();
         for (name, dir) in self.vpi_port_directions.iter() {
+            if name.contains('.') {
+                continue;
+            }
             let Some(&id) = self.signal_name_to_id.get(name.as_ref()) else {
                 continue;
             };
@@ -404,9 +405,9 @@ crossing limit; not attached",
         out
     }
 
-    /// Stage export-mapped SV signals into the shim, returning
-    /// (idx, words) pairs (1..2 words depending on crossing width).
-    fn sc_stage_exports(&mut self) -> Vec<(i32, Vec<u64>)> {
+    /// Stage export-mapped 4-state SV signals into the shim, returning
+    /// `(sc_idx, sv_id, val_words, xz_words)` tuples and updating `sc_last_exports`.
+    fn sc_stage_exports(&mut self) -> Vec<(i32, usize, Vec<u64>, Vec<u64>)> {
         let Some(b) = self.sc_bridge.as_mut() else {
             return Vec::new();
         };
@@ -414,41 +415,76 @@ crossing limit; not attached",
         // sc_idx; resolve any that are still pending before the first exchange.
         b.ensure_ready();
         let mut out = Vec::new();
+        let mut snap = Vec::new();
         for row in &b.rows {
             // Export and Auto rows both push the SV value into SystemC.
             if row.dir == crate::sc_bridge::ScDir::Import {
                 continue;
             }
             if let Some(idx) = row.sc_idx {
-                let (v, _x) = self.signal_table[row.sv_id].bits128();
-                let n = row.nwords();
-                let mut words = vec![0u64; n];
-                words[0] = v as u64;
-                if n > 1 {
-                    words[1] = (v >> 64) as u64;
-                }
-                out.push((idx, words));
+                let (val, xz) = crate::sc_bridge::value_to_planes(
+                    &self.signal_table[row.sv_id],
+                    row.sv_width,
+                );
+                snap.push((row.sv_id, val.clone(), xz.clone()));
+                out.push((idx, row.sv_id, val, xz));
             }
         }
+        self.sc_last_exports = snap;
         out
     }
 
-    /// Apply pulled import values into the signal table with full write
-    /// bookkeeping (settle marks, dirty tracking, edge detection).
-    fn sc_apply_imports(&mut self, imports: Vec<(usize, Vec<u64>)>) {
-        for (sv_id, words) in imports {
-            let w_bits = self.signal_table[sv_id].width;
-            // Mask the top word to the declared width.
-            let mut ws = words;
-            let top = w_bits % 64;
-            if let Some(hw) = ws.last_mut() {
-                if top != 0 {
-                    *hw &= (1u64 << top) - 1;
+    /// True if any Export/Auto row currently differs from the snapshot staged
+    /// at the most recent exchange (`sc_last_exports`).
+    pub(crate) fn sc_any_export_changed(&self) -> bool {
+        let Some(b) = self.sc_bridge.as_ref() else {
+            return false;
+        };
+        for (sv_id, prev_v, prev_x) in &self.sc_last_exports {
+            for row in &b.rows {
+                if row.sv_id == *sv_id
+                    && row.dir != crate::sc_bridge::ScDir::Import
+                    && row.sc_idx.is_some()
+                {
+                    let (cur_v, cur_x) = crate::sc_bridge::value_to_planes(
+                        &self.signal_table[*sv_id],
+                        row.sv_width,
+                    );
+                    if cur_v != *prev_v || cur_x != *prev_x {
+                        return true;
+                    }
+                    break;
                 }
             }
-            // Two-state v1: the C++ readers already map sc_lv X/Z to 0.
-            self.ts_store_wide(sv_id, &ws);
         }
+        false
+    }
+
+    /// Apply pulled 4-state import values into the signal table with full write
+    /// bookkeeping (`write_sig!` + dirty tracking + `table_modified`). Returns
+    /// true when at least one SV signal actually changed.
+    fn sc_apply_imports(&mut self, imports: Vec<(usize, Vec<u64>, Vec<u64>)>) -> bool {
+        let mut any_changed = false;
+        for (sv_id, val_words, xz_words) in imports {
+            let w_bits = self.signal_table[sv_id].width;
+            let mut val = crate::sc_bridge::planes_to_value(&val_words, &xz_words, w_bits);
+            if self.signal_two_state.get(sv_id).copied().unwrap_or(false) {
+                val = val.to_two_state();
+            }
+            if self.signal_table[sv_id] != val {
+                any_changed = true;
+                write_sig!(self, sv_id, val);
+                self.after_signal_write(sv_id);
+                if sv_id < self.dirty_signals.len() && !self.dirty_signals[sv_id] {
+                    self.dirty_signals[sv_id] = true;
+                    self.dirty_list.push(sv_id);
+                    self.dirty_any = true;
+                }
+                self.table_modified = true;
+            }
+        }
+        self.sc_last_import_changed = any_changed;
+        any_changed
     }
 
     /// `$sc_step(n)` (SV top): push exports, advance the SystemC kernel
@@ -465,8 +501,8 @@ crossing limit; not attached",
         let exports = self.sc_stage_exports();
         {
             let b = self.sc_bridge.as_ref().unwrap();
-            for (idx, words) in &exports {
-                unsafe { (b.shim.write_export)(*idx, words.as_ptr(), words.len() as i32) };
+            for (idx, _sv_id, val, xz) in &exports {
+                b.shim.write_export_planes(*idx, val, xz);
             }
             unsafe { (b.shim.step)(ticks) };
         }
@@ -496,8 +532,8 @@ crossing limit; not attached",
         let exports = self.sc_stage_exports();
         {
             let b = self.sc_bridge.as_ref().unwrap();
-            for (idx, words) in &exports {
-                unsafe { (b.shim.write_export)(*idx, words.as_ptr(), words.len() as i32) };
+            for (idx, _sv_id, val, xz) in &exports {
+                b.shim.write_export_planes(*idx, val, xz);
             }
             unsafe { (b.shim.step_mode_b)(ticks) };
         }
@@ -528,17 +564,7 @@ crossing limit; not attached",
     /// Whether the SystemC side still expects work: either the SystemC kernel
     /// has projected future activity (a not-yet-elaborated/not-yet-finished
     /// kernel reports pending), or the SV side has staged an export value the
-    /// SystemC side hasn't consumed yet. The second clause is what lets an
-    /// SC-top exchange deliver an SV output whose combinational fanout settled
-    /// only after the last exchange — without it, a quiet SystemC side would
-    /// end the run and the SV output would never reach sc_main.
-    ///
-    /// Additionally, in the auto-derive SC-top flow the SystemC master's
-    /// `sc_main` drives the DUT imperatively (write + `sc_start()`), so between
-    /// the master's steps the SC kernel is quiescent yet more steps are coming.
-    /// While `sc_main` has not returned (`!sc_done`) the SV kernel must park on
-    /// the link rather than treat the momentary quiescence as the end, otherwise
-    /// an imported clock edge written later never reaches the SV kernel.
+    /// SystemC side hasn't consumed yet.
     pub(crate) fn sc_exchange_alive(&mut self) -> bool {
         if self.sc_side_alive() {
             return true;
@@ -550,34 +576,10 @@ crossing limit; not attached",
                 return true;
             }
         }
-        // NV: any Export/Auto row whose current value differs from what we
-        // last staged still needs one more exchange to reach SystemC.
-        let Some(b) = self.sc_bridge.as_ref() else { return false };
-        for (idx, prev) in &self.sc_last_exports {
-            for row in &b.rows {
-                if row.sv_id == *idx
-                    && row.dir != crate::sc_bridge::ScDir::Import
-                    && row.sc_idx.is_some()
-                {
-                    let (v, _x) = self.signal_table[*idx].bits128();
-                    let n = row.nwords();
-                    let mut cur = vec![0u64; n];
-                    cur[0] = v as u64;
-                    if n > 1 {
-                        cur[1] = (v >> 64) as u64;
-                    }
-                    if cur != *prev {
-                        return true;
-                    }
-                    break;
-                }
-            }
-        }
-        false
+        self.sc_any_export_changed()
     }
 
     pub(crate) fn sc_rendezvous(&mut self) -> bool {
-        // Remove the debug print and record the staged snapshot below.
         let Some(link) = self.sc_link.clone() else {
             return true;
         };
@@ -593,16 +595,11 @@ crossing limit; not attached",
             return false;
         }
         let exports = self.sc_stage_exports();
-        // Record what we staged this exchange for pending-export detection.
-        self.sc_last_exports = exports
-            .iter()
-            .map(|(idx, v)| (*idx as usize, v.clone()))
-            .collect();
         // 1. Publish this kernel's exports for the slice.
         {
             let b = self.sc_bridge.as_ref().unwrap();
-            for (idx, w) in &exports {
-                unsafe { (b.shim.write_export)(*idx, w.as_ptr(), w.len() as i32) };
+            for (idx, _sv_id, val, xz) in &exports {
+                b.shim.write_export_planes(*idx, val, xz);
             }
             // 2. Block until the SystemC slice ran to its next activity.
             let rc = unsafe { (b.shim.sv_wait_slice)() };
@@ -623,63 +620,18 @@ crossing limit; not attached",
         if let Some(b) = self.sc_bridge.as_mut() {
             b.update_mirrors();
         }
-        let had_imports = !imports.is_empty();
-        self.sc_apply_imports(imports);
-        if had_imports {
-            // The import writes bypass the delta machinery (this runs at the
-            // event-loop top, outside any time slot): propagate combinational
-            // fanout and re-check parked @/always-edge waiters against the
-            // new values, mirroring what a $deposit inside a time slot does.
+        let changed = self.sc_apply_imports(imports);
+        if changed {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
             self.check_edges();
-            // A posedge/negedge waiter just ran may have scheduled an NBA
-            // (e.g. `dout <= din + 1`); commit it here so the latched value
-            // is visible to the next exchange. Without this, SC-top register
-            // outputs stay stuck at their initial value (SV time does not
-            // advance between exchanges, so the normal loop never commits it).
-            // Commit every NBA queue — an always_ff `<=` write lands in
-            // `nba_fast`/`nba_queue`, not `delayed_nba` — and repeat until the
-            // edge blocks settle (a cascade of `<=`n writes can schedule
-            // further edges within the same import).
             self.apply_nba();
             if self.dirty_any {
                 self.settle_combinatorial();
             }
         }
-        // Publish to the SC side whether any export the SystemC side hasn't
-        // yet consumed changed value this round (a combinational fanout that
-        // settled only after we staged the exports at the top of this
-        // rendezvous). The SC-side drain-to-quiescence loop reads this to
-        // decide whether another flush slice is needed before sc_start()
-        // returns. Mirrors the pending-export clause of sc_exchange_alive().
-        let mut pending = false;
-        if let Some(b) = self.sc_bridge.as_ref() {
-            for (idx, prev) in &self.sc_last_exports {
-                let changed = b.rows.iter().any(|row| {
-                    if row.sv_id == *idx
-                        && row.dir != crate::sc_bridge::ScDir::Import
-                        && row.sc_idx.is_some()
-                    {
-                        let (v, _x) = self.signal_table[*idx].bits128();
-                        let n = row.nwords();
-                        let mut cur = vec![0u64; n];
-                        cur[0] = v as u64;
-                        if n > 1 {
-                            cur[1] = (v >> 64) as u64;
-                        }
-                        cur != *prev
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    pending = true;
-                    break;
-                }
-            }
-        }
+        let pending = self.sc_any_export_changed();
         let b = self.sc_bridge.as_ref().unwrap();
         unsafe { (b.shim.sv_set_pending)(pending as i32) };
         true

@@ -91,6 +91,8 @@ impl ScLink {
 
     pub fn mark_sc_done(&self) {
         self.sc_done.store(true, Ordering::Release);
+        self.tick_cv.notify_all();
+        self.wrapper_cv.notify_all();
     }
 
     /// Called by the xezim worker thread once `tick_s` is known.
@@ -179,6 +181,8 @@ pub struct ScShimApi {
     pub find_signal: unsafe extern "C" fn(*const c_char) -> c_int,
     pub write_export: unsafe extern "C" fn(c_int, *const u64, c_int),
     pub read_import: unsafe extern "C" fn(c_int, *mut u64, c_int),
+    pub write_export4: Option<unsafe extern "C" fn(c_int, *const u64, *const u64, c_int)>,
+    pub read_import4: Option<unsafe extern "C" fn(c_int, *mut u64, *mut u64, c_int)>,
     pub step: unsafe extern "C" fn(u64),
     pub step_mode_b: unsafe extern "C" fn(u64),
     pub time_now: unsafe extern "C" fn() -> u64,
@@ -194,6 +198,14 @@ pub struct ScShimApi {
     pub param_count: unsafe extern "C" fn() -> c_int,
     pub param_name: unsafe extern "C" fn(c_int) -> *const c_char,
     pub param_value: unsafe extern "C" fn(c_int) -> *const c_char,
+    pub island_count: Option<unsafe extern "C" fn() -> c_int>,
+    pub island_sc_name: Option<unsafe extern "C" fn(c_int) -> *const c_char>,
+    pub island_sv_mod: Option<unsafe extern "C" fn(c_int) -> *const c_char>,
+    pub spawn_leaf: Option<unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> c_int>,
+    pub sv_await_bootstrap: Option<unsafe extern "C" fn() -> c_int>,
+    pub sv_request_create_leaf:
+        Option<unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> c_int>,
+    pub sv_finish_bootstrap: Option<unsafe extern "C" fn()>,
 }
 
 impl ScShimApi {
@@ -213,6 +225,85 @@ impl ScShimApi {
                 out.push((name, value));
             }
             out
+        }
+    }
+
+    pub fn write_export_planes(&self, idx: i32, val: &[u64], xz: &[u64]) {
+        unsafe {
+            if let Some(f) = self.write_export4 {
+                f(idx, val.as_ptr(), xz.as_ptr(), val.len() as c_int);
+            } else {
+                (self.write_export)(idx, val.as_ptr(), val.len() as c_int);
+            }
+        }
+    }
+
+    pub fn read_import_planes(&self, idx: i32, val: &mut [u64], xz: &mut [u64]) {
+        unsafe {
+            if let Some(f) = self.read_import4 {
+                f(idx, val.as_mut_ptr(), xz.as_mut_ptr(), val.len() as c_int);
+            } else {
+                (self.read_import)(idx, val.as_mut_ptr(), val.len() as c_int);
+                xz.fill(0);
+            }
+        }
+    }
+
+    /// Return `(sc_inst_name, sv_mod_name)` for every SV island registered
+    /// from C++ constructors (`xez_<SvMod>.h`).
+    pub fn registered_islands(&self) -> Vec<(String, String)> {
+        let (Some(cnt), Some(sc_fn), Some(sv_fn)) =
+            (self.island_count, self.island_sc_name, self.island_sv_mod)
+        else {
+            return Vec::new();
+        };
+        unsafe {
+            let n = cnt();
+            let mut out = Vec::with_capacity(n.max(0) as usize);
+            for i in 0..n {
+                let sp = sc_fn(i);
+                let mp = sv_fn(i);
+                if sp.is_null() || mp.is_null() {
+                    continue;
+                }
+                let sc_inst = CStr::from_ptr(sp).to_string_lossy().into_owned();
+                let sv_mod = CStr::from_ptr(mp).to_string_lossy().into_owned();
+                out.push((sc_inst, sv_mod));
+            }
+            out
+        }
+    }
+
+    pub fn spawn_leaf_sync(&self, mod_type: &str, sv_inst_path: &str, sc_obj_name: &str) -> i32 {
+        let Some(f) = self.spawn_leaf else {
+            return -1;
+        };
+        let m = std::ffi::CString::new(mod_type).unwrap_or_default();
+        let p = std::ffi::CString::new(sv_inst_path).unwrap_or_default();
+        let s = std::ffi::CString::new(sc_obj_name).unwrap_or_default();
+        unsafe { f(m.as_ptr(), p.as_ptr(), s.as_ptr()) }
+    }
+
+    pub fn await_bootstrap(&self) -> bool {
+        let Some(f) = self.sv_await_bootstrap else {
+            return true;
+        };
+        unsafe { f() == 0 }
+    }
+
+    pub fn request_create_leaf(&self, mod_type: &str, sv_inst_path: &str, sc_obj_name: &str) -> i32 {
+        let Some(f) = self.sv_request_create_leaf else {
+            return -1;
+        };
+        let m = std::ffi::CString::new(mod_type).unwrap_or_default();
+        let p = std::ffi::CString::new(sv_inst_path).unwrap_or_default();
+        let s = std::ffi::CString::new(sc_obj_name).unwrap_or_default();
+        unsafe { f(m.as_ptr(), p.as_ptr(), s.as_ptr()) }
+    }
+
+    pub fn finish_bootstrap(&self) {
+        if let Some(f) = self.sv_finish_bootstrap {
+            unsafe { f() };
         }
     }
 
@@ -249,6 +340,13 @@ impl ScShimApi {
                         })?
                 };
             }
+            macro_rules! opt_sym {
+                ($name:literal, $t:ty) => {
+                    lib.get::<$t>(concat!($name, "\0").as_bytes())
+                        .ok()
+                        .map(|s| *s)
+                };
+            }
             let model_init = sym!("xsc_model_init", unsafe extern "C" fn(f64) -> c_int);
             let model_finish = sym!("xsc_model_finish", unsafe extern "C" fn());
             let signal_count = sym!("xsc_signal_count", unsafe extern "C" fn() -> c_int);
@@ -261,6 +359,14 @@ impl ScShimApi {
                 sym!("xsc_write_export", unsafe extern "C" fn(c_int, *const u64, c_int));
             let read_import =
                 sym!("xsc_read_import", unsafe extern "C" fn(c_int, *mut u64, c_int));
+            let write_export4 = opt_sym!(
+                "xsc_write_export4",
+                unsafe extern "C" fn(c_int, *const u64, *const u64, c_int)
+            );
+            let read_import4 = opt_sym!(
+                "xsc_read_import4",
+                unsafe extern "C" fn(c_int, *mut u64, *mut u64, c_int)
+            );
             let step = sym!("xsc_step", unsafe extern "C" fn(u64));
             #[allow(non_snake_case)]
             let step_mode_b = sym!("xsc_step_mode_b", unsafe extern "C" fn(u64));
@@ -284,6 +390,23 @@ impl ScShimApi {
             let param_count = sym!("xsc_param_count", unsafe extern "C" fn() -> c_int);
             let param_name = sym!("xsc_param_name", unsafe extern "C" fn(c_int) -> *const c_char);
             let param_value = sym!("xsc_param_value", unsafe extern "C" fn(c_int) -> *const c_char);
+            let island_count = opt_sym!("xsc_island_count", unsafe extern "C" fn() -> c_int);
+            let island_sc_name =
+                opt_sym!("xsc_island_sc_name", unsafe extern "C" fn(c_int) -> *const c_char);
+            let island_sv_mod =
+                opt_sym!("xsc_island_sv_mod", unsafe extern "C" fn(c_int) -> *const c_char);
+            let spawn_leaf = opt_sym!(
+                "xsc_spawn_leaf",
+                unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> c_int
+            );
+            let sv_await_bootstrap =
+                opt_sym!("xsc_sv_await_bootstrap", unsafe extern "C" fn() -> c_int);
+            let sv_request_create_leaf = opt_sym!(
+                "xsc_sv_request_create_leaf",
+                unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> c_int
+            );
+            let sv_finish_bootstrap =
+                opt_sym!("xsc_sv_finish_bootstrap", unsafe extern "C" fn());
             Ok(Self {
                 _lib: lib,
                 model_init,
@@ -294,6 +417,8 @@ impl ScShimApi {
                 find_signal,
                 write_export,
                 read_import,
+                write_export4,
+                read_import4,
                 step,
                 step_mode_b,
                 time_now,
@@ -309,6 +434,13 @@ impl ScShimApi {
                 param_count,
                 param_name,
                 param_value,
+                island_count,
+                island_sc_name,
+                island_sv_mod,
+                spawn_leaf,
+                sv_await_bootstrap,
+                sv_request_create_leaf,
+                sv_finish_bootstrap,
             })
         }
     }

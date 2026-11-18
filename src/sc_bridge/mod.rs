@@ -50,15 +50,18 @@ pub mod options;
 pub mod placeholder;
 pub mod wrapper;
 
-pub use bridge::{ScBridge, ScMapRow, ScTraceRow};
+pub use bridge::{planes_to_value, value_to_planes, ScBridge, ScMapRow, ScTraceRow};
 pub use build::build_and_load;
 pub use host::run_sc_top_thread;
 pub use link::{store_pending_link, take_pending_link, ScLink, ScShimApi, XscHostCb};
 pub use options::{
-    infer_master, infer_sc_top, quantum_from_env, sc_module_ports, sc_options, sc_top,
-    set_sc_options, shim_include_dir, shim_source, ScDir, ScOptions, ScPort, ScTop,
+    discover_sc_module_names, discover_sv_module_names_in_sv, discover_sv_modules_in_sc,
+    has_xsc_model_build, infer_master, infer_sc_top, quantum_from_env, sc_module_ports,
+    sc_module_ports_in, sc_options, sc_top, set_sc_options, shim_include_dir, shim_source,
+    ScDir, ScOptions, ScPort, ScTop,
 };
 pub use placeholder::synthesize_placeholder;
 pub use wrapper::{
-    generate_wrapper, set_top_ports, top_ports, ScPortDir, TopPort, WrapperBundle,
+    generate_wrapper, generate_wrapper_full, set_top_ports, top_ports, ScPortDir, TopPort,
+    WrapperBundle,
 };

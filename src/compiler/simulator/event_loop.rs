@@ -2270,6 +2270,7 @@ impl Simulator {
         if !self.checkpoint_restored {
             self.t0_starts_remaining = self.event_queue.slot_len(0);
         }
+        let mut sc_same_time_hops: u32 = 0;
         while !self.finished && iters < max_iters {
             iters += 1;
             // ── SystemC co-sim rendezvous (SC top) ──────────────────────────
@@ -2278,7 +2279,8 @@ impl Simulator {
             // The rendezvous blocks until the SystemC slice completes, so a
             // quiescent SV side simply parks here instead of spinning.
             if self.sc_link.is_some()
-                && self.time >= self.sc_link.as_ref().unwrap().current_cap()
+                && (self.time >= self.sc_link.as_ref().unwrap().current_cap()
+                    || self.sc_any_export_changed())
                 // Let the t=0 initial-block slot run before the first
                 // exchange: an import delivered while the design is still
                 // executing its initials would arm every @/always block at
@@ -2690,6 +2692,7 @@ impl Simulator {
                 }
                 self.growth_trace();
                 self.time = next_time;
+                sc_same_time_hops = 0;
                 publish_sim_time(next_time);
                 // Mode B: a pure-SystemC leaf is embedded in the netlist and
                 // the SV testbench drives it with plain SV (clock generators,
@@ -2768,24 +2771,30 @@ impl Simulator {
             if self.cond_progress != cond_prog_before {
                 self.stall_iters = 0;
             }
-            // Mode B deferred exchange: now that this time slot's SV nets have
-            // settled, advance the SC kernel by the elapsed ticks (delivering
-            // the post-edge clock/inputs) and pull its outputs back into the
-            // netlist at the SAME time — matching the reference simulators,
-            // where a posedge-{triggered} SC output is visible in the same
-            // slot it is produced.
+            // Mode B deferred exchange + multi-hop delta fixed-point convergence:
+            // on a time advance, step SC by `elapsed` ticks and pull imports;
+            // on same-time delta hops (when SV settling changed an export for
+            // another SC/SV layer), step SC by 0 ticks (delta cycle) and pull
+            // imports until both sides reach a fixed point at this timestamp.
             if self.sc_exchange_pending {
                 self.sc_exchange_pending = false;
                 let elapsed = self.time - self.sc_last_exchange_time;
                 if self.sc_mode_b && self.sc_bridge.is_some() && elapsed > 0 {
                     self.sc_last_exchange_time = self.time;
                     self.sc_step_sv_top_mode_b(elapsed);
-                    // SC outputs may have changed SV nets; force one more full
-                    // pass at the same time so `$monitor`/dependent logic
-                    // observe the SC-driven value in this slot.
-                    if self.table_modified {
+                    if self.sc_last_import_changed {
                         self.sc_force_same_time_pass = true;
                     }
+                }
+            } else if self.sc_mode_b
+                && self.sc_bridge.is_some()
+                && self.sc_any_export_changed()
+                && sc_same_time_hops < 256
+            {
+                sc_same_time_hops += 1;
+                self.sc_step_sv_top_mode_b(0);
+                if self.sc_last_import_changed {
+                    self.sc_force_same_time_pass = true;
                 }
             }
             // The genuine library owns the full phase schedule

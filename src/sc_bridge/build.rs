@@ -37,6 +37,10 @@ pub fn build_and_load(opts: &ScOptions, bundle: &WrapperBundle) -> Result<ScShim
 
         // Materialise the auto-derived wrapper into the build dir.
         let mut generated_tus: Vec<PathBuf> = Vec::new();
+        for (fname, content) in &bundle.extra_headers {
+            std::fs::write(out_dir.join(fname), content)
+                .map_err(|e| format!("cannot write {fname}: {e}"))?;
+        }
         if !bundle.sc_top_header.is_empty() {
             std::fs::write(out_dir.join("xez_top.h"), &bundle.sc_top_header)
                 .map_err(|e| format!("cannot write xez_top.h: {e}"))?;
@@ -65,17 +69,25 @@ pub fn build_and_load(opts: &ScOptions, bundle: &WrapperBundle) -> Result<ScShim
         for d in &opts.include_dirs {
             cmd.arg("-I").arg(d);
         }
-        if !bundle.sc_top_header.is_empty() {
-            // So the user's `#include "xez_top.h"` resolves.
+        if !bundle.sc_top_header.is_empty() || !bundle.extra_headers.is_empty() {
+            // So the user's `#include "xez_top.h"` / `xez_<Mod>.h` / `xez_sv.h` resolves.
             cmd.arg("-I").arg(&out_dir);
         }
         if bundle.sv_top_sources.is_empty() {
-            // In SV-master auto-derive mode the user source (SC_MODULE
-            // definition) is `#include`d into the generated model TU, so it
-            // must NOT also be a standalone TU (duplicate ODR symbols). In
-            // SC-master mode the user source is the testbench.
+            // In SC-master mode, pass non-included sources directly to g++; any
+            // source listed in `included_sc_sources` is `#include`d into
+            // `xez_top.cc` so `xsc_create_leaf` sees its `SC_MODULE`s without
+            // duplicate ODR symbols.
             for s in &opts.sources {
-                cmd.arg(s);
+                if bundle.included_sc_sources.contains(s) {
+                    let abs = std::fs::canonicalize(s)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(s));
+                    if let Some(dir) = abs.parent() {
+                        cmd.arg("-I").arg(dir);
+                    }
+                } else {
+                    cmd.arg(s);
+                }
             }
         } else {
             // SV-master mode: the generated model TU `#include`s each user

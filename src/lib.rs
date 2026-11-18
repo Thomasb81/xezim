@@ -1233,35 +1233,6 @@ pub fn simulate_multi(
     // the allocation that failed first under one was the design's, not a
     // stack's.
     let on_cli_worker = std::thread::current().name() == Some(CLI_WORKER_THREAD);
-    if stack_mb == 0
-        || on_cli_worker
-        || CLI_CURRENT_THREAD.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return simulate_multi_inner(
-            sources,
-            max_time,
-            top_module_name,
-            include_dirs,
-            source_paths,
-            settle_limit,
-            activity_mon,
-            sdf_file,
-            sdf_select,
-            defines,
-            plusargs,
-            xtrace_file,
-            xtrace_scopes,
-            xtrace_from_ns,
-            xtrace_to_ns,
-            fst_file,
-            fst_scopes,
-            emit_hypergraph,
-            load_partition,
-            write_profile,
-            profile_input,
-            collapse_islands,
-        );
-    }
     // `Simulator` is not auto-`Send`: it carries raw pointers into its OWN
     // allocations (`vpi_argv` → `vpi_arg_cstrings`, leaked DPI scope boxes)
     // and thread-local registrations that are re-established per call. A
@@ -1276,7 +1247,8 @@ pub fn simulate_multi(
         // shim) runs on its own thread and rendezvouses with the simulation
         // worker through the link below. The link must be installed BEFORE
         // the worker starts, since the worker's Simulator picks it up at
-        // simulate() entry.
+        // simulate() entry — including on the CLI worker direct path.
+        let mut sc_link_guard: Option<std::sync::Arc<sc_bridge::ScLink>> = None;
         let _sc_join = if sc_bridge::sc_top() == sc_bridge::ScTop::Sc
             && sc_bridge::sc_options().is_some()
         {
@@ -1285,43 +1257,81 @@ pub fn simulate_multi(
             // first time step (cap 0), not free-run.
             link.set_cap(0);
             sc_bridge::store_pending_link(link.clone());
+            sc_link_guard = Some(link.clone());
             Some(scope.spawn(move || sc_bridge::run_sc_top_thread(link)))
         } else {
             None
         };
-        std::thread::Builder::new()
-            .name("xezim-sim".to_string())
-            .stack_size(stack_mb * 1024 * 1024)
-            .spawn_scoped(scope, || {
-                SendResult(simulate_multi_inner(
-                    sources,
-                    max_time,
-                    top_module_name,
-                    include_dirs,
-                    source_paths,
-                    settle_limit,
-                    activity_mon,
-                    sdf_file,
-                    sdf_select,
-                    defines,
-                    plusargs,
-                    xtrace_file,
-                    xtrace_scopes,
-                    xtrace_from_ns,
-                    xtrace_to_ns,
-                    fst_file,
-                    fst_scopes,
-                    emit_hypergraph,
-                    load_partition,
-                    write_profile,
-                    profile_input,
-                    collapse_islands,
-                ))
-            })
-            .expect("spawn simulation worker")
-            .join()
-            .map(|r| r.0)
-            .unwrap_or_else(|_| Err("simulation worker panicked".to_string()))
+        let res = if stack_mb == 0
+            || on_cli_worker
+            || CLI_CURRENT_THREAD.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            simulate_multi_inner(
+                sources,
+                max_time,
+                top_module_name,
+                include_dirs,
+                source_paths,
+                settle_limit,
+                activity_mon,
+                sdf_file,
+                sdf_select,
+                defines,
+                plusargs,
+                xtrace_file,
+                xtrace_scopes,
+                xtrace_from_ns,
+                xtrace_to_ns,
+                fst_file,
+                fst_scopes,
+                emit_hypergraph,
+                load_partition,
+                write_profile,
+                profile_input,
+                collapse_islands,
+            )
+        } else {
+            std::thread::Builder::new()
+                .name("xezim-sim".to_string())
+                .stack_size(stack_mb * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    SendResult(simulate_multi_inner(
+                        sources,
+                        max_time,
+                        top_module_name,
+                        include_dirs,
+                        source_paths,
+                        settle_limit,
+                        activity_mon,
+                        sdf_file,
+                        sdf_select,
+                        defines,
+                        plusargs,
+                        xtrace_file,
+                        xtrace_scopes,
+                        xtrace_from_ns,
+                        xtrace_to_ns,
+                        fst_file,
+                        fst_scopes,
+                        emit_hypergraph,
+                        load_partition,
+                        write_profile,
+                        profile_input,
+                        collapse_islands,
+                    ))
+                })
+                .expect("spawn simulation worker")
+                .join()
+                .map(|r| r.0)
+                .unwrap_or_else(|_| Err("simulation worker panicked".to_string()))
+        };
+        if res.is_err() {
+            if let Some(link) = sc_link_guard {
+                let _ = sc_bridge::take_pending_link();
+                link.mark_sc_done();
+            }
+        }
+        res
     })
 }
 
@@ -1410,6 +1420,17 @@ fn simulate_multi_inner(
         .as_ref()
         .zip(cache_key.as_deref())
         .and_then(|(config, key)| read_design_cache(config, key));
+
+    let sc_sv_sources: Option<Vec<String>> = if sc_bridge::sc_options().is_some() {
+        Some(
+            raw_sources
+                .iter()
+                .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     let elab = if let Some(mut elab) = cached_elab {
         drop(sources);
@@ -1518,7 +1539,26 @@ fn simulate_multi_inner(
         elab
     };
 
+    let (elab, pre_sc_bridge, pre_sc_link, pre_sc_islands) = if let Some(opts) =
+        sc_bridge::sc_options()
+    {
+        bootstrap_sc_cosim(
+            elab,
+            &opts,
+            sc_sv_sources.as_deref().unwrap_or(raw_sources),
+            top_module_name,
+            include_dirs,
+            source_paths,
+            defines,
+        )?
+    } else {
+        (elab, None, None, Vec::new())
+    };
+
     let mut sim = compiler::Simulator::new(elab, max_time);
+    sim.sc_bridge = pre_sc_bridge;
+    sim.sc_link = pre_sc_link;
+    sim.sc_islands = pre_sc_islands;
     rss_trace("simulator constructed");
     if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
         sim.set_prepared_comb_cache_path(Some(config.directory.join(format!("{}.xezcomb", key))));
@@ -1676,4 +1716,338 @@ fn simulate_multi_inner(
     // it here too put it on BOTH streams, so it appeared twice in any terminal
     // or merged log.
     Ok(sim)
+}
+
+type ScIslandEntry = (String, String, String, Vec<sc_bridge::TopPort>);
+
+fn elab_top_ports(elab: &elaborate::ElaboratedModule) -> Vec<sc_bridge::TopPort> {
+    let mut out = Vec::new();
+    for (name, sig) in elab.signals.iter() {
+        if name.contains('.') {
+            continue;
+        }
+        let Some(dir) = sig.direction else { continue };
+        let sd = match dir {
+            xezim_core::ast::types::PortDirection::Input => sc_bridge::ScPortDir::In,
+            xezim_core::ast::types::PortDirection::Output => sc_bridge::ScPortDir::Out,
+            xezim_core::ast::types::PortDirection::Inout
+            | xezim_core::ast::types::PortDirection::Ref => sc_bridge::ScPortDir::Inout,
+        };
+        out.push(sc_bridge::TopPort {
+            name: name.to_string(),
+            dir: sd,
+            width: sig.value.width,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn extract_sv_mod_ports(
+    sv_sources: &[String],
+    sv_mod: &str,
+    include_dirs: &[String],
+    source_paths: &[String],
+    defines: &[(String, Option<String>)],
+) -> Result<Vec<sc_bridge::TopPort>, String> {
+    let (_defs, sub_elab) = xezim_core::parse_and_elaborate_multi_preprocessed(
+        sv_sources,
+        Some(sv_mod),
+        include_dirs,
+        source_paths,
+        defines,
+        None,
+    )?;
+    Ok(elab_top_ports(&sub_elab))
+}
+
+/// Inject C++-instantiated SV island declarations/instances into `<top_name>`
+/// right before its `endmodule`, preserving `<top_name>`'s own ports/params.
+fn inject_islands_into_sv(
+    sv_sources: &[String],
+    source_paths: &[String],
+    top_name: &str,
+    islands: &[ScIslandEntry],
+) -> (Vec<String>, Vec<String>, String) {
+    let mut snippet = String::from("\n  // Auto-generated multi-hop SV islands\n");
+    for (idx, (wire_pfx, _sc_inst, sv_mod, ports)) in islands.iter().enumerate() {
+        let mut conns = Vec::new();
+        for p in ports {
+            let w = p.width.max(1);
+            let wname = format!("{wire_pfx}_{}", p.ident());
+            if w <= 1 {
+                snippet.push_str(&format!("  logic {wname};\n"));
+            } else {
+                snippet.push_str(&format!("  logic [{}:0] {wname};\n", w - 1));
+            }
+            conns.push(format!(".{}({wname})", p.name));
+        }
+        snippet.push_str(&format!(
+            "  {sv_mod} __xez_isl_{idx}({});\n",
+            conns.join(", ")
+        ));
+    }
+
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut aug_sources = sv_sources.to_vec();
+    let aug_paths = source_paths.to_vec();
+    let self_collision = islands.iter().any(|(_, _, m, _)| m == top_name);
+
+    if !self_collision {
+        for src in &mut aug_sources {
+            let bytes = src.as_bytes();
+            let n = bytes.len();
+            let mut i = 0usize;
+            let mut in_target = false;
+            while i < n {
+                match bytes[i] {
+                    b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                        while i < n && bytes[i] != b'\n' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                        i += 2;
+                        while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                            i += 1;
+                        }
+                        i = (i + 2).min(n);
+                        continue;
+                    }
+                    b'"' => {
+                        i += 1;
+                        while i < n {
+                            if bytes[i] == b'\\' {
+                                i += 2;
+                            } else if bytes[i] == b'"' {
+                                i += 1;
+                                break;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !in_target {
+                    if src[i..].starts_with("module")
+                        && (i == 0 || !is_id(bytes[i - 1]))
+                        && (i + 6 >= n || !is_id(bytes[i + 6]))
+                    {
+                        let mut j = i + 6;
+                        while j < n && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if src[j..].starts_with("automatic") || src[j..].starts_with("static") {
+                            while j < n && is_id(bytes[j]) {
+                                j += 1;
+                            }
+                            while j < n && bytes[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                        }
+                        let start = j;
+                        while j < n && is_id(bytes[j]) {
+                            j += 1;
+                        }
+                        if &src[start..j] == top_name {
+                            in_target = true;
+                            i = j;
+                            continue;
+                        }
+                    }
+                } else if src[i..].starts_with("endmodule")
+                    && (i == 0 || !is_id(bytes[i - 1]))
+                    && (i + 9 >= n || !is_id(bytes[i + 9]))
+                {
+                    src.insert_str(i, &snippet);
+                    return (aug_sources, aug_paths, top_name.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let mut paths = aug_paths;
+    aug_sources.push(format!("module __xez_cosim_root;\n{snippet}endmodule\n"));
+    paths.push("<sc_cosim_root>".to_string());
+    (aug_sources, paths, "__xez_cosim_root".to_string())
+}
+
+fn bootstrap_sc_cosim(
+    mut elab: elaborate::ElaboratedModule,
+    opts: &sc_bridge::ScOptions,
+    sv_sources: &[String],
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    source_paths: &[String],
+    defines: &[(String, Option<String>)],
+) -> Result<
+    (
+        elaborate::ElaboratedModule,
+        Option<sc_bridge::ScBridge>,
+        Option<std::sync::Arc<sc_bridge::ScLink>>,
+        Vec<ScIslandEntry>,
+    ),
+    String,
+> {
+    let top_ports = elab_top_ports(&elab);
+    sc_bridge::set_top_ports(top_ports.clone());
+
+    let mut sv_mod_ports: Vec<(String, Vec<sc_bridge::TopPort>)> = Vec::new();
+    for sv_mod in &opts.sv_modules {
+        let ports = if sv_mod == &elab.name {
+            top_ports.clone()
+        } else {
+            extract_sv_mod_ports(sv_sources, sv_mod, include_dirs, source_paths, defines)?
+        };
+        sv_mod_ports.push((sv_mod.clone(), ports));
+    }
+
+    let user_has_model_build = sc_bridge::has_xsc_model_build(&opts.sources);
+    let initial_leaves: Vec<String> = if opts.master == sc_bridge::ScTop::Sv && !user_has_model_build
+    {
+        if let Some(m) = opts.sc_module.as_deref() {
+            elab.instances
+                .iter()
+                .filter(|inst| inst.def_name == m)
+                .map(|inst| inst.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let link = if opts.master == sc_bridge::ScTop::Sc {
+        sc_bridge::take_pending_link()
+    } else {
+        None
+    };
+
+    let bundle = sc_bridge::generate_wrapper_full(
+        opts,
+        link.as_ref(),
+        &initial_leaves,
+        &sv_mod_ports,
+        user_has_model_build,
+    );
+
+    let (mut bridge, shim, is_sc_master) = if opts.master == sc_bridge::ScTop::Sc {
+        let Some(ref l) = link else {
+            return Err("SystemC-master run missing pending ScLink".to_string());
+        };
+        l.set_tick_s(elab.tick_s);
+        let Some(shim) = l.take_shim() else {
+            eprintln!("[xezim-sc] SystemC model unavailable; continuing without co-simulation");
+            return Ok((elab, None, link, Vec::new()));
+        };
+        if !shim.await_bootstrap() {
+            let b = sc_bridge::ScBridge::init_sc_top(shim)?;
+            return Ok((elab, Some(b), link, Vec::new()));
+        }
+        (None, shim, true)
+    } else {
+        let mut params: Vec<(String, String)> = Vec::new();
+        for (pname, pval) in elab.parameters.iter() {
+            params.push((
+                pname.clone(),
+                compiler::simulator::sc_param_value_text(pval),
+            ));
+        }
+        let b = sc_bridge::ScBridge::init_sv_top(opts, elab.tick_s, &bundle, &params)?;
+        let shim = b.shim.clone();
+        (Some(b), shim, false)
+    };
+
+    // Multi-hop fixed-point discovery: iterate between C++-registered SV islands
+    // and SV-elaborated SC leaves until neither side produces new instances.
+    let mut created_leaves: std::collections::HashSet<String> =
+        initial_leaves.into_iter().collect();
+    let mut sc_leaf_counter: usize = 0;
+    let mut elab_islands: Vec<ScIslandEntry> = Vec::new();
+    let mut seen_island_sc: std::collections::HashSet<String> = Default::default();
+    let sc_mods = opts.all_sc_modules();
+    let sc_set: std::collections::HashSet<&str> = sc_mods.iter().map(String::as_str).collect();
+    let base_top = top_module_name.unwrap_or(&elab.name).to_string();
+
+    for _ in 0..32 {
+        let mut changed = false;
+        let mut new_islands = false;
+        for (sc_inst, sv_mod) in shim.registered_islands() {
+            if seen_island_sc.insert(sc_inst.clone()) {
+                let ports = if let Some((_, p)) = sv_mod_ports.iter().find(|(m, _)| m == &sv_mod) {
+                    p.clone()
+                } else {
+                    let p = extract_sv_mod_ports(
+                        sv_sources,
+                        &sv_mod,
+                        include_dirs,
+                        source_paths,
+                        defines,
+                    )?;
+                    sv_mod_ports.push((sv_mod.clone(), p.clone()));
+                    p
+                };
+                let wire_pfx = format!("__xez_w_{}", elab_islands.len());
+                elab_islands.push((wire_pfx, sc_inst, sv_mod, ports));
+                new_islands = true;
+                changed = true;
+            }
+        }
+        if new_islands {
+            let (aug_sources, aug_paths, eff_top) =
+                inject_islands_into_sv(sv_sources, source_paths, &base_top, &elab_islands);
+            let (_defs, new_elab) = xezim_core::parse_and_elaborate_multi_preprocessed(
+                &aug_sources,
+                Some(eff_top.as_str()),
+                include_dirs,
+                &aug_paths,
+                defines,
+                None,
+            )?;
+            elab = new_elab;
+        }
+        let pending_leaves: Vec<(String, String)> = elab
+            .instances
+            .iter()
+            .filter(|inst| {
+                sc_set.contains(inst.def_name.as_str()) && !created_leaves.contains(&inst.path)
+            })
+            .map(|inst| (inst.path.clone(), inst.def_name.clone()))
+            .collect();
+        for (inst_path, def_name) in pending_leaves {
+            if !created_leaves.insert(inst_path.clone()) {
+                continue;
+            }
+            if sc_bridge::sc_module_ports_in(&def_name, &opts.sources, &opts.include_dirs)
+                .is_empty()
+            {
+                continue;
+            }
+            let sc_obj_name = format!("xez_leaf_{sc_leaf_counter}");
+            sc_leaf_counter += 1;
+            let rc = if is_sc_master {
+                shim.request_create_leaf(&def_name, &inst_path, &sc_obj_name)
+            } else {
+                shim.spawn_leaf_sync(&def_name, &inst_path, &sc_obj_name)
+            };
+            if rc == 0 {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    if is_sc_master {
+        shim.finish_bootstrap();
+        bridge = Some(sc_bridge::ScBridge::init_sc_top(shim)?);
+    }
+
+    Ok((elab, bridge, link, elab_islands))
 }

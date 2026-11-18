@@ -4739,6 +4739,8 @@ impl Simulator {
             sc_bridge: None,
             sc_link: None,
             sc_last_exports: Vec::new(),
+            sc_islands: Vec::new(),
+            sc_last_import_changed: false,
             sc_mode_b: false,
             sc_last_exchange_time: 0,
             sc_exchange_pending: false,
