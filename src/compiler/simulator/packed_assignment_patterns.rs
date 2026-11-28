@@ -426,6 +426,10 @@ impl Simulator {
         compiler.set_typedef_unpacked_dims(&module.typedef_unpacked_dims);
         compiler.set_param_decl_types(&module.param_decl_types);
         compiler.set_port_aliases(&module.port_aliases);
+        compiler.set_unpacked_decl_dims(&module.unpacked_decl_dims);
+        compiler.set_arrays_nd(&module.arrays_nd);
+        compiler.set_coll_shapes(&module.coll_shapes);
+        compiler.set_descending_arrays(&module.descending_arrays);
     }
 
     /// `e` evaluated as the source of an assignment to `dt` (§10.8), when

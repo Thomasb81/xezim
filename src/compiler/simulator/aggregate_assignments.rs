@@ -7090,6 +7090,55 @@ impl Simulator {
         Some((dt, arr))
     }
 
+    /// `O(dims.len())` twin of [`flat_path_type`] returning declared `(left, right)`
+    /// bounds without materializing per-element index vectors.
+    pub(super) fn flat_path_dim_bounds(
+        &self,
+        flat: &str,
+    ) -> Option<(DataType, Option<Vec<(i64, i64)>>)> {
+        if !flat.as_bytes().contains(&b'[') {
+            let base = flat.split('.').next().unwrap_or(flat);
+            if !self.module.var_decl_types.contains_key(base) && base.len() == flat.len() {
+                return None;
+            }
+        }
+        let mut segs = Self::split_flat_path(flat);
+        if !self.module.var_decl_types.contains_key(&segs.first()?.0) {
+            segs = self.flat_path_scoped_segs(flat)?;
+        }
+        let (base, base_idx) = segs.first()?.clone();
+        let mut dt = self.module.var_decl_types.get(&base)?.clone();
+        let mut bounds: Option<Vec<(i64, i64)>> =
+            if base_idx > 0 || self.module.associative_arrays.contains_key(&base) {
+                None
+            } else if let Some(dd) = self.module.unpacked_decl_dims.get(&base) {
+                Some(dd.to_vec())
+            } else {
+                self.module
+                    .arrays
+                    .get(&base)
+                    .map(|&(lo, hi, _)| vec![(lo, hi)])
+            };
+
+        for (seg, nidx) in segs.iter().skip(1) {
+            let DataType::Struct(su) = self.resolve_dt(&dt) else {
+                return None;
+            };
+            let (mdt, dims) = su.members.iter().find_map(|m| {
+                m.declarators
+                    .iter()
+                    .find(|md| md.name.name == *seg)
+                    .map(|md| (m.data_type.clone(), self.member_dims(&m.data_type, &md.dimensions)))
+            })?;
+            dt = mdt;
+            bounds = self
+                .member_dim_bounds(&dims)
+                .filter(|b| *nidx < b.len())
+                .map(|b| b[*nidx..].to_vec());
+        }
+        Some((dt, bounds))
+    }
+
     /// Remaining dimensions of a partially indexed multi-dimensional array
     /// (`m[1]` of `int m[2][3]` still has one dimension left).
     pub(super) fn partial_index_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {

@@ -975,3 +975,9 @@ mod ch07_queue_semantics;
 
 #[path = "types/ch07_coll_containers_perf.rs"]
 mod ch07_coll_containers_perf;
+
+#[path = "types/ch07_array_query_semantics.rs"]
+mod ch07_array_query_semantics;
+
+#[path = "types/ch07_array_query_legality.rs"]
+mod ch07_array_query_legality;

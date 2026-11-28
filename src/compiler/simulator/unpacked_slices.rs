@@ -939,26 +939,58 @@ impl Simulator {
         true
     }
 
-    /// §20.7: `$size` of a slice of an unpacked array is its element count,
-    /// the width of `[b +: w]` or `|l - r| + 1`; it read the slice's width in
-    /// bits. `None` when `e` is no such slice.
-    pub(super) fn unpacked_slice_size(&mut self, e: &Expression) -> Option<i64> {
+    /// §20.7: declared `(left, right)` bounds of a slice of an unpacked array
+    /// (`a[2:4]`, `a[b +: w]`, `a[b -: w]`), or `None` when `e` is no such slice.
+    pub(super) fn unpacked_slice_bounds(&mut self, e: &Expression) -> Option<(i64, i64)> {
         let ExprKind::RangeSelect {
-            kind, left, right, ..
+            expr,
+            kind,
+            left,
+            right,
         } = &e.kind
         else {
             return None;
         };
         self.unpacked_operand_elems(e).filter(|el| el.sliced)?;
-        Some(match kind {
-            RangeKind::Constant => {
-                let (l, r) = (
-                    self.eval_expr(left).to_i64()?,
-                    self.eval_expr(right).to_i64()?,
-                );
-                (l - r).abs() + 1
+        let desc = match kind {
+            RangeKind::Constant => false,
+            _ => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let rname = self.resolve_hier_name(h);
+                    self.module
+                        .unpacked_decl_dims
+                        .get(&*rname)
+                        .and_then(|d| d.first())
+                        .is_some_and(|&(l, r)| l >= r)
+                        || self.module.descending_arrays.contains(&*rname)
+                } else {
+                    false
+                }
             }
-            RangeKind::IndexedUp | RangeKind::IndexedDown => self.eval_expr(right).to_i64()?,
+        };
+        Some(match kind {
+            RangeKind::Constant => (
+                self.eval_expr(left).to_i64()?,
+                self.eval_expr(right).to_i64()?,
+            ),
+            RangeKind::IndexedUp => {
+                let b = self.eval_expr(left).to_i64()?;
+                let w = self.eval_expr(right).to_i64()?;
+                if desc {
+                    (b + w - 1, b)
+                } else {
+                    (b, b + w - 1)
+                }
+            }
+            RangeKind::IndexedDown => {
+                let b = self.eval_expr(left).to_i64()?;
+                let w = self.eval_expr(right).to_i64()?;
+                if desc {
+                    (b, b - w + 1)
+                } else {
+                    (b - w + 1, b)
+                }
+            }
         })
     }
 }

@@ -2380,6 +2380,32 @@ impl<'a> BytecodeCompiler<'a> {
                 // signal reductions use ~4x per cycle) or a plain SIGNAL
                 // (declared width). Anything else — strings, class
                 // handles, unpacked aggregates — keeps the interpreter.
+                "$__xz_type_op" => {
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadConst(r, Box::new(Value::zero(1))));
+                    Some(r)
+                }
+                "$dimensions"
+                | "$unpacked_dimensions"
+                | "$left"
+                | "$right"
+                | "$low"
+                | "$high"
+                | "$increment"
+                | "$size" => {
+                    if let Some(v) = self.try_fold_static_array_query(name, args) {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::LoadConst(r, Box::new(v)));
+                        return Some(r);
+                    }
+                    if let Some(r) =
+                        self.emit_expr_fallback(expr, ctx_width, "SystemCall_array_query")
+                    {
+                        return Some(r);
+                    }
+                    self.bail("SystemCall_array_query");
+                    None
+                }
                 "$bits" => {
                     let w: Option<u32> = args.first().and_then(|a| match &a.kind {
                         ExprKind::Ident(h)
@@ -3691,5 +3717,248 @@ impl<'a> BytecodeCompiler<'a> {
                 None
             }
         }
+    }
+
+    /// Constant-fold static §7.11 / §20.7 array queries (`$dimensions`,
+    /// `$unpacked_dimensions`, `$left`, `$right`, `$low`, `$high`,
+    /// `$increment`, `$size`) over fixed-size types and non-local/non-dynamic
+    /// module variables/arrays. Dynamic, string, indexed, or shadowed operands
+    /// return `None` to preserve runtime semantics via fallback.
+    fn try_fold_static_array_query(&mut self, name: &str, args: &[Expression]) -> Option<Value> {
+        let is_dim_count = matches!(name, "$dimensions" | "$unpacked_dimensions");
+        if (is_dim_count && args.len() != 1) || (!is_dim_count && !(1..=2).contains(&args.len())) {
+            return None;
+        }
+        let signed_i64_32 = |v: i64| {
+            let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+            out.is_signed = true;
+            out
+        };
+        let signed_x32 = || {
+            let mut out = Value::new(32);
+            out.is_signed = true;
+            out
+        };
+
+        let dim: usize = if is_dim_count {
+            1
+        } else if let Some(d_expr) = args.get(1) {
+            match self.fold_const(d_expr) {
+                Some(v) => match v.to_i64() {
+                    Some(d) if d >= 1 => d as usize,
+                    _ => return Some(signed_x32()),
+                },
+                None if matches!(&d_expr.kind, ExprKind::Number(_)) => {
+                    return Some(signed_x32());
+                }
+                None => return None,
+            }
+        } else {
+            1
+        };
+
+        let mut arg = &args[0];
+        loop {
+            match &arg.kind {
+                ExprKind::Paren(inner) => arg = inner,
+                ExprKind::SystemCall {
+                    name: sn,
+                    args: sargs,
+                } if sn == "$__xz_type_op" && sargs.len() == 1 => {
+                    arg = &sargs[0];
+                }
+                _ => break,
+            }
+        }
+
+        if let ExprKind::TypeLiteral(dt) = &arg.kind {
+            if let crate::ast::types::DataType::TypeReference { name: tn, .. } = dt.as_ref()
+                && self
+                    .typedef_unpacked_dims
+                    .and_then(|m| m.get(&tn.name.name))
+                    .is_some_and(|ds| {
+                        ds.iter().any(|d| {
+                            !matches!(
+                                d,
+                                crate::ast::types::UnpackedDimension::Range { .. }
+                                    | crate::ast::types::UnpackedDimension::Expression { .. }
+                            )
+                        })
+                    })
+            {
+                return None;
+            }
+            let q = crate::compiler::elaborate::type_query_dims_of(
+                dt,
+                self.params,
+                self.typedefs,
+                self.typedef_types,
+            );
+            return Some(match crate::compiler::elaborate::type_query_bound(name, &q, dim) {
+                Some(v) => signed_i64_32(v),
+                None => signed_x32(),
+            });
+        }
+
+        let ExprKind::Ident(h) = &arg.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let nm = h.path[0].name.name.as_str();
+        if self.method_mode
+            || self.scope_hint.is_some()
+            || self.names_local(nm)
+            || self.local_const_vars.contains_key(nm)
+            || self.params.is_some_and(|p| p.contains_key(nm))
+            || self.dynamic_arrays.is_some_and(|d| d.contains(nm))
+            || self.queue_vars.is_some_and(|q| q.contains(nm))
+            || self.assoc_arrays.is_some_and(|a| a.contains_key(nm))
+            || self.string_signals.is_some_and(|s| s.contains(nm))
+            || self.coll_shapes.is_some_and(|c| c.contains_key(nm))
+        {
+            return None;
+        }
+
+        let has_arr = self.arrays.contains_key(nm)
+            || self.arrays_2d.is_some_and(|m| m.contains_key(nm))
+            || self.arrays_nd.is_some_and(|m| m.contains_key(nm));
+        let dt = self.var_decl_types.and_then(|m| m.get(nm));
+        if !has_arr && dt.is_none() && !self.signal_name_to_id.contains_key(nm) {
+            if self
+                .typedef_unpacked_dims
+                .and_then(|m| m.get(nm))
+                .is_some_and(|ds| {
+                    ds.iter().any(|d| {
+                        !matches!(
+                            d,
+                            crate::ast::types::UnpackedDimension::Range { .. }
+                                | crate::ast::types::UnpackedDimension::Expression { .. }
+                        )
+                    })
+                })
+            {
+                return None;
+            }
+            let q = crate::compiler::elaborate::type_query_dims_by_name(
+                nm,
+                self.params,
+                self.typedefs,
+                self.typedef_types,
+                self.typedef_unpacked_dims,
+            )?;
+            if q.dims.is_empty() && !q.is_string && is_dim_count {
+                return None;
+            }
+            return Some(match crate::compiler::elaborate::type_query_bound(name, &q, dim) {
+                Some(v) => signed_i64_32(v),
+                None => signed_x32(),
+            });
+        }
+
+        let dt = dt?;
+        let u_dims = if let Some((shape, _)) = self.arrays_nd.and_then(|m| m.get(nm)) {
+            shape.len()
+        } else if self.arrays_2d.is_some_and(|m| m.contains_key(nm)) {
+            2
+        } else if self.arrays.contains_key(nm) {
+            1
+        } else {
+            0
+        };
+        let pq = crate::compiler::elaborate::type_query_dims_of(
+            dt,
+            self.params,
+            self.typedefs,
+            self.typedef_types,
+        );
+        if pq.is_string {
+            return None;
+        }
+        let pd = self.packed_full_dims.and_then(|m| m.get(nm));
+        if is_dim_count {
+            if name == "$unpacked_dimensions" {
+                return Some(signed_i64_32(u_dims as i64));
+            }
+            let p_dims = pd.map_or(pq.dims.len(), |s| s.len());
+            return Some(signed_i64_32((u_dims + p_dims) as i64));
+        }
+
+        if dim <= u_dims {
+            let decl_sel = self
+                .unpacked_decl_dims
+                .and_then(|m| m.get(nm))
+                .and_then(|d| d.get(dim - 1))
+                .copied();
+            let (lo, hi, desc) = if let Some((l, r)) = decl_sel {
+                (l.min(r), l.max(r), l >= r)
+            } else if let Some((l, h)) = self
+                .arrays_nd
+                .and_then(|m| m.get(nm))
+                .and_then(|(s, _)| s.get(dim - 1).copied())
+                .or_else(|| {
+                    self.arrays_2d.and_then(|m| m.get(nm)).and_then(|&(a, b, _)| {
+                        match dim {
+                            1 => Some(a),
+                            2 => Some(b),
+                            _ => None,
+                        }
+                    })
+                })
+                .or_else(|| {
+                    if dim == 1 {
+                        self.arrays.get(nm).map(|&(lo, hi, _)| (lo, hi))
+                    } else {
+                        None
+                    }
+                })
+            {
+                let d = l == h
+                    || (dim == 1 && self.descending_arrays.is_some_and(|s| s.contains(nm)));
+                (l, h, d)
+            } else {
+                return Some(signed_x32());
+            };
+            let left = if desc { hi } else { lo };
+            let right = if desc { lo } else { hi };
+            let result = match name {
+                "$left" => left,
+                "$right" => right,
+                "$high" => hi,
+                "$low" => lo,
+                "$size" => (hi - lo + 1).max(0),
+                "$increment" => if desc { 1 } else { -1 },
+                _ => return None,
+            };
+            return Some(signed_i64_32(result));
+        }
+
+        let p_idx = dim - u_dims - 1;
+        if let Some(pd) = pd {
+            let Some(&(l, r)) = pd.get(p_idx) else {
+                return Some(signed_x32());
+            };
+            let (lo, hi, desc) = (l.min(r), l.max(r), l >= r);
+            let left = if desc { hi } else { lo };
+            let right = if desc { lo } else { hi };
+            let result = match name {
+                "$left" => left,
+                "$right" => right,
+                "$high" => hi,
+                "$low" => lo,
+                "$size" => (hi - lo + 1).max(0),
+                "$increment" => if desc { 1 } else { -1 },
+                _ => return None,
+            };
+            return Some(signed_i64_32(result));
+        }
+
+        Some(
+            match crate::compiler::elaborate::type_query_bound(name, &pq, p_idx + 1) {
+                Some(v) => signed_i64_32(v),
+                None => signed_x32(),
+            },
+        )
     }
 }

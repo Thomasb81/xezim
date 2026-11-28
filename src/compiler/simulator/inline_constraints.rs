@@ -612,6 +612,66 @@ impl Simulator {
             .map(|&(lo, hi, _)| vec![(lo, hi)])
     }
 
+    #[inline]
+    pub(super) fn has_fixed_array_dims(&self, name: &str) -> bool {
+        self.module.arrays_nd.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays.contains_key(name)
+    }
+
+    #[inline]
+    pub(super) fn fixed_unpacked_dim_count(&self, name: &str) -> usize {
+        if let Some((shape, _)) = self.module.arrays_nd.get(name) {
+            shape.len()
+        } else if self.module.arrays_2d.contains_key(name) {
+            2
+        } else if self.module.arrays.contains_key(name) {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub(super) fn fixed_unpacked_dim_at(&self, name: &str, idx: usize) -> Option<(i64, i64)> {
+        if let Some((shape, _)) = self.module.arrays_nd.get(name) {
+            shape.get(idx).copied()
+        } else if let Some(&(d1, d2, _)) = self.module.arrays_2d.get(name) {
+            match idx {
+                0 => Some(d1),
+                1 => Some(d2),
+                _ => None,
+            }
+        } else if idx == 0 {
+            self.module.arrays.get(name).map(|&(lo, hi, _)| (lo, hi))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(super) fn coll_shape_of(&self, name: &str) -> Option<&CollShape> {
+        self.module
+            .coll_shapes
+            .get(name)
+            .or_else(|| self.local_coll_shapes.get(name))
+    }
+
+    #[inline]
+    pub(super) fn unpacked_dim_count(&self, name: &str) -> usize {
+        if let Some(shape) = self.coll_shape_of(name) {
+            return shape.dims.len();
+        }
+        let fixed = self.fixed_unpacked_dim_count(name);
+        if fixed > 0 {
+            return fixed;
+        }
+        usize::from(
+            self.module.dynamic_arrays.contains(name)
+                || self.module.associative_arrays.contains_key(name),
+        )
+    }
+
     /// §20.7: the array query functions also accept a TYPE as their operand
     /// (`$size(int)`, `$left(my_vec_t)`, `$size(logic [7:0])`). A bare type
     /// keyword or a typedef name in an argument list parses as a plain Ident
@@ -622,6 +682,18 @@ impl Simulator {
         &self,
         arg: &Expression,
     ) -> Option<super::elaborate::TypeQueryDims> {
+        let mut arg = arg;
+        loop {
+            match &arg.kind {
+                ExprKind::Paren(inner) => arg = inner,
+                ExprKind::SystemCall { name, args }
+                    if name == "$__xz_type_op" && args.len() == 1 =>
+                {
+                    arg = &args[0];
+                }
+                _ => break,
+            }
+        }
         if let ExprKind::TypeLiteral(dt) = &arg.kind {
             return Some(super::elaborate::type_query_dims_of(
                 dt,

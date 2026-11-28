@@ -3217,6 +3217,142 @@ impl<'a> Ck<'a> {
         }
     }
 
+    /// §20.7 / §20.7.1 array querying function legality checks:
+    /// - `$dimensions`/`$unpacked_dimensions` take 1 argument; bound queries
+    ///   take 1 or 2 arguments;
+    /// - directly naming a dynamically sized type identifier is illegal;
+    /// - bound queries on `dim > 1` are illegal when dimension `dim` is
+    ///   variable-sized (dynamic, queue, or associative);
+    /// - `$left`/`$right`/`$low`/`$high`/`$increment` on an associative array
+    ///   dimension require an integral index type.
+    fn check_array_query(
+        &self,
+        name: &str,
+        args: &[Expression],
+        span: Span,
+        out: &mut Vec<(Span, String)>,
+    ) {
+        let is_dim_count = matches!(name, "$dimensions" | "$unpacked_dimensions");
+        let is_bound_q = matches!(
+            name,
+            "$left" | "$right" | "$low" | "$high" | "$increment" | "$size"
+        );
+        if !is_dim_count && !is_bound_q {
+            return;
+        }
+        if is_dim_count && args.len() != 1 {
+            out.push((
+                span,
+                format!("{name} takes exactly 1 argument (IEEE 1800-2023 §20.7)"),
+            ));
+            return;
+        }
+        if is_bound_q && (args.is_empty() || args.len() > 2) {
+            out.push((
+                span,
+                format!("{name} takes 1 or 2 arguments (IEEE 1800-2023 §20.7)"),
+            ));
+            return;
+        }
+
+        fn ty_is_dynamic(t: &Ty) -> bool {
+            match t {
+                Ty::Unpacked { dims, elem } => {
+                    dims.iter()
+                        .any(|d| matches!(d, Dim::Dynamic | Dim::Queue | Dim::Assoc(_)))
+                        || ty_is_dynamic(elem)
+                }
+                _ => false,
+            }
+        }
+
+        let mut arg0 = &args[0];
+        loop {
+            match &arg0.kind {
+                ExprKind::Paren(inner) => arg0 = inner,
+                ExprKind::SystemCall {
+                    name: sn,
+                    args: sargs,
+                } if sn == "$__xz_type_op" && sargs.len() == 1 => {
+                    arg0 = &sargs[0];
+                }
+                _ => break,
+            }
+        }
+
+        // Direct use on a dynamically sized type identifier (`$size(d_t)`).
+        if let ExprKind::Ident(h) = &arg0.kind
+            && h.root.is_none()
+            && h.path.iter().all(|s| s.selects.is_empty())
+        {
+            let type_ty = if h.path.len() == 1 {
+                let n = &h.path[0].name.name;
+                if self.lookup_var(n).is_none() {
+                    self.lookup_type(n)
+                } else {
+                    None
+                }
+            } else {
+                let path: Vec<String> = h.path.iter().map(|s| s.name.name.clone()).collect();
+                self.scoped_type(&path)
+            };
+            if type_ty.as_ref().is_some_and(ty_is_dynamic) {
+                out.push((
+                    arg0.span,
+                    format!(
+                        "{name} cannot be applied directly to dynamically sized type \
+                         (IEEE 1800-2023 §20.7)"
+                    ),
+                ));
+                return;
+            }
+        }
+
+        if !is_bound_q {
+            return;
+        }
+
+        let dim_n: i64 = if let Some(d_expr) = args.get(1) {
+            match self.eval_const(d_expr) {
+                Some(CVal::Int(n)) => n,
+                _ => return,
+            }
+        } else {
+            1
+        };
+        if dim_n < 1 {
+            return;
+        }
+
+        if let Ty::Unpacked { dims, .. } = self.ty_of(arg0)
+            && let Some(dim_kind) = dims.get((dim_n - 1) as usize)
+        {
+            if dim_n > 1 && matches!(dim_kind, Dim::Dynamic | Dim::Queue | Dim::Assoc(_)) {
+                out.push((
+                    span,
+                    format!(
+                        "{name} dimension {dim_n} is variable-sized; queries with \
+                         dimension > 1 require a fixed-size dimension \
+                         (IEEE 1800-2023 §20.7.1)"
+                    ),
+                ));
+            }
+            if name != "$size"
+                && let Dim::Assoc(Some(
+                    AssocKey::Str | AssocKey::Class(_) | AssocKey::Struct(_),
+                )) = dim_kind
+            {
+                out.push((
+                    span,
+                    format!(
+                        "{name} on associative array dimension requires an integral \
+                         index type (IEEE 1800-2023 §20.7)"
+                    ),
+                ));
+            }
+        }
+    }
+
     /// §11.4.12 operand rules (replications, real operands) and §6.24.1 size
     /// casts, everywhere in `e`.
     fn check_operands(&mut self, e: &Expression) {
@@ -3283,6 +3419,10 @@ impl<'a> Ck<'a> {
                 operands(exprs, false, out);
             }
             ExprKind::SystemCall { name, args } => {
+                if name == "$__xz_type_op" {
+                    return;
+                }
+                self.check_array_query(name, args, e.span, out);
                 let size = match name.as_str() {
                     "$__xz_size_cast" | "$__xz_named_cast" => args.first(),
                     _ => None,
@@ -3327,7 +3467,12 @@ impl<'a> Ck<'a> {
             ExprKind::Binary { op, left, right } => {
                 if !matches!(
                     op,
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
                 ) && (matches!(self.ty_of(left), Ty::Unpacked { .. })
                     || matches!(self.ty_of(right), Ty::Unpacked { .. }))
                 {
@@ -3626,6 +3771,7 @@ impl<'a> Ck<'a> {
         match &s.kind {
             StatementKind::Expr(e) => {
                 self.check_const_selects(e);
+                self.check_operands(e);
                 self.walk_value(e, false)
             }
             StatementKind::BlockingAssign { lvalue, rvalue } => {

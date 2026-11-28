@@ -2196,6 +2196,7 @@ impl Simulator {
             dims: udims,
             unpacked,
             whole: inner.whole,
+            is_string: inner.is_string,
         })
     }
 
@@ -2261,6 +2262,46 @@ impl Simulator {
 
     /// The declared type and unpacked dimensions of member `seg` of a value
     /// of type `dt`: a property of a class, or a member of a struct.
+    /// `O(dims.len())` declared `(left, right)` bounds of fixed unpacked
+    /// dimensions, without materializing per-element index vectors.
+    pub(super) fn fixed_dim_bounds(&self, dim: &crate::ast::types::UnpackedDimension) -> Option<(i64, i64)> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let dims = super::elaborate::normalize_unpacked_dims(
+            std::slice::from_ref(dim),
+            &self.module.parameters,
+            &self.module.typedef_types,
+        );
+        let p = Some(&self.module.parameters);
+        match dims.first()? {
+            UD::Expression { expr, .. } => {
+                match super::elaborate::const_eval_i64_with_params(expr, p) {
+                    Some(n) if n > 0 => Some((0, n - 1)),
+                    _ => None,
+                }
+            }
+            UD::Range { left, right, .. } => {
+                let l = super::elaborate::const_eval_i64_with_params(left, p)?;
+                let r = super::elaborate::const_eval_i64_with_params(right, p)?;
+                Some((l, r))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn member_dim_bounds(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<(i64, i64)>> {
+        if dims.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(dims.len());
+        for d in dims {
+            out.push(self.fixed_dim_bounds(d)?);
+        }
+        Some(out)
+    }
+
     pub(super) fn member_decl_type(
         &self,
         dt: &DataType,
@@ -2285,10 +2326,7 @@ impl Simulator {
         let udims = if dims.is_empty() {
             Vec::new()
         } else {
-            self.member_dim_indices(&dims)?
-                .iter()
-                .map(|l| Some((*l.first()?, *l.last()?)))
-                .collect::<Option<Vec<_>>>()?
+            self.member_dim_bounds(&dims)?
         };
         Some((mdt, udims))
     }
@@ -2346,12 +2384,11 @@ impl Simulator {
             return None;
         }
         let flat = self.flat_member_name(arg)?;
-        if !flat.contains('.') || self.foreach_dims(&flat).is_some() {
+        if !flat.contains('.') || self.has_fixed_array_dims(&flat) {
             return None;
         }
-        let (_, lists) = self.flat_path_type(&flat)?;
-        let list = lists?.get(dim.checked_sub(1)?)?.clone();
-        let (left, right) = (*list.first()?, *list.last()?);
+        let (_, bounds) = self.flat_path_dim_bounds(&flat)?;
+        let &(left, right) = bounds?.get(dim.checked_sub(1)?)?;
         let (lo, hi) = (left.min(right), left.max(right));
         let result = match sn {
             "$left" => left,

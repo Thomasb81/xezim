@@ -3756,14 +3756,6 @@ impl Simulator {
                 args[0] = folded;
                 return self.eval_expr_system_call_body(expr, ctx_width, name, &args);
             }
-            // §7.4.6, §20.7: a slice of an unpacked array has the size of its
-            // range, not its width in bits (#867).
-            if name == "$size"
-                && args.len() == 1
-                && let Some(n) = self.unpacked_slice_size(operand)
-            {
-                return Value::from_u64(n as u64, 32);
-            }
             // §20.7, §13.4.1: `$size` of a call returning an unpacked array
             // counts the elements it returns, the call running once.
             if name == "$size"
@@ -5610,440 +5602,27 @@ impl Simulator {
                 Value::from_f64(f as f64)
             }
 
+            "$__xz_type_op" => Value::zero(1),
             "$dimensions" | "$unpacked_dimensions" => {
-                if let Some(arg) = args.first() {
-                    // §20.7: a TYPE operand — `$dimensions(int)` is 1,
-                    // `$dimensions(logic)` 0 (a scalar has no dimension),
-                    // `$dimensions(bit [3:0][7:0])` 2.
-                    if let Some(q) = self.type_query_operand(arg) {
-                        let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
-                        return Value::from_u64(n as u64, 32);
-                    }
-                    // §7.4.5: a select of `k` elements leaves the dimensions
-                    // after the first `k` (`$dimensions(a3[1])` of `logic
-                    // [1:0][3:0][7:0] a3` is 2). A select that leaves one
-                    // dimension or none keeps the answers below.
-                    if name == "$dimensions"
-                        && let Some((base, k)) = Self::peel_index_selects(arg)
-                        && !self.query_base_is_collection(&base)
-                    {
-                        let probe = Expression::new(
-                            ExprKind::SystemCall {
-                                name: "$dimensions".to_string(),
-                                args: vec![base.clone()],
-                            },
-                            base.span,
-                        );
-                        let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
-                        if nd > k + 1 {
-                            return Value::from_u64((nd - k) as u64, 32);
-                        }
-                    }
-                    // A class property or a struct member path (`m`,
-                    // `this.m`, `a.w`): its declared type, unpacked and
-                    // packed dimensions alike. A multi-dimensional packed
-                    // one is stored flattened and counted as one dimension.
-                    if let Some(q) = self
-                        .query_operand_decl_dims(arg)
-                        .filter(|q| !q.dims.is_empty())
-                    {
-                        let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
-                        return Value::from_u64(n as u64, 32);
-                    }
-                    if let ExprKind::Ident(hier) = &arg.kind {
-                        let mut aname = self.resolve_hier_name(hier);
-                        // A class-member collection (`h.raw`) is shaped under
-                        // its instance store (see the bound queries below).
-                        if self.foreach_dims(&aname).is_none()
-                            && let Some(nm) = self
-                                .array_operand_name(arg)
-                                .filter(|n| self.foreach_dims(n).is_some())
-                        {
-                            aname = std::borrow::Cow::Owned(nm);
-                        }
-                        // §20.7: EVERY unpacked dimension counts, not just
-                        // the first — `int m[2][3]` has two, `int n[2][3][4]`
-                        // three. Only the 1-D table was consulted.
-                        let unpacked_dim = self.foreach_dims(&aname).map_or(0, |d| d.len()) as u64;
-                        if name == "$unpacked_dimensions" {
-                            return Value::from_u64(unpacked_dim, 32);
-                        }
-                        let elem_w = self
-                            .module
-                            .arrays
-                            .get(&*aname)
-                            .map(|&(_, _, w)| w)
-                            .or_else(|| self.module.arrays_2d.get(&*aname).map(|&(_, _, w)| w))
-                            .or_else(|| self.module.arrays_nd.get(&*aname).map(|(_, w)| *w))
-                            .or_else(|| {
-                                self.signal_name_to_id
-                                    .get(aname.as_ref())
-                                    .map(|&id| self.signal_widths[id])
-                            })
-                            .unwrap_or(0);
-                        let packed_dim: u64 = self
-                            .module
-                            .packed_full_dims
-                            .get(&*aname)
-                            .map(|d| d.len() as u64)
-                            .unwrap_or(if elem_w > 1 { 1 } else { 0 });
-                        let total = packed_dim + unpacked_dim;
-                        return Value::from_u64(total.max(1), 32);
-                    }
-                }
-                Value::from_u64(1, 32)
+                let unpacked_only = name == "$unpacked_dimensions";
+                let n = args
+                    .first()
+                    .map_or(0, |arg| self.eval_dimensions_query(arg, unpacked_only));
+                Self::signed_int32(n)
             }
             sn @ ("$left" | "$high" | "$right" | "$low" | "$size" | "$increment") => {
-                let sn = sn.to_string();
-                // §20.7: a TYPE operand — the query describes THAT TYPE's
-                // dimensions, so it must report the DECLARED bounds of the
-                // selected one (`$size(int)` 32, `$left(byte)` 7,
-                // `$left(logic [15:4])` 15, `$size(bit [3:0][7:0], 2)` 8).
-                // Only the whole type's width was consulted, which is wrong
-                // for any non-zero-based or multi-dimensional shape — and a
-                // bare type keyword / typedef NAME parses as an Ident (see
-                // `parse_call_args`), so it missed this branch entirely and
-                // fell through to the signal path, reporting the bounds of
-                // a nonexistent signal (-1:0).
-                if let Some(q) = args.first().and_then(|a| self.type_query_operand(a)) {
-                    let dim = args
-                        .get(1)
-                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
-                        .unwrap_or(1) as usize;
-                    // §20.7: an out-of-range dimension has no bounds to
-                    // report — the result is x, not 0.
-                    return Self::type_query_value(&sn, &q, dim);
-                }
-                let dim = args
-                    .get(1)
-                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
-                    .unwrap_or(1) as usize;
-                // §20.7: a query of a selected sub-array (`m[0]`, `dm[1]`)
-                // describes the dimensions left after the selects:
-                // dimension d of `m[i]` is dimension d + 1 of `m`.
-                if let Some((base, k)) = args.first().and_then(Self::peel_index_selects) {
-                    let probe = Expression::new(
-                        ExprKind::SystemCall {
-                            name: "$unpacked_dimensions".to_string(),
-                            args: vec![base.clone()],
-                        },
-                        base.span,
-                    );
-                    let mut nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
-                    if nd <= k && !self.query_base_is_collection(&base) {
-                        // §7.4.5: past the unpacked dimensions the selects
-                        // name elements of the packed ones, numbered on from
-                        // them: `$size(a3[1])` of `logic [1:0][3:0][7:0] a3`
-                        // is `$size(a3, 2)`, 4, not the 32 bits of `a3[1]`.
-                        // A dynamic array, queue or associative array keeps
-                        // its own row answers below (its rows' shape is not
-                        // in the declared dimensions).
-                        let probe = Expression::new(
-                            ExprKind::SystemCall {
-                                name: "$dimensions".to_string(),
-                                args: vec![base.clone()],
-                            },
-                            base.span,
-                        );
-                        nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                let Some(arg) = args.first() else {
+                    return Self::signed_x32();
+                };
+                let dim: usize = if let Some(d_expr) = args.get(1) {
+                    match self.eval_expr(d_expr).to_i64() {
+                        Some(d) if d >= 1 => d as usize,
+                        _ => return Self::signed_x32(),
                     }
-                    if nd > k {
-                        let call = Expression::new(
-                            ExprKind::SystemCall {
-                                name: sn.clone(),
-                                args: vec![
-                                    base.clone(),
-                                    Self::int_lit_expr((dim + k) as i64, base.span),
-                                ],
-                            },
-                            base.span,
-                        );
-                        return self.eval_expr(&call);
-                    }
-                }
-                // §20.7 / §7.5: on a DYNAMIC array or queue the query
-                // functions report the CURRENT element count, not a static
-                // packed width — `$size(d)` == `d.size()`. The declared-dims
-                // table below only knows fixed arrays, so a dynamic array
-                // fell through to the "packed vector" branch and reported
-                // its element width (or 0). `array_operand_name` also lifts
-                // a class member (`dyn_array` inside a constraint, `o.q`
-                // from outside) to its instance-scoped storage, which is
-                // what §18.5.12 needs for `array_size == $size(dyn_array)`.
-                if dim <= 1 {
-                    if let Some(arg) = args.first() {
-                        // §20.7: `$size` of an ASSOCIATIVE array is its
-                        // number of entries, `num()` — the declared-dims
-                        // table has no row for it, so it fell through to the
-                        // packed-vector branch and reported the element
-                        // width (32 for `int a[int]`).
-                        if sn == "$size" {
-                            if let Some(an) = self.assoc_operand_name(arg) {
-                                return Self::int_count(self.assoc_top_level_keys(&an).len() as u64);
-                            }
-                        }
-                        if let Some(nm) = self.array_operand_name(arg) {
-                            if self.module.dynamic_arrays.contains(&nm) {
-                                let size = self.get_queue_size(&nm);
-                                return Self::dynamic_query_result(&sn, size);
-                            }
-                        }
-                        // §7.11 applies to strings too: a string acts as a
-                        // dynamic array of bytes, so the queries track its
-                        // CURRENT length ($left 0, $right len-1) — not the
-                        // 1024-bit placeholder width it fell through to.
-                        // BUT a FIXED-SIZE string-array member (`string[16]`)
-                        // must keep reporting its DECLARED element count, not
-                        // the current (empty) string value read back from the
-                        // array — `$size(a)` == 16, not 0. Resolve any
-                        // instance-scoped / module-scope fixed array first
-                        // and fall through to the array-dim branch below.
-                        if self.expr_is_string_valued(arg) {
-                            let mut is_fixed_array = false;
-                            if let ExprKind::Ident(h) = &arg.kind {
-                                let rname = self.resolve_hier_name(h);
-                                let fixed = |m: &str| {
-                                    self.module.arrays.contains_key(m)
-                                        || self.module.arrays_2d.contains_key(m)
-                                        || self.module.arrays_nd.contains_key(m)
-                                };
-                                is_fixed_array = self
-                                    .instance_assoc_member(&rname)
-                                    .map_or_else(|| fixed(&rname), |s| fixed(&s));
-                            }
-                            if !is_fixed_array {
-                                let len = self.eval_expr(arg).sv_string_bytes().len() as u64;
-                                return Self::dynamic_query_result(&sn, len);
-                            }
-                        }
-                    }
-                }
-                if let Some(arg) = args.first() {
-                    // §8.25 and §20.7: use the materialized declaration
-                    // rather than the generic class's bounds for a scoped static array.
-                    if dim == 1
-                        && matches!(&arg.kind, ExprKind::MemberAccess { expr, .. }
-                            if matches!(expr.kind, ExprKind::Specialization { .. }))
-                        && let Some(store) = self.array_operand_name(arg)
-                        && let Some(bounds) = self.module.unpacked_decl_dims.get(&store)
-                        && let Some(&(left, right)) = bounds.first()
-                    {
-                        let dims = super::elaborate::TypeQueryDims {
-                            dims: vec![(left, right)],
-                            unpacked: 1,
-                            whole: None,
-                        };
-                        return Self::type_query_value(&sn, &dims, dim);
-                    }
-                    if let Some(rv) = self.member_array_query(&sn, arg, dim) {
-                        return rv;
-                    }
-                    // §8.3.2/§6.20.2 (issue #388): the query on a class-scope
-                    // ARRAY constant — `$size(pkg::Cls::T)`, `$size(Cls::T)`
-                    // (which parses as a MemberAccess when the prefix is a
-                    // plain class), bare `$size(T)` in a method of the
-                    // declaring class. The constant has no module-scope shape
-                    // row, so the query fell through to the operand's packed
-                    // width (32) while the element reads were right.
-                    if dim == 1 {
-                        if let Some(c) = self.resolve_class_scope_array_const(arg) {
-                            let size = (c.hi - c.lo + 1).max(0) as u64;
-                            // Declared bounds in source order: a descending
-                            // `[5:4]` constant reports `$left` 5 / `$right` 4
-                            // and `$increment` 1 (§20.7); the normalized
-                            // (lo, hi) pair covers `$low`/`$high`/`$size`.
-                            // Falls back to the normalized pair (ascending)
-                            // when no declared-dimension row was recorded.
-                            let result = match sn.as_str() {
-                                "$left" => c.left as u64,
-                                "$right" => c.right as u64,
-                                "$high" => c.hi as u64,
-                                "$low" => c.lo as u64,
-                                "$size" => size,
-                                "$increment" => {
-                                    if c.left >= c.right {
-                                        1
-                                    } else {
-                                        0u64.wrapping_sub(1)
-                                    }
-                                }
-                                _ => 0,
-                            };
-                            let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
-                            rv.is_signed = true;
-                            return rv;
-                        }
-                    }
-                    // Resolve the operand to the name its declared bounds
-                    // are registered under. A plain / hierarchical Ident
-                    // resolves as it always did; a HANDLE-QUALIFIED member
-                    // resolves to the instance-scoped store below.
-                    let mut aname: Option<std::borrow::Cow<str>> = None;
-                    if let ExprKind::Ident(hier) = &arg.kind {
-                        let mut n = self.resolve_hier_name(hier);
-                        // A fixed-size ARRAY class member lives at
-                        // `<handle>#<member>`; the bare name has no dims.
-                        if let Some(scoped) = self.instance_assoc_member(&n) {
-                            if self.module.arrays.contains_key(&scoped)
-                                || self.module.arrays_2d.contains_key(&scoped)
-                                || self.module.arrays_nd.contains_key(&scoped)
-                            {
-                                n = std::borrow::Cow::Owned(scoped);
-                            }
-                        }
-                        // §8.9: `$size(Cls::S)` — the resolver collapses
-                        // the 2-segment form to the bare leaf; map from
-                        // the original segments to the qualified store.
-                        if !self.module.arrays.contains_key(&*n) {
-                            if let Some(k) = self.static_fixed_key_from_hier(hier) {
-                                n = std::borrow::Cow::Owned(k);
-                            }
-                        }
-                        aname = Some(n);
-                    }
-                    // §20.7: `$size(a.M)` on a class member array. The
-                    // handle-qualified spelling parses either as a
-                    // `MemberAccess`, which never entered the Ident arm at
-                    // all, or as a two-segment Ident that resolves to a
-                    // name carrying no registered shape. Either way no
-                    // bounds were found and the query fell through to the
-                    // operand's evaluated BIT WIDTH below, so every
-                    // `$size(a.M)` reported 32 while the in-method
-                    // `$size(M)` on the same member reported 3.
-                    // `foreach (a.M[i])` already iterates the member, so
-                    // the shape was known all along — only this path
-                    // missed it.
-                    if aname
-                        .as_deref()
-                        .is_none_or(|n| self.foreach_dims(n).is_none())
-                    {
-                        if let Some(scoped) = self.handle_member_array_name(arg) {
-                            aname = Some(std::borrow::Cow::Owned(scoped));
-                        }
-                    }
-                    // A class-member QUEUE / dynamic array of fixed rows
-                    // (`h.raw` on `bit [7:0] raw[][2]`) has its shape under
-                    // its instance store `<h>#raw` too; unfound, `$size(h.raw,
-                    // 2)` reported the element's 8 bits (§20.7).
-                    if aname
-                        .as_deref()
-                        .is_none_or(|n| self.foreach_dims(n).is_none())
-                    {
-                        if let Some(nm) = self
-                            .array_operand_name(arg)
-                            .filter(|n| self.foreach_dims(n).is_some())
-                        {
-                            aname = Some(std::borrow::Cow::Owned(nm));
-                        }
-                    }
-                    if let Some(aname) = aname {
-                        // Every unpacked dimension, outermost first. Only the
-                        // 1-D table was consulted, so `$size(m, 2)` — and even
-                        // `$size(m)` on a 2-D/N-D array — returned 0.
-                        let dims = self.foreach_dims(&aname);
-                        let elem_w = self
-                            .module
-                            .arrays
-                            .get(&*aname)
-                            .map(|&(_, _, w)| w)
-                            .or_else(|| self.module.arrays_2d.get(&*aname).map(|&(_, _, w)| w))
-                            .or_else(|| self.module.arrays_nd.get(&*aname).map(|(_, w)| *w));
-                        let packed_w = if let Some(w) = elem_w {
-                            w
-                        } else if let Some(&id) = self.signal_name_to_id.get(aname.as_ref()) {
-                            self.signal_widths[id]
-                        } else {
-                            // Block-local vector: width lives in the
-                            // runtime maps, not the compact table.
-                            self.lookup_signal_width(&aname).unwrap_or_else(|| {
-                                // A class-member packed vector (`$size(o.big)`
-                                // on a `bit[88:0]` field) is not in the
-                                // compact tables, so the lookup returns None
-                                // and the query collapsed to 0 while `$bits`
-                                // reported 89. Fall back to the evaluated
-                                // value's width, which resolves class
-                                // members to their full bit width.
-                                args.first()
-                                    .map(|a| self.eval_expr(a).width as u32)
-                                    .unwrap_or(0)
-                            })
-                        };
-                        let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
-                        let n_unpacked = dims.as_ref().map(|d| d.len()).unwrap_or(0);
-                        // Declared per-dimension order (`[3:1]` -> left=3,
-                        // right=1) — the arrays* tables normalize to
-                        // (lo, hi) and would report the bounds flipped.
-                        let decl_sel = self
-                            .module
-                            .unpacked_decl_dims
-                            .get(&*aname)
-                            .and_then(|d| d.get(dim.saturating_sub(1)))
-                            .copied();
-                        let (lo, hi, descending) = if let Some((l, r)) = decl_sel {
-                            (l.min(r), l.max(r), l > r)
-                        } else if let Some(&(l, h)) = sel {
-                            let desc = dim == 1 && self.module.descending_arrays.contains(&*aname);
-                            (l, h, desc)
-                        } else if let Some(&(l, r)) =
-                            self.module.packed_full_dims.get(&*aname).and_then(|pd| {
-                                pd.get(dim.saturating_sub(1).saturating_sub(n_unpacked))
-                            })
-                        {
-                            // §7.4.5: dimensions number unpacked-first, then
-                            // packed. A multi-D packed vector (`logic
-                            // [3:0][7:0]`) has per-dimension bounds in
-                            // packed_full_dims (declared left,right) — without
-                            // this the query collapsed to the FLATTENED vector,
-                            // so `$left([3:0][7:0])` returned 31, not 3.
-                            (l.min(r), l.max(r), l > r)
-                        } else if let Some(q) = self
-                            .query_operand_decl_dims(arg)
-                            .filter(|q| q.unpacked >= n_unpacked && !q.dims.is_empty())
-                        {
-                            return Self::type_query_value(&sn, &q, dim);
-                        } else {
-                            (0i64, packed_w as i64 - 1, true)
-                        };
-                        let left = if descending { hi } else { lo };
-                        let right = if descending { lo } else { hi };
-                        let size = (hi - lo + 1).max(0) as u64;
-                        let result = match sn.as_str() {
-                            "$left" => left as u64,
-                            "$right" => right as u64,
-                            "$high" => hi as u64,
-                            "$low" => lo as u64,
-                            "$size" => size,
-                            "$increment" => {
-                                if descending {
-                                    1
-                                } else {
-                                    0u64.wrapping_sub(1)
-                                }
-                            }
-                            _ => 0,
-                        };
-                        // §20.7: array query functions return `int`
-                        // (signed) — `$increment` of an ascending range is
-                        // -1, and negative declared bounds print negative.
-                        let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
-                        rv.is_signed = true;
-                        return rv;
-                    }
-                    if let Some(q) = self
-                        .query_operand_decl_dims(arg)
-                        .filter(|q| !q.dims.is_empty())
-                    {
-                        return Self::type_query_value(&sn, &q, dim);
-                    }
-                    let v = self.eval_expr(arg);
-                    match sn.as_str() {
-                        "$left" | "$high" => return Value::from_u64(v.width as u64 - 1, 32),
-                        "$size" => return Value::from_u64(v.width as u64, 32),
-                        "$increment" => return Value::from_u64(1, 32),
-                        _ => return Value::zero(32),
-                    }
-                }
-                Value::zero(32)
+                } else {
+                    1
+                };
+                self.eval_bound_query(sn, arg, dim)
             }
             "$get_randstate" => {
                 // §18.13.4: the RNG state as an implementation-defined
@@ -6432,5 +6011,648 @@ impl Simulator {
                 Value::zero(32)
             }
         }
+    }
+
+    #[inline]
+    fn signed_int32(v: i64) -> Value {
+        let mut rv = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+        rv.is_signed = true;
+        rv
+    }
+
+    #[inline]
+    fn signed_x32() -> Value {
+        let mut xv = Value::new(32);
+        xv.is_signed = true;
+        xv
+    }
+
+    fn unwrap_type_op(mut arg: &Expression) -> &Expression {
+        loop {
+            match &arg.kind {
+                ExprKind::Paren(inner) => arg = inner,
+                ExprKind::SystemCall { name, args }
+                    if name == "$__xz_type_op" && args.len() == 1 =>
+                {
+                    arg = &args[0];
+                }
+                _ => return arg,
+            }
+        }
+    }
+
+    fn resolve_query_var_name<'e>(
+        &mut self,
+        arg: &'e Expression,
+    ) -> Option<std::borrow::Cow<'e, str>> {
+        let mut aname: Option<std::borrow::Cow<'e, str>> = None;
+        if let ExprKind::Ident(hier) = &arg.kind {
+            let mut n = self.resolve_hier_name(hier);
+            if !self.has_fixed_array_dims(&n) && self.coll_shape_of(&n).is_none() {
+                if let Some(scoped) = self.instance_assoc_member(&n)
+                    && (self.has_fixed_array_dims(&scoped)
+                        || self.coll_shape_of(&scoped).is_some()
+                        || self.module.associative_arrays.contains_key(&scoped)
+                        || self.module.dynamic_arrays.contains(&scoped))
+                {
+                    n = std::borrow::Cow::Owned(scoped);
+                } else if !self.module.arrays.contains_key(&*n)
+                    && let Some(k) = self.static_fixed_key_from_hier(hier)
+                {
+                    n = std::borrow::Cow::Owned(k);
+                }
+            }
+            aname = Some(n);
+        }
+        if aname.as_deref().is_none_or(|n| {
+            !self.has_fixed_array_dims(n) && self.coll_shape_of(n).is_none()
+        }) && let Some(scoped) = self.handle_member_array_name(arg)
+        {
+            aname = Some(std::borrow::Cow::Owned(scoped));
+        }
+        if aname.as_deref().is_none_or(|n| {
+            !self.has_fixed_array_dims(n) && self.coll_shape_of(n).is_none()
+        }) && let Some(nm) = self
+            .array_operand_name(arg)
+            .filter(|n| self.has_fixed_array_dims(n) || self.coll_shape_of(n).is_some())
+        {
+            aname = Some(std::borrow::Cow::Owned(nm));
+        }
+        aname
+    }
+
+    fn packed_dims_for_name(&self, aname: &str) -> usize {
+        if let Some(pd) = self.module.packed_full_dims.get(aname) {
+            return pd.len();
+        }
+        if let Some(pd) = self.module.packed_full_dims.get(aname) {
+            return pd.len();
+        }
+        if self.real_signals.contains(aname)
+            || self.unpacked_struct_sens.contains_key(aname)
+        {
+            return 0;
+        }
+        if self.module.string_signals.contains(aname) {
+            return 1;
+        }
+        if let Some(dt) = self.module.var_decl_types.get(aname) {
+            let mut total = 0usize;
+            let mut cur = dt;
+            let mut seen_resolved = true;
+            for _ in 0..32 {
+                match cur {
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    } => return total + 1,
+                    crate::ast::types::DataType::IntegerAtom { .. } => return total + 1,
+                    crate::ast::types::DataType::IntegerVector { dimensions, .. }
+                    | crate::ast::types::DataType::Implicit { dimensions, .. } => {
+                        return total + dimensions.len();
+                    }
+                    crate::ast::types::DataType::Real { .. }
+                    | crate::ast::types::DataType::Enum(_)
+                    | crate::ast::types::DataType::Simple { .. }
+                    | crate::ast::types::DataType::Void(_)
+                    | crate::ast::types::DataType::Interface { .. } => return total,
+                    crate::ast::types::DataType::Struct(su) => {
+                        return total + if su.packed { su.dimensions.len() } else { 0 };
+                    }
+                    crate::ast::types::DataType::TypeReference {
+                        name, dimensions, ..
+                    } => {
+                        total += dimensions.len();
+                        if let Some(next) = self.module.typedef_types.get(&name.name.name) {
+                            cur = next;
+                        } else {
+                            seen_resolved = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if seen_resolved || total > 0 {
+                return total;
+            }
+        }
+        let elem_w = self
+            .module
+            .arrays
+            .get(aname)
+            .map(|&(_, _, w)| w)
+            .or_else(|| self.module.arrays_2d.get(aname).map(|&(_, _, w)| w))
+            .or_else(|| self.module.arrays_nd.get(aname).map(|(_, w)| *w))
+            .or_else(|| {
+                self.signal_name_to_id
+                    .get(aname)
+                    .map(|&id| self.signal_widths[id])
+            })
+            .or_else(|| self.lookup_signal_width(aname))
+            .unwrap_or(0);
+        usize::from(elem_w > 1)
+    }
+
+    fn eval_assoc_dim_query(&self, sn: &str, an: &str) -> Value {
+        if sn == "$size" {
+            let count = if let Some(table) = self.assoc_tables.get(an)
+                && !table.entries.is_empty()
+            {
+                table.entries.len() as u64
+            } else {
+                self.assoc_top_level_keys_shared(an).len() as u64
+            };
+            return Self::int_count(count);
+        }
+        if self.is_string_keyed_array(an) {
+            return Self::signed_x32();
+        }
+        match sn {
+            "$left" => Self::signed_int32(0),
+            "$increment" => Self::signed_int32(-1),
+            "$right" => {
+                let max_val: i64 = match self.assoc_index_width_for(an) {
+                    Some((w, true)) => {
+                        if w >= 32 {
+                            i32::MAX as i64
+                        } else {
+                            (1i64 << (w - 1)) - 1
+                        }
+                    }
+                    Some((w, false)) => {
+                        if w >= 32 {
+                            u32::MAX as i64
+                        } else {
+                            (1i64 << w) - 1
+                        }
+                    }
+                    None => i32::MAX as i64,
+                };
+                Self::signed_int32(max_val)
+            }
+            "$low" | "$high" => {
+                if let Some(table) = self.assoc_tables.get(an)
+                    && !table.entries.is_empty()
+                {
+                    let key = if sn == "$low" {
+                        table.entries.keys().next()
+                    } else {
+                        table.entries.keys().next_back()
+                    };
+                    let val = match key {
+                        Some(super::assoc_store::AssocKey::Int64(v)) => Some(*v),
+                        Some(super::assoc_store::AssocKey::UInt64(u)) => Some(*u as i64),
+                        Some(super::assoc_store::AssocKey::WideUnsigned(w)) => {
+                            Some(w.first().copied().unwrap_or(0) as i64)
+                        }
+                        Some(super::assoc_store::AssocKey::WideSigned { words, .. }) => {
+                            Some(words.first().copied().unwrap_or(0) as i64)
+                        }
+                        _ => None,
+                    };
+                    return val.map_or_else(Self::signed_x32, Self::signed_int32);
+                }
+                let keys = self.assoc_top_level_keys_shared(an);
+                let raw = if sn == "$low" {
+                    keys.first()
+                } else {
+                    keys.last()
+                };
+                match raw.and_then(|s| s.parse::<i128>().ok()) {
+                    Some(v) => Self::signed_int32(v as i64),
+                    None => Self::signed_x32(),
+                }
+            }
+            _ => Self::signed_x32(),
+        }
+    }
+
+    fn eval_dimensions_query(&mut self, raw_arg: &Expression, unpacked_only: bool) -> i64 {
+        let arg = Self::unwrap_type_op(raw_arg);
+        if self.unpacked_slice_bounds(arg).is_some()
+            && let ExprKind::RangeSelect { expr: base, .. } = &arg.kind
+        {
+            return self.eval_dimensions_query(base, unpacked_only);
+        }
+        if let Some(q) = self.type_query_operand(arg) {
+            return if unpacked_only {
+                q.unpacked as i64
+            } else {
+                (q.dims.len() + usize::from(q.is_string)) as i64
+            };
+        }
+        if let Some((base, k)) = Self::peel_index_selects(arg) {
+            let base_unpacked = self.eval_dimensions_query(&base, true) as usize;
+            if unpacked_only {
+                return base_unpacked.saturating_sub(k) as i64;
+            }
+            if k <= base_unpacked {
+                let base_total = self.eval_dimensions_query(&base, false) as usize;
+                return base_total.saturating_sub(k) as i64;
+            }
+            if !self.query_base_is_collection(&base)
+                && !(base_unpacked == 0 && self.expr_is_string_valued(&base))
+            {
+                let base_total = self.eval_dimensions_query(&base, false) as usize;
+                return base_total.saturating_sub(k) as i64;
+            }
+            if base_unpacked == 0 && self.expr_is_string_valued(&base) {
+                return 1;
+            }
+        }
+        if let Some(q) = self.query_operand_decl_dims(arg) {
+            return if unpacked_only {
+                q.unpacked as i64
+            } else {
+                (q.dims.len() + usize::from(q.is_string)) as i64
+            };
+        }
+        if let Some(an) = self.assoc_operand_name(arg) {
+            let u = self.unpacked_dim_count(&an).max(1);
+            if unpacked_only {
+                return u as i64;
+            }
+            let p = self.packed_dims_for_name(&an);
+            return (u + p) as i64;
+        }
+        if let Some(aname) = self.resolve_query_var_name(arg) {
+            let u = self.unpacked_dim_count(&aname);
+            if unpacked_only {
+                return u as i64;
+            }
+            let p = self.packed_dims_for_name(&aname);
+            return (u + p) as i64;
+        }
+        if unpacked_only {
+            return 0;
+        }
+        if self.expr_is_string_valued(arg) || matches!(arg.kind, ExprKind::RangeSelect { .. }) {
+            return 1;
+        }
+        let w = self.eval_expr(arg).width;
+        i64::from(w > 1)
+    }
+
+    fn eval_bound_query(&mut self, sn: &str, raw_arg: &Expression, dim: usize) -> Value {
+        let arg = Self::unwrap_type_op(raw_arg);
+        if let Some((sl, sr)) = self.unpacked_slice_bounds(arg) {
+            if dim == 1 {
+                let (lo, hi) = (sl.min(sr), sl.max(sr));
+                let result = match sn {
+                    "$left" => sl,
+                    "$right" => sr,
+                    "$low" => lo,
+                    "$high" => hi,
+                    "$size" => hi - lo + 1,
+                    "$increment" => if sl >= sr { 1 } else { -1 },
+                    _ => 0,
+                };
+                return Self::signed_int32(result);
+            } else if let ExprKind::RangeSelect { expr: base, .. } = &arg.kind {
+                return self.eval_bound_query(sn, base, dim);
+            }
+        }
+        if let Some(q) = self.type_query_operand(arg) {
+            return Self::type_query_value(sn, &q, dim);
+        }
+        if let Some((base, k)) = Self::peel_index_selects(arg) {
+            let base_coll_dim = if let Some(bname) = self.resolve_query_var_name(&base)
+                && let Some(shape) = self.coll_shape_of(&bname).cloned()
+            {
+                Some((bname.into_owned(), shape))
+            } else {
+                None
+            };
+            if let Some((_bname, shape)) = base_coll_dim {
+                let target_idx = k + dim - 1;
+                if target_idx < shape.dims.len() {
+                    match &shape.dims[target_idx] {
+                        Dim::Fixed(Some((l, r))) => {
+                            let (lo, hi) = ((*l).min(*r), (*l).max(*r));
+                            let result = match sn {
+                                "$left" => *l,
+                                "$right" => *r,
+                                "$low" => lo,
+                                "$high" => hi,
+                                "$size" => hi - lo + 1,
+                                "$increment" => if *l >= *r { 1 } else { -1 },
+                                _ => 0,
+                            };
+                            return Self::signed_int32(result);
+                        }
+                        Dim::Dyn | Dim::Queue => {
+                            if dim == 1 {
+                                let row = self.flat_member_name(arg).unwrap_or_default();
+                                let sz = if row.is_empty() {
+                                    0
+                                } else {
+                                    self.get_queue_size(&row)
+                                };
+                                return Self::dynamic_query_result(sn, sz);
+                            }
+                            return Self::signed_x32();
+                        }
+                        Dim::Assoc(_) => {
+                            if dim == 1 {
+                                let row = self.flat_member_name(arg).unwrap_or_default();
+                                return if row.is_empty() {
+                                    Self::signed_x32()
+                                } else {
+                                    self.eval_assoc_dim_query(sn, &row)
+                                };
+                            }
+                            return Self::signed_x32();
+                        }
+                        Dim::Fixed(None) => return Self::signed_x32(),
+                    }
+                } else {
+                    return self.eval_bound_query(sn, &base, dim + k);
+                }
+            }
+            let base_unpacked = self.eval_dimensions_query(&base, true) as usize;
+            if k < base_unpacked {
+                return self.eval_bound_query(sn, &base, dim + k);
+            }
+            if !self.query_base_is_collection(&base) {
+                let base_total = self.eval_dimensions_query(&base, false) as usize;
+                if k < base_total {
+                    return self.eval_bound_query(sn, &base, dim + k);
+                }
+                if !(base_unpacked == 0 && self.expr_is_string_valued(&base)) {
+                    return Self::signed_x32();
+                }
+            }
+        }
+        if dim == 1 {
+            if let Some(an) = self.assoc_operand_name(arg) {
+                return self.eval_assoc_dim_query(sn, &an);
+            }
+            if let Some(nm) = self.array_operand_name(arg)
+                && self.module.dynamic_arrays.contains(&nm)
+            {
+                let size = self.get_queue_size(&nm);
+                return Self::dynamic_query_result(sn, size);
+            }
+            if self.expr_is_string_valued(arg) {
+                let mut is_array = false;
+                if let ExprKind::Ident(h) = &arg.kind {
+                    let rname = self.resolve_hier_name(h);
+                    is_array = self
+                        .instance_assoc_member(&rname)
+                        .map_or_else(
+                            || {
+                                self.has_fixed_array_dims(&rname)
+                                    || self.module.dynamic_arrays.contains(&*rname)
+                                    || self.module.associative_arrays.contains_key(&*rname)
+                            },
+                            |s| {
+                                self.has_fixed_array_dims(&s)
+                                    || self.module.dynamic_arrays.contains(&s)
+                                    || self.module.associative_arrays.contains_key(&s)
+                            },
+                        );
+                }
+                if !is_array {
+                    let len = self.eval_expr(arg).sv_string_bytes().len() as u64;
+                    return Self::dynamic_query_result(sn, len);
+                }
+            }
+        }
+        if dim == 1
+            && matches!(&arg.kind, ExprKind::MemberAccess { expr, .. }
+                if matches!(expr.kind, ExprKind::Specialization { .. }))
+            && let Some(store) = self.array_operand_name(arg)
+            && let Some(bounds) = self.module.unpacked_decl_dims.get(&store)
+            && let Some(&(left, right)) = bounds.first()
+        {
+            let dims = super::elaborate::TypeQueryDims {
+                dims: vec![(left, right)],
+                unpacked: 1,
+                whole: None,
+                is_string: false,
+            };
+            return Self::type_query_value(sn, &dims, dim);
+        }
+        if let Some(rv) = self.member_array_query(sn, arg, dim) {
+            return rv;
+        }
+        if dim == 1
+            && let Some(c) = self.resolve_class_scope_array_const(arg)
+        {
+            let size = (c.hi - c.lo + 1).max(0) as u64;
+            let result = match sn {
+                "$left" => c.left,
+                "$right" => c.right,
+                "$high" => c.hi,
+                "$low" => c.lo,
+                "$size" => size as i64,
+                "$increment" => if c.left >= c.right { 1 } else { -1 },
+                _ => 0,
+            };
+            return Self::signed_int32(result);
+        }
+        if let Some(aname) = self.resolve_query_var_name(arg) {
+            let aname = aname.as_ref();
+            if let Some(shape) = self.coll_shape_of(aname).cloned() {
+                if dim <= shape.dims.len() {
+                    return match &shape.dims[dim - 1] {
+                        Dim::Fixed(Some((l, r))) => {
+                            let (lo, hi) = ((*l).min(*r), (*l).max(*r));
+                            let result = match sn {
+                                "$left" => *l,
+                                "$right" => *r,
+                                "$low" => lo,
+                                "$high" => hi,
+                                "$size" => hi - lo + 1,
+                                "$increment" => if *l >= *r { 1 } else { -1 },
+                                _ => 0,
+                            };
+                            Self::signed_int32(result)
+                        }
+                        Dim::Dyn | Dim::Queue => {
+                            if dim == 1 {
+                                Self::dynamic_query_result(sn, self.get_queue_size(aname))
+                            } else {
+                                Self::signed_x32()
+                            }
+                        }
+                        Dim::Assoc(_) => {
+                            if dim == 1 {
+                                self.eval_assoc_dim_query(sn, aname)
+                            } else {
+                                Self::signed_x32()
+                            }
+                        }
+                        Dim::Fixed(None) => Self::signed_x32(),
+                    };
+                }
+            }
+            let n_unpacked = self.unpacked_dim_count(aname);
+            if dim <= n_unpacked {
+                let decl_sel = self
+                    .module
+                    .unpacked_decl_dims
+                    .get(aname)
+                    .and_then(|d| d.get(dim - 1))
+                    .copied();
+                let (lo, hi, descending) = if let Some((l, r)) = decl_sel {
+                    (l.min(r), l.max(r), l >= r)
+                } else if let Some((l, h)) = self.fixed_unpacked_dim_at(aname, dim - 1) {
+                    let desc = l == h
+                        || (dim == 1 && self.module.descending_arrays.contains(aname));
+                    (l, h, desc)
+                } else {
+                    return Self::signed_x32();
+                };
+                let left = if descending { hi } else { lo };
+                let right = if descending { lo } else { hi };
+                let result = match sn {
+                    "$left" => left,
+                    "$right" => right,
+                    "$high" => hi,
+                    "$low" => lo,
+                    "$size" => (hi - lo + 1).max(0),
+                    "$increment" => if descending { 1 } else { -1 },
+                    _ => 0,
+                };
+                return Self::signed_int32(result);
+            }
+            let p_idx = dim - n_unpacked - 1;
+            if let Some(pd) = self.module.packed_full_dims.get(aname) {
+                let Some(&(l, r)) = pd.get(p_idx) else {
+                    return Self::signed_x32();
+                };
+                let (lo, hi, descending) = (l.min(r), l.max(r), l >= r);
+                let left = if descending { hi } else { lo };
+                let right = if descending { lo } else { hi };
+                let result = match sn {
+                    "$left" => left,
+                    "$right" => right,
+                    "$high" => hi,
+                    "$low" => lo,
+                    "$size" => (hi - lo + 1).max(0),
+                    "$increment" => if descending { 1 } else { -1 },
+                    _ => 0,
+                };
+                return Self::signed_int32(result);
+            }
+            if let Some(q) = self
+                .query_operand_decl_dims(arg)
+                .filter(|q| q.unpacked >= n_unpacked && (!q.dims.is_empty() || q.whole.is_some()))
+            {
+                return Self::type_query_value(sn, &q, dim);
+            }
+            if self.real_signals.contains(aname)
+                || self.unpacked_struct_sens.contains_key(aname)
+                || self.module.string_signals.contains(aname)
+            {
+                return Self::signed_x32();
+            }
+            let elem_w = self
+                .module
+                .arrays
+                .get(aname)
+                .map(|&(_, _, w)| w)
+                .or_else(|| self.module.arrays_2d.get(aname).map(|&(_, _, w)| w))
+                .or_else(|| self.module.arrays_nd.get(aname).map(|(_, w)| *w));
+            let packed_w = if let Some(w) = elem_w {
+                w
+            } else if let Some(&id) = self.signal_name_to_id.get(aname) {
+                self.signal_widths[id]
+            } else if let Some(w) = self.lookup_signal_width(aname) {
+                w
+            } else {
+                self.eval_expr(arg).width as u32
+            };
+            if let Some(dt) = self.module.var_decl_types.get(aname) {
+                let resolved =
+                    super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                match resolved {
+                    crate::ast::types::DataType::Real { .. }
+                    | crate::ast::types::DataType::Simple { .. }
+                    | crate::ast::types::DataType::Void(_)
+                    | crate::ast::types::DataType::Interface { .. } => {
+                        return Self::signed_x32();
+                    }
+                    crate::ast::types::DataType::Struct(su) if !su.packed => {
+                        return Self::signed_x32();
+                    }
+                    crate::ast::types::DataType::IntegerVector { dimensions, .. }
+                    | crate::ast::types::DataType::Implicit { dimensions, .. } => {
+                        if dimensions.is_empty() {
+                            return Self::signed_x32();
+                        }
+                        if dimensions.len() == 1 {
+                            if p_idx == 0 && packed_w > 0 {
+                                let result = match sn {
+                                    "$left" | "$high" => packed_w as i64 - 1,
+                                    "$right" | "$low" => 0,
+                                    "$size" => packed_w as i64,
+                                    "$increment" => 1,
+                                    _ => 0,
+                                };
+                                return Self::signed_int32(result);
+                            }
+                            return Self::signed_x32();
+                        }
+                        let q = super::elaborate::type_query_dims_of(
+                            dt,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                            Some(&self.module.typedef_types),
+                        );
+                        return Self::type_query_value(sn, &q, p_idx + 1);
+                    }
+                    crate::ast::types::DataType::IntegerAtom { .. }
+                    | crate::ast::types::DataType::Enum(_)
+                    | crate::ast::types::DataType::Struct(_) => {
+                        if p_idx == 0 && packed_w > 0 {
+                            let result = match sn {
+                                "$left" | "$high" => packed_w as i64 - 1,
+                                "$right" | "$low" => 0,
+                                "$size" => packed_w as i64,
+                                "$increment" => 1,
+                                _ => 0,
+                            };
+                            return Self::signed_int32(result);
+                        }
+                        return Self::signed_x32();
+                    }
+                    crate::ast::types::DataType::TypeReference { .. } => {}
+                }
+            }
+            if p_idx == 0 && packed_w > 1 {
+                let result = match sn {
+                    "$left" | "$high" => packed_w as i64 - 1,
+                    "$right" | "$low" => 0,
+                    "$size" => packed_w as i64,
+                    "$increment" => 1,
+                    _ => 0,
+                };
+                return Self::signed_int32(result);
+            }
+            return Self::signed_x32();
+        }
+        if let Some(q) = self
+            .query_operand_decl_dims(arg)
+            .filter(|q| !q.dims.is_empty() || q.whole.is_some())
+        {
+            return Self::type_query_value(sn, &q, dim);
+        }
+        if dim > 1 {
+            return Self::signed_x32();
+        }
+        let v = self.eval_expr(arg);
+        if v.width == 0 || (v.width == 1 && !matches!(arg.kind, ExprKind::RangeSelect { .. })) {
+            return Self::signed_x32();
+        }
+        let result = match sn {
+            "$left" | "$high" => v.width as i64 - 1,
+            "$right" | "$low" => 0,
+            "$size" => v.width as i64,
+            "$increment" => 1,
+            _ => 0,
+        };
+        Self::signed_int32(result)
     }
 }

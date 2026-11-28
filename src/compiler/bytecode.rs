@@ -1192,6 +1192,10 @@ pub struct BytecodeCompiler<'a> {
     /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
     /// `idx * elem_w` is only correct for a normalized `[N-1:0]` range and
     /// mis-places (or drops) elements of e.g. `[2:1]` or an ascending `[0:1]`.
+    unpacked_decl_dims: Option<&'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>>,
+    arrays_nd: Option<&'a HashMap<String, (Vec<(i64, i64)>, u32)>>,
+    coll_shapes: Option<&'a HashMap<String, crate::compiler::elaborate::CollShape>>,
+    descending_arrays: Option<&'a HashSet<String>>,
     packed_full_dims: Option<&'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>>,
     /// Declared variable types, for the type a pattern assigned to a
     /// variable takes (§10.8).
@@ -1437,6 +1441,10 @@ impl<'a> BytecodeCompiler<'a> {
             packed_elem_widths: None,
             assoc_elem_widths: None,
             assoc_arrays: None,
+            unpacked_decl_dims: None,
+            arrays_nd: None,
+            coll_shapes: None,
+            descending_arrays: None,
             packed_full_dims: None,
             var_decl_types: None,
             typedef_unpacked_dims: None,
@@ -1577,6 +1585,25 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_assoc_arrays(&mut self, a: &'a HashMap<String, bool>) {
         self.assoc_arrays = Some(a);
+    }
+
+    pub fn set_unpacked_decl_dims(
+        &mut self,
+        d: &'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>,
+    ) {
+        self.unpacked_decl_dims = Some(d);
+    }
+
+    pub fn set_arrays_nd(&mut self, m: &'a HashMap<String, (Vec<(i64, i64)>, u32)>) {
+        self.arrays_nd = Some(m);
+    }
+
+    pub fn set_coll_shapes(&mut self, s: &'a HashMap<String, crate::compiler::elaborate::CollShape>) {
+        self.coll_shapes = Some(s);
+    }
+
+    pub fn set_descending_arrays(&mut self, d: &'a HashSet<String>) {
+        self.descending_arrays = Some(d);
     }
 
     pub fn set_packed_full_dims(

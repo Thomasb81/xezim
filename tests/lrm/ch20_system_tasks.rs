@@ -88,15 +88,17 @@ fn c20_17_system_output_order() {
 // §20.7: Array query functions: out-of-range dimension argument and associative arrays
 #[test]
 fn c20_7_array_query_packed_dims() {
-    // Known gap (§20.7): `20.7c` reference `left3=7 size3=8 size4=4 inc2=1 size5=x`, xezim `left3=7 size3=8 size4=4 inc2=1 size5=32`
-    // Known gap (§20.7): `20.7d` reference `1`, xezim `32`
     check(
         "20.7_array_query_packed_dims",
         include_str!("sv/20.7_array_query_packed_dims.sv"),
         "faq",
         Order::Exact,
-        &["T|20.7a|dims=4 udims=2"],
-        &["T|20.7c|", "T|20.7d|"],
+        &[
+            "T|20.7a|dims=4 udims=2",
+            "T|20.7c|left3=7 size3=8 size4=4 inc2=1 size5=x",
+            "T|20.7d|1",
+        ],
+        &[],
     );
 }
 
@@ -106,9 +108,6 @@ fn c20_utility_system_functions() {
     // Not compared: $typename text and the sign of a printed NaN (implementation-defined).
     // Not compared (§20.6.2): `$bits(real)`: the reference returns 0; xezim returns 64, as the clause specifies
     // Known gap (§20.6.2): `20.6.2b` reference `96`, xezim `64`
-    // Known gap (§20.7): `20.7c` reference `7 0 8 1`, xezim `7 0 8 -1`
-    // Known gap (§20.7): `20.7d` reference `4 3 2 1`, xezim `4 3 2 32`
-    // Known gap (§20.7): `20.7f` reference `x`, xezim `32`
     // Known gap (§20.15.1): `20.15.1a` reference `-2147138048 230383387 -2147138048 same=1`, xezim `1351845 336141829 1351845 same=1`
     // Known gap (§20.15.2): `20.15.2a` reference `0 11 475628535`, xezim `93 39 67634689`
     // Known gap (§20.15.2): `20.15.2b` reference `62 14`, xezim `80 1`
@@ -138,7 +137,10 @@ fn c20_utility_system_functions() {
             "T|20.6.3|0 0",
             "T|20.7a|4 2 1",
             "T|20.7b|2 5 2 5 -1 4",
+            "T|20.7c|7 0 8 1",
+            "T|20.7d|4 3 2 1",
             "T|20.7e|7 1",
+            "T|20.7f|x",
             "T|20.8.1a|0 0 1 3 32",
             "T|20.8.2a|0.000000 3.000000 1.000000 4.000000",
             "T|20.8.2b|8.000000 -2.000000 -1.000000 0.000000",
@@ -162,9 +164,6 @@ fn c20_utility_system_functions() {
             "T|20.8.2f|",
             "T|20.6.2r|",
             "T|20.6.2b|",
-            "T|20.7c|",
-            "T|20.7d|",
-            "T|20.7f|",
             "T|20.15.1a|",
             "T|20.15.2a|",
             "T|20.15.2b|",
