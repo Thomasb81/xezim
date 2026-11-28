@@ -356,6 +356,23 @@ fn runs_round_trip_through_serialization() {
     }
     m.insert("q[9]".to_string(), Value::from_u64(99, 8));
     m.insert("aa[\"k\"]".to_string(), Value::from_u64(7, 8));
+    for (index, key) in [
+        "aa[-1]",
+        "aa[1]",
+        "aa[01]",
+        "aa[-0]",
+        "aa[0]",
+        "aa[18446744073709551615]",
+        "aa[18446744073709551616]",
+        "aa[1][3]",
+        "aa[1][30]",
+        "aa[1].field",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        m.insert(key.to_owned(), Value::from_u64(index as u64, 8));
+    }
     let cfg = xezim_core::xez_bincode_config();
     let bytes = bincode::serde::encode_to_vec(&m, cfg).unwrap();
     let (back, _): (SignalMap, usize) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
@@ -363,4 +380,31 @@ fn runs_round_trip_through_serialization() {
     check(&back, &model, &["q", "aa"], 0);
     assert!(back.run_covers("q", 0, 3) == m.run_covers("q", 0, 3));
     assert_eq!(back.elem_runs().count(), 1);
+}
+
+/// §8.7: a restored signal store rebuilds the owner index for both dense
+/// and sparse storage, including nested element runs and displaced values.
+#[test]
+fn class_owner_cleanup_after_signal_store_round_trip() {
+    let mut map = SignalMap::new();
+    for name in ["4#q[1]", "4#q[2]", "14#q[1]"] {
+        map.insert(format!("{name}.size"), Value::from_u64(6, 32));
+        for index in 0..6 {
+            map.insert(format!("{name}[{index}]"), Value::from_u64(index, 8));
+        }
+    }
+    // Split one run so it has sparse keys again, then leave an empty run.
+    map.remove("4#q[1][2]");
+    map.register_element_run("4#empty", false);
+    let cfg = xezim_core::xez_bincode_config();
+    let bytes = bincode::serde::encode_to_vec(&map, cfg).unwrap();
+    let (mut restored, _): (SignalMap, _) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+
+    for store in [&mut map, &mut restored] {
+        store.release_storage_owner(super::heap_gc::StorageOwner::Class(4));
+        assert!(store.elem_keys("4#q").is_empty());
+        assert!(store.elem_keys("4#empty").is_empty());
+        assert_eq!(store.len(), 7);
+        assert!(store.run_covers("14#q[1]", 0, 6));
+    }
 }
