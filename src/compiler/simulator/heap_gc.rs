@@ -218,6 +218,7 @@ impl Simulator {
             sva_proc_pending,
             sva_default_disable,
             sva_preponed,
+            sva_preponed_names,
             cg_heap,
             cg_named_event_waiters,
             cg_instance_event_waiters,
@@ -404,6 +405,56 @@ impl Simulator {
                 }
             }
         }
+        for (name, table) in self.assoc_tables.iter() {
+            let key_is_class = self.assoc_key_is_class(name);
+            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
+                edge_trace.elem_run_base(name);
+                let (_, property) = name.split_once('#').unwrap();
+                let trace_vals = !self.class_property_has_no_handles(owner, property);
+                if trace_vals {
+                    if let Some(def) = &table.evaluated_default {
+                        edge_trace.trace(def)?;
+                    }
+                }
+                for (k, entry) in &table.entries {
+                    if key_is_class {
+                        if let Some(kh) = match k {
+                            super::assoc_store::AssocKey::UInt64(h) => Some(*h),
+                            super::assoc_store::AssocKey::Int64(h) if *h > 0 => Some(*h as u64),
+                            _ => None,
+                        } {
+                            edge_trace.trace(&Value::from_u64(kh, 64))?;
+                        }
+                    }
+                    if trace_vals && let super::assoc_store::AssocEntry::Scalar(v) = entry {
+                        edge_trace.trace(v)?;
+                    }
+                }
+                let found = edge_trace.drain_candidates();
+                if !found.is_empty() {
+                    edges.entry(owner).or_default().extend(found);
+                }
+            } else {
+                roots.elem_run_base(name);
+                if let Some(def) = &table.evaluated_default {
+                    roots.trace(def)?;
+                }
+                for (k, entry) in &table.entries {
+                    if key_is_class {
+                        if let Some(kh) = match k {
+                            super::assoc_store::AssocKey::UInt64(h) => Some(*h),
+                            super::assoc_store::AssocKey::Int64(h) if *h > 0 => Some(*h as u64),
+                            _ => None,
+                        } {
+                            roots.trace(&Value::from_u64(kh, 64))?;
+                        }
+                    }
+                    if let super::assoc_store::AssocEntry::Scalar(v) = entry {
+                        roots.trace(v)?;
+                    }
+                }
+            }
+        }
         let mut marked = super::heap_trace::SlotBits::new(self.heap.len());
         let mut todo = roots.drain_candidates();
         while let Some(handle) = todo.pop() {
@@ -512,6 +563,7 @@ impl Simulator {
             associative_arrays,
             assoc_elem_widths,
             assoc_index_widths,
+            assoc_key_struct_types,
             assoc_key_type_names,
             assoc_defaults,
             queue_max_sizes,
@@ -530,7 +582,8 @@ impl Simulator {
             descending_arrays,
             queue_vars,
             string_signals,
-            two_state_signals
+            two_state_signals,
+            wildcard_assoc_arrays
         );
         macro_rules! maps {
             ($($field:ident),* $(,)?) => { $(self.$field.retain(|name, _| !dead_name(name));)* };
@@ -551,6 +604,8 @@ impl Simulator {
             active_union_tag,
             mixed_local_two_state,
             static_struct_holders,
+            assoc_tables,
+            queue_elem_ids,
             rand_ranges,
             rand_elem_ranges
         );

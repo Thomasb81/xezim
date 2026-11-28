@@ -5252,6 +5252,13 @@ impl Simulator {
         {
             return Some(handle);
         }
+        if let Some((base, rest)) = obj_name.rsplit_once('[')
+            && rest.ends_with(']')
+            && self.is_associative_array(base)
+            && let Some(v) = self.assoc_get_by_canon(base, &rest[..rest.len() - 1])
+        {
+            return Some(v.to_u64().unwrap_or(0) as usize);
+        }
         if let Some(v) = self.get_signal_value_by_name(obj_name) {
             return Some(v.to_u64().unwrap_or(0) as usize);
         }

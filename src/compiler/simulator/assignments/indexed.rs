@@ -434,15 +434,21 @@ impl Simulator {
                 let prev = self.get_signal_value_by_name(&elem);
                 let changed = prev.as_ref() != Some(&val);
                 self.set_signal_value_by_name(&elem, val);
+                if changed {
+                    self.touch_queue(&row);
+                }
                 return changed;
             }
             if self.is_associative_array(&row) {
-                let kv = self.eval_expr(index);
-                let key = self.assoc_key_str(&row, &kv);
-                let elem = format!("{}[{}]", row, key);
-                let prev = self.get_signal_value_by_name(&elem);
-                let changed = prev.as_ref() != Some(val);
-                self.set_signal_value_by_name(&elem, val.clone());
+                let Some(key) = self.eval_assoc_key(&row, index) else {
+                    self.warn_invalid_assoc_index(&row);
+                    return false;
+                };
+                let fitted = self.fit_assoc_elem_val(&row, val.clone());
+                let changed = self.assoc_set_scalar(&row, key, fitted);
+                if changed {
+                    self.touch_queue(&row);
+                }
                 return changed;
             }
         }
@@ -467,21 +473,25 @@ impl Simulator {
             let prev = self.get_signal_value_by_name(&elem);
             let changed = prev.as_ref() != Some(val);
             self.set_signal_value_by_name(&elem, val.clone());
+            if changed {
+                self.touch_queue(&qn);
+            }
             return changed;
         }
         // `a[i][key] = v` on an array of associative arrays.
-        if let Some(elem) = self.indexed_assoc_elem(expr, index) {
-            let conv;
-            let val = match self.fit_real_nested_elem(expr, val) {
-                Some(v) => {
-                    conv = v;
-                    &conv
-                }
-                None => val,
+        if let Some(an) = self.indexed_assoc_base(expr) {
+            let Some(key) = self.eval_assoc_key(&an, index) else {
+                self.warn_invalid_assoc_index(&an);
+                return false;
             };
-            let prev = self.get_signal_value_by_name(&elem);
-            let changed = prev.as_ref() != Some(val);
-            self.set_signal_value_by_name(&elem, val.clone());
+            let v = self
+                .fit_real_nested_elem(expr, val)
+                .unwrap_or_else(|| val.clone());
+            let fitted = self.fit_assoc_elem_val(&an, v);
+            let changed = self.assoc_set_scalar(&an, key, fitted);
+            if changed {
+                self.touch_queue(&an);
+            }
             return changed;
         }
         // Multidimensional associative-array write
@@ -489,7 +499,7 @@ impl Simulator {
         // `m[K1][K2]...[Kn]` (see `multidim_assoc_elem`). Without this
         // the write is silently lost and later reads / `.exists()` /
         // recursion guards see nothing (IEEE 1800-2023 §7.8.1).
-        if let Some((_, key)) = self.multidim_assoc_elem(expr, index) {
+        if let Some((base, key)) = self.multidim_assoc_elem(expr, index) {
             let conv;
             let val = match self.fit_real_nested_elem(expr, val) {
                 Some(v) => {
@@ -498,6 +508,23 @@ impl Simulator {
                 }
                 None => val,
             };
+            if let Some((row, canon)) = key.rsplit_once('[')
+                && canon.ends_with(']')
+            {
+                let canon = &canon[..canon.len() - 1];
+                if !self.is_associative_array(row) {
+                    self.ensure_row(row);
+                }
+                if self.is_associative_array(row) {
+                    let fitted = self.fit_assoc_elem_val(row, val.clone());
+                    let changed = self.assoc_set_by_canon(row, canon, fitted);
+                    if changed {
+                        self.touch_queue(&base);
+                        self.touch_queue(row);
+                    }
+                    return changed;
+                }
+            }
             let changed = self.signals.get(&key).is_none_or(|p| *p != *val);
             if changed {
                 self.signals.insert(key, val.clone());
@@ -747,15 +774,25 @@ impl Simulator {
                 && me.assoc_missing_elem_value(&n).is_some()
         };
         if let Some(an) = self.expr_assoc_name(expr).filter(|_| !elem_bit(self)) {
+            if self.is_associative_array(&an) {
+                let Some(key) = self.eval_assoc_key(&an, index) else {
+                    self.warn_invalid_assoc_index(&an);
+                    return false;
+                };
+                let fitted = self.fit_assoc_elem_val(&an, val.clone());
+                let changed = self.assoc_set_scalar(&an, key, fitted);
+                if changed {
+                    self.touch_queue(&an);
+                }
+                return changed;
+            }
             let idx_val = self.eval_expr(index);
             let idx_str = self.assoc_key_str(&an, &idx_val);
             let elem_name = Self::name_with_key(&an, &idx_str);
             let is_fixed_array = self.module.arrays.contains_key(&an)
                 && !self.module.dynamic_arrays.contains(&an)
                 && !self.module.queue_vars.contains(&an);
-            if !self.is_associative_array(&an) && !is_fixed_array
-                && self.prepare_sequence_write(&an, &idx_val).is_none()
-            {
+            if !is_fixed_array && self.prepare_sequence_write(&an, &idx_val).is_none() {
                 return false;
             }
             // §10.7: fit to the DECLARED element width when one was
@@ -772,20 +809,11 @@ impl Simulator {
                 },
                 _ => self.fit_block_local_array_elem(&an, &elem_name, val.clone()),
             };
-            // The element takes its declared signedness, not the RHS's
-            // (`byte m[int]; m[k] = 8'hF0` is -16).
-            if let Some(sg) = self
-                .assoc_elem_signed(&an)
-                .filter(|_| !fitted.is_real && self.is_associative_array(&an))
-            {
-                fitted.is_signed = sg;
-            } else if !self.is_associative_array(&an) {
-                // §7.10/§10.7: a queue or dynamic-array element takes the
-                // element type (an `int unsigned` element of -1 is 2**32-1).
-                fitted = self.fit_queue_push_elem(&an, fitted);
-                if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
-                    fitted = self.fit_signed_class_coll_elem(&an, fitted);
-                }
+            // §7.10/§10.7: a queue or dynamic-array element takes the
+            // element type (an `int unsigned` element of -1 is 2**32-1).
+            fitted = self.fit_queue_push_elem(&an, fitted);
+            if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
+                fitted = self.fit_signed_class_coll_elem(&an, fitted);
             }
             let changed = self.signals.get(&elem_name) != Some(&fitted);
             self.signals.insert(elem_name, fitted);
@@ -1488,21 +1516,44 @@ impl Simulator {
                     }
                 }
             }
-            let idx_val = self.eval_expr(index);
-            // §7.8.2: an associative index containing x/z is invalid.
-            // The write is ignored (with a warning) — it must not fold
-            // the unknown bits away and clobber a real element.
-            if self.is_associative_array(&name) && idx_val.has_xz() {
-                self.warn_invalid_assoc_index(&name);
-                return false;
+            if self.is_associative_array(&name) {
+                let Some(key) = self.eval_assoc_key(&name, index) else {
+                    self.warn_invalid_assoc_index(&name);
+                    return false;
+                };
+                let elem_is_string = self.is_string_collection(&name);
+                let mut fitted = if elem_is_string || val.is_real {
+                    self.fit_assoc_elem_val(&name, val.clone())
+                } else {
+                    let fitted0 = self.fit_assoc_elem_val(&name, val.clone());
+                    let elem_name = format!("{}[{}]", name, key.to_canon_string());
+                    let mut fitted1 = self.fit_block_local_array_elem(&name, &elem_name, fitted0);
+                    if fitted1.has_xz() && self.is_assoc_elem_two_state(&name) {
+                        fitted1 = fitted1.to_two_state();
+                    }
+                    if let Some(sg) = self.assoc_elem_signed(&name) {
+                        fitted1.is_signed = sg;
+                    }
+                    fitted1
+                };
+                if val.is_real && !elem_is_string {
+                    if let Some(w) = self.assoc_store_ctx_width(&name) {
+                        fitted = Self::real_to_int(val.to_f64(), w);
+                        if let Some(sg) = self.assoc_elem_signed(&name) {
+                            fitted.is_signed = sg;
+                        }
+                    }
+                }
+                let changed = self.assoc_set_scalar(&name, key, fitted);
+                if changed {
+                    self.touch_queue(&name);
+                }
+                return changed;
             }
-            let idx_str = if self.is_associative_array(&name) {
-                self.assoc_key_str(&name, &idx_val)
-            } else {
-                idx_val.to_u64().unwrap_or(0).to_string()
-            };
+            let idx_val = self.eval_expr(index);
+            let idx_str = idx_val.to_u64().unwrap_or(0).to_string();
             // Check if this is an array element assignment
-            if self.module.arrays.contains_key(&*name) || self.is_associative_array(&name) {
+            if self.module.arrays.contains_key(&*name) {
                 // Compact-resolver fast path for 1D arrays: compute
                 // signal_id directly without `format!()` + HashMap
                 // lookup. Required for correctness now that 1D
@@ -1583,7 +1634,14 @@ impl Simulator {
                 // recorded width is only the elaborator's placeholder,
                 // and fitting to it would chop the text.
                 let elem_is_string = self.is_string_collection(&name);
-                let mut fitted = match self.assoc_elem_width(&name) {
+                let ew_opt = self.assoc_elem_width(&name).or_else(|| {
+                    self.module
+                        .arrays
+                        .get(&*name)
+                        .map(|t| t.2)
+                        .filter(|&w| w > 0)
+                });
+                let mut fitted = match ew_opt {
                     Some(w) if (w != val.width || val.is_fill) && !val.is_real && !elem_is_string => {
                         val.resize_for_assign(w)
                     }
@@ -1606,6 +1664,15 @@ impl Simulator {
                     !fitted.is_real && !elem_is_string && self.is_associative_array(&name)
                 }) {
                     fitted.is_signed = sg;
+                } else if !fitted.is_real && !elem_is_string && !self.is_associative_array(&name) {
+                    if let Some((_, is_signed, is_two_state)) = self.integral_queue_elem(&name) {
+                        if is_two_state && fitted.has_xz() {
+                            fitted = fitted.to_two_state();
+                        }
+                        fitted.is_signed = is_signed;
+                    } else if !fitted.is_signed && self.signed_class_coll(&name) {
+                        fitted = self.fit_signed_class_coll_elem(&name, fitted);
+                    }
                 } else if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&name) {
                     fitted = self.fit_signed_class_coll_elem(&name, fitted);
                 }

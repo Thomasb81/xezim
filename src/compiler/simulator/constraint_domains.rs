@@ -1231,11 +1231,9 @@ impl Simulator {
         for r in ranges {
             match r {
                 ConstraintRange::Value(e) => {
-                    if let Some(keys) = self.inside_operand_keys(e) {
-                        for key in keys {
-                            if let Some(ev) = self.get_signal_value_by_name(&key)
-                                && let Some(raw) = ev.to_u64()
-                            {
+                    if let Some(vals) = self.inside_operand_values(e) {
+                        for ev in vals {
+                            if let Some(raw) = ev.to_u64() {
                                 let b = Bound {
                                     expr: None,
                                     leaves: Vec::new(),

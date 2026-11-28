@@ -13,6 +13,13 @@ const REF_PIN_PREFIX: &str = "__xz_ref_obj";
 /// the class-scope name reaches the one shared cell from any scope (§8.9).
 const REF_STATIC_PREFIX: &str = "__xz_ref_static:";
 
+/// Alias storage prefix for a queue/dynamic-array element (`__xz_qref:<qname>\x1f<id>`),
+/// preserving `ref` element identity across `push_front`/`insert`/`pop`/`delete` (§7.10.3).
+pub(super) const REF_QELEM_PREFIX: &str = "__xz_qref:";
+
+/// Alias storage prefix for a scalar AA element (`__xz_aref:<aname>\x1f<canon_key>`).
+pub(super) const REF_AELEM_PREFIX: &str = "__xz_aref:";
+
 /// `Simulator::ref_park_flags`: a task bound a formal with select metadata.
 pub(super) const REF_PARK_META: u8 = 1;
 /// ... an aliased leaf of a `ref` struct formal.
@@ -67,6 +74,13 @@ impl Simulator {
         })
     }
 
+    /// Whether `storage` names an element of a fixed, dynamic, queue, or associative collection.
+    pub(super) fn is_ref_elem_storage(storage: &str) -> bool {
+        storage.ends_with(']')
+            || Self::qref_parts(storage).is_some()
+            || Self::aref_parts(storage).is_some()
+    }
+
     /// Whether `name` is a class-handle formal of the running frame aliased
     /// to one ELEMENT of an array (`st` bound to `s[3]`). The storage
     /// spelling `s[3]` is not a variable's name, so a member path through
@@ -77,7 +91,7 @@ impl Simulator {
         self.ref_alias_stack
             .last()
             .and_then(|m| m.get(name))
-            .is_some_and(|storage| storage.ends_with(']'))
+            .is_some_and(|storage| Self::is_ref_elem_storage(storage))
             && self.frame_class_handle(name).is_some()
     }
 
@@ -202,7 +216,7 @@ impl Simulator {
             .last()
             .map(|m| {
                 m.iter()
-                    .filter(|(_, s)| s.ends_with(']'))
+                    .filter(|(_, s)| Self::is_ref_elem_storage(s))
                     .map(|(k, _)| k.clone())
                     .collect()
             })
@@ -241,21 +255,56 @@ impl Simulator {
         {
             return;
         }
-        let iv = self.eval_expr(index);
-        if iv.has_xz() {
+        let Some(key) = self.eval_assoc_key(bname, index) else {
+            return;
+        };
+        if self
+            .assoc_tables
+            .get(bname)
+            .is_some_and(|t| t.entries.contains_key(&key))
+        {
             return;
         }
-        let cell = format!("{}[{}]", bname, self.assoc_key_str(bname, &iv));
+        let cell = format!("{}[{}]", bname, key.to_canon_string());
         if self.signals.contains_key(&cell) || self.signal_name_to_id.contains_key(cell.as_str()) {
             return;
         }
         let v = self.eval_expr(arg);
-        self.assign_value(arg, &v);
+        let fitted = self.fit_assoc_elem_val(bname, v);
+        self.assoc_set_scalar(bname, key, fitted);
+    }
+
+    fn qref_parts(storage: &str) -> Option<(&str, u64)> {
+        let rest = storage.strip_prefix(REF_QELEM_PREFIX)?;
+        let (qname, id_str) = rest.split_once('\x1f')?;
+        Some((qname, id_str.parse::<u64>().ok()?))
+    }
+
+    fn aref_parts(storage: &str) -> Option<(&str, &str)> {
+        storage.strip_prefix(REF_AELEM_PREFIX)?.split_once('\x1f')
+    }
+
+    fn qref_live_cell(&self, qname: &str, id: u64) -> Option<String> {
+        let pos = self
+            .queue_elem_ids
+            .get(qname)?
+            .iter()
+            .position(|&x| x == id)?;
+        Some(format!("{}[{}]", qname, pos))
     }
 
     /// Current value of an aliased formal's storage, read without running
     /// any code (`&self` paths: a method receiver, a member write's handle).
     pub(super) fn ref_alias_peek(&self, storage: &str) -> Option<Value> {
+        if let Some((qname, id)) = Self::qref_parts(storage) {
+            if let Some(cell) = self.qref_live_cell(qname, id) {
+                return self.get_signal_value_by_name(&cell);
+            }
+            return self.detached_qref_vals.get(&id).cloned();
+        }
+        if let Some((aname, canon)) = Self::aref_parts(storage) {
+            return self.assoc_get_by_canon(aname, canon);
+        }
         if let Some((class, prop)) = Self::ref_static_parts(storage) {
             let key = self.static_prop_key(class, prop)?;
             return self.class_statics.get(&key).cloned();
@@ -272,6 +321,9 @@ impl Simulator {
 
     /// §13.5.2: read the storage an aliased `ref` formal names.
     pub(super) fn ref_alias_read(&mut self, storage: &str) -> Option<Value> {
+        if Self::qref_parts(storage).is_some() || Self::aref_parts(storage).is_some() {
+            return self.ref_alias_peek(storage);
+        }
         // A pinned instance property is read straight from its object.
         if Self::ref_pin_parts(storage).is_some() {
             return self.ref_alias_peek(storage);
@@ -288,6 +340,37 @@ impl Simulator {
     /// §13.5.2: write the storage an aliased `ref` formal names; true when
     /// the value changed.
     pub(super) fn ref_alias_write(&mut self, storage: &str, val: &Value) -> bool {
+        if let Some((qname, id)) = Self::qref_parts(storage) {
+            if let Some(cell) = self.qref_live_cell(qname, id) {
+                let prev = self.get_signal_value_by_name(&cell);
+                let fitted = self.fit_queue_push_elem(qname, val.clone());
+                let changed = prev.as_ref() != Some(&fitted);
+                self.set_signal_value_by_name(&cell, fitted);
+                if changed {
+                    self.touch_queue(qname);
+                }
+                return changed;
+            }
+            let prev = self.detached_qref_vals.get(&id).cloned();
+            let fitted = self.fit_queue_push_elem(qname, val.clone());
+            let changed = prev.as_ref() != Some(&fitted);
+            self.detached_qref_vals.insert(id, fitted);
+            return changed;
+        }
+        if let Some((aname, canon)) = Self::aref_parts(storage) {
+            let fitted = self.fit_assoc_elem_val(aname, val.clone());
+            let key = self
+                .assoc_tables
+                .get(aname)
+                .and_then(|t| t.entries.keys().find(|k| k.to_canon_string() == canon).cloned());
+            if let Some(ak) = key {
+                let changed = self.assoc_set_scalar(aname, ak, fitted);
+                if changed {
+                    self.touch_queue(aname);
+                }
+                return changed;
+            }
+        }
         if let Some((h, prop)) = Self::ref_pin_parts(storage) {
             let prop = prop.to_string();
             let changed = self.set_prop_if_changed(h, &prop, val.clone());
@@ -462,6 +545,11 @@ impl Simulator {
                 return None;
             }
             let cell = format!("{store}[{idx}]");
+            if class.queue_properties.contains_key(member) {
+                let sz = size.unwrap_or_else(|| self.get_queue_size(&store)) as usize;
+                let id = self.ensure_queue_elem_ids(&store, sz)[idx as usize];
+                return Some(format!("{}{}\x1f{}", REF_QELEM_PREFIX, store, id));
+            }
             return self.get_signal_value_by_name(&cell).map(|_| cell);
         }
         let (handle, prop): (usize, &str) = match &arg.kind {
@@ -650,6 +738,13 @@ impl Simulator {
 
     fn ref_storage_owner(storage: &str) -> Option<usize> {
         Self::ref_pin_parts(storage).map(|(handle, _)| handle).or_else(|| {
+            if let Some(store) = Self::qref_parts(storage)
+                .map(|(q, _)| q)
+                .or_else(|| Self::aref_parts(storage).map(|(a, _)| a))
+            {
+                let (handle, _) = store.split_once('#')?;
+                return handle.parse().ok();
+            }
             let (handle, member) = storage.split_once('#')?;
             member.ends_with(']').then(|| handle.parse().ok()).flatten()
         })

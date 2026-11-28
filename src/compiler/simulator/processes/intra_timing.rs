@@ -524,13 +524,7 @@ impl Simulator {
                     );
                     items.push(AssignmentPatternItem::Keyed(key_value, value));
                 }
-                let default = self.class_assoc_defaults.get(name).cloned().or_else(|| {
-                    self.module
-                        .assoc_defaults
-                        .get(name)
-                        .cloned()
-                        .map(|e| self.eval_expr(&e))
-                });
+                let default = self.assoc_default_val(name);
                 if let Some(default) = default {
                     items.push(AssignmentPatternItem::Default(
                         self.value_method_arg_expr(&default),

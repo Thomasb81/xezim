@@ -78,19 +78,35 @@ impl Simulator {
             }
             found?
         } else {
+            let static_member_dt = name.rsplit_once("::").and_then(|(head, member)| {
+                let mut cur = head.split_once('#').map(|(c, _)| c).unwrap_or(head);
+                let member = member.split('[').next().unwrap_or(member);
+                for _ in 0..32 {
+                    let cd = self.module.classes.get(cur)?;
+                    if let Some(dt) = cd.property_types.get(member) {
+                        return Some(dt);
+                    }
+                    cur = cd.extends.as_deref()?;
+                }
+                None
+            });
             let leaf = name.rsplit('.').next().unwrap_or(name);
-            self.module
-                .var_decl_types
-                .get(name)
-                .or_else(|| self.module.var_decl_types.get(leaf))
-                // §7.4.5: an element array of an array of associative arrays
-                // (`v[0]` of `int v[2][string][string]`) has the root's type.
-                .or_else(|| {
-                    let root = name.split('[').next().unwrap_or(name);
-                    (root.len() < name.len() && !root.contains('.'))
-                        .then(|| self.module.var_decl_types.get(root))
-                        .flatten()
-                })?
+            match static_member_dt {
+                Some(dt) => dt,
+                None => self
+                    .module
+                    .var_decl_types
+                    .get(name)
+                    .or_else(|| self.module.var_decl_types.get(leaf))
+                    // §7.4.5: an element array of an array of associative arrays
+                    // (`v[0]` of `int v[2][string][string]`) has the root's type.
+                    .or_else(|| {
+                        let root = name.split('[').next().unwrap_or(name);
+                        (root.len() < name.len() && !root.contains('.'))
+                            .then(|| self.module.var_decl_types.get(root))
+                            .flatten()
+                    })?,
+            }
         };
         // §7.2.1: a packed struct or union is one integral value too.
         matches!(
@@ -197,7 +213,29 @@ impl Simulator {
         if self.coll_elem_is_real(name) {
             return Some(Value::from_f64(0.0));
         }
-        let dt = self.assoc_elem_decl_type(name)?;
+        let Some(dt) = self.assoc_elem_decl_type(name) else {
+            if let Some((w, signed, two_state)) = self.integral_queue_elem(name) {
+                let mut v = if two_state {
+                    Value::zero(w.max(1))
+                } else {
+                    Value::new(w.max(1))
+                };
+                v.is_signed = signed;
+                return Some(v);
+            }
+            if self.module.two_state_signals.contains(name) {
+                let w = self
+                    .assoc_elem_width(name)
+                    .or_else(|| self.module.arrays.get(name).map(|a| a.2))
+                    .or_else(|| self.widths.get(name).copied())
+                    .unwrap_or(32)
+                    .max(1);
+                let mut v = Value::zero(w);
+                v.is_signed = self.signed_signals.contains(name);
+                return Some(v);
+            }
+            return None;
+        };
         let four_state = match self.resolve_dt_ref(dt) {
             DataType::IntegerVector { kind, .. } => !matches!(kind, IVT::Bit),
             DataType::IntegerAtom { kind, .. } => matches!(kind, IAT::Integer | IAT::Time),
@@ -343,7 +381,9 @@ impl Simulator {
         if elem.is_some_and(|dt| matches!(self.resolve_dt_ref(&dt), DataType::Real { .. })) {
             return None;
         }
-        self.assoc_elem_width(name).filter(|&w| w > 0)
+        self.assoc_elem_width(name)
+            .or_else(|| self.module.arrays.get(name).map(|t| t.2))
+            .filter(|&w| w > 0)
     }
 
     /// §7.8, §7.4.6, §11.5.1: a select past the unpacked dimensions of an
@@ -713,20 +753,16 @@ impl Simulator {
         // Every remaining branch needs a `#` (scoped member) or a trailing
         // `]` (nested element): one byte scan replaces up to three char
         // searches, a second map probe and a `format!` on the hot path.
-        if !name.ends_with(']') && !name.as_bytes().contains(&b'#') {
+        if !name.ends_with(']') && !name.as_bytes().contains(&b'#') && !name.as_bytes().contains(&b':')
+        {
             return false;
         }
-        // parameterized assoc array read 0 / garbage (`first()` dropped the
-        // whole store). Confirm the member after the last `::` is a
-        // registered static assoc array of the class before the `#`.
-        // NB: this is distinct from an INSTANCE member store `handle#member`
-        // (numeric handle, no `::`), handled by the `#` branch above.
-        if let Some((head, member)) = name.split_once('#')
-            && let Some((_, member2)) = member.rsplit_once("::")
-            && self.member_is_static_coll(head, member2)
-            && self.module.associative_arrays.contains_key(member2)
-        {
-            return true;
+        // Static class associative arrays (`Class#spec::member` or `Class::member`).
+        if let Some((head, member2)) = name.rsplit_once("::") {
+            let cls = head.split_once('#').map(|(c, _)| c).unwrap_or(head);
+            if self.member_is_static_assoc(cls, member2) {
+                return true;
+            }
         }
         // Per-instance class member: `<handle>#<member>`.
         if let Some(pos) = name.find('#') {
@@ -920,6 +956,7 @@ impl Simulator {
             return ready;
         }
         let dims = shape.dims.clone();
+        let queue_bounds = shape.queue_bounds.clone();
         // The path's prefixes, outermost first: `m`, `m[k1]`, ..., `name`.
         let mut ends = Vec::with_capacity(depth + 1);
         let mut end = name.len();
@@ -961,7 +998,31 @@ impl Simulator {
                     }
                 }
                 Dim::Fixed(Some(bounds)) if !Self::within(idx, *bounds) => return false,
-                Dim::Assoc(_) | Dim::Fixed(_) => {}
+                Dim::Assoc(kk) => {
+                    let ak = match kk {
+                        KeyKind::String => super::assoc_store::AssocKey::Str(
+                            decode_name_key(idx).into_owned(),
+                        ),
+                        KeyKind::Integral { signed: true, .. } => {
+                            if let Ok(v) = idx.parse::<i64>() {
+                                super::assoc_store::AssocKey::Int64(v)
+                            } else {
+                                super::assoc_store::AssocKey::Str(idx.to_string())
+                            }
+                        }
+                        _ => {
+                            if let Ok(v) = idx.parse::<u64>() {
+                                super::assoc_store::AssocKey::UInt64(v)
+                            } else if let Ok(v) = idx.parse::<i64>() {
+                                super::assoc_store::AssocKey::Int64(v)
+                            } else {
+                                super::assoc_store::AssocKey::Str(idx.to_string())
+                            }
+                        }
+                    };
+                    self.assoc_mark_compound(parent, ak, row.to_string());
+                }
+                Dim::Fixed(_) => {}
             }
             if registered && !fresh {
                 continue;
@@ -969,6 +1030,8 @@ impl Simulator {
             // A new row starts empty, whatever an earlier row at this index
             // left behind (`q.delete(); q[0][7] = 2` holds only key 7).
             if fresh {
+                self.assoc_clear(row, true);
+                self.assoc_tables.remove(row);
                 for key in self.signals.keys_with_elem_prefix(&format!("{row}[")) {
                     self.signals.remove(&key);
                     self.widths.remove(&key);
@@ -977,10 +1040,16 @@ impl Simulator {
             match dims.get(level) {
                 Some(Dim::Queue | Dim::Dyn) => {
                     self.module.dynamic_arrays.insert(row.to_string());
+                    if matches!(dims.get(level), Some(Dim::Queue)) {
+                        self.module.queue_vars.insert(row.to_string());
+                    }
+                    if let Some(&(_, max)) = queue_bounds.iter().find(|&&(d, _)| d == level) {
+                        self.module.queue_max_sizes.insert(row.to_string(), max);
+                    }
                     self.module
                         .arrays
                         .entry(row.to_string())
-                        .or_insert((0, 63, w));
+                        .or_insert((0, -1, w));
                     // An unregistered row that already has a size (a copied
                     // object's) keeps it.
                     if fresh
@@ -2216,10 +2285,8 @@ impl Simulator {
         // the instance `##` branch below — so without this it fell into the
         // NUMERIC branch of `assoc_key_str` and stored string keys as hashed
         // integers (consistent for /set/get but corrupting foreach()).
-        if let Some((head, member)) = name.split_once('#')
-            && let Some((_, member2)) = member.rsplit_once("::")
-            && let Some(cls) = head.split_once('#').map(|(c, _)| c).or(Some(head))
-        {
+        if let Some((head, member2)) = name.rsplit_once("::") {
+            let cls = head.split_once('#').map(|(c, _)| c).unwrap_or(head);
             if self.static_member_is_string_keyed(cls, member2) {
                 return true;
             }
@@ -2612,6 +2679,11 @@ impl Simulator {
             while let Some(c) = cur {
                 if let Some(cd) = self.module.classes.get(&c) {
                     if let Some(&iw) = cd.assoc_index_props.get(member) {
+                        if let Some(kt) = cd.assoc_key_types.get(member)
+                            && cd.type_param_names.contains(kt)
+                        {
+                            return None;
+                        }
                         return Some(iw);
                     }
                     cur = cd.extends.clone();
@@ -2715,6 +2787,17 @@ impl Simulator {
     /// `assoc_top_level_keys`, shared and cached: `first`/`next`/`num` in a
     /// loop over an unchanged array no longer rescan and re-sort every key.
     pub(super) fn assoc_top_level_keys_shared(&self, obj_name: &str) -> Arc<Vec<String>> {
+        if let Some(table) = self.assoc_tables.get(obj_name)
+            && !table.entries.is_empty()
+        {
+            return Arc::new(
+                table
+                    .entries
+                    .keys()
+                    .map(super::assoc_store::AssocKey::to_canon_string)
+                    .collect(),
+            );
+        }
         let prefix = format!("{}[", obj_name);
         let stamp = self.signals.elem_gen_for_prefix(&prefix);
         if let Some((s, keys)) = self.assoc_keys_cache.borrow().get(obj_name) {
@@ -2862,6 +2945,11 @@ impl Simulator {
         expr: &Expression,
         base: &Expression,
     ) -> Expression {
+        if let Some(dt) = self.assoc_struct_key_type_for_expr(base) {
+            return self
+                .freeze_struct_key_expr(expr, &dt)
+                .unwrap_or_else(|| Expression::new(ExprKind::AssignmentPattern(Vec::new()), expr.span));
+        }
         // §7.10: `$` belongs to the selected collection, for both index
         // expressions and range bounds, including `q[$ - f()]`.
         let bound = Self::expr_contains_dollar(expr)
@@ -3183,6 +3271,20 @@ impl Simulator {
                 return Some(v);
             }
         }
+        if !self.assoc_tables.is_empty()
+            && name.ends_with(']')
+            && let Some((base, rest)) = name.rsplit_once('[')
+        {
+            let canon = &rest[..rest.len() - 1];
+            if let Some(table) = self.assoc_tables.get(base)
+                && let Some((_, super::assoc_store::AssocEntry::Scalar(v))) = table
+                    .entries
+                    .iter()
+                    .find(|(k, _)| k.to_canon_string() == canon)
+            {
+                return Some(v.clone());
+            }
+        }
         let mut v = match self.signals.get(name).cloned() {
             Some(v) => v,
             None => {
@@ -3352,6 +3454,31 @@ impl Simulator {
         // that is under an active force / procedural continuous assign.
         if self.forced_names.contains(name) {
             return;
+        }
+        if name.ends_with(']')
+            && let Some((base, rest)) = name.rsplit_once('[')
+        {
+            let canon = &rest[..rest.len() - 1];
+            let is_compound = self
+                .assoc_tables
+                .get(base)
+                .is_some_and(|t| {
+                    t.entries.iter().any(|(k, e)| {
+                        k.to_canon_string() == canon
+                            && matches!(e, super::assoc_store::AssocEntry::Compound(_))
+                    })
+                });
+            if !base.is_empty()
+                && (self.is_associative_array(base) || self.assoc_tables.contains_key(base))
+                && !self.is_associative_array(name)
+                && !self.module.dynamic_arrays.contains(name)
+                && !is_compound
+                && self.queue_elem_struct(base).is_none()
+            {
+                self.assoc_set_by_canon(base, canon, val);
+                self.touch_queue(base);
+                return;
+            }
         }
         // A queue/dynamic-array ELEMENT (or element member) lives only in the
         // runtime map — mark the queue's `.size` comb proxy dirty so readers
@@ -3591,6 +3718,13 @@ impl Simulator {
         if raw > 1 << 26 { 0 } else { raw }
     }
 
+    pub(super) fn queue_max_size_for(&self, name: &str) -> Option<u32> {
+        self.module.queue_max_sizes.get(name).copied().or_else(|| {
+            self.coll_shape_at(name)
+                .and_then(|(shape, depth)| shape.queue_max_size_at(depth))
+        })
+    }
+
     /// Check a sequence element write before touching its backing store. Queues
     /// append only at their current size (IEEE 1800-2023 §7.10.1).
     pub(super) fn prepare_sequence_write(&mut self, name: &str, index: &Value) -> Option<i64> {
@@ -3600,7 +3734,9 @@ impl Simulator {
             return i;
         }
         if self.is_queue_store(name) {
-            let room = self.module.queue_max_sizes.get(name).is_none_or(|&max| size < u64::from(max));
+            let room = self
+                .queue_max_size_for(name)
+                .is_none_or(|max| size < u64::from(max));
             if i == Some(size as i64) && room {
                 self.set_queue_size(name, size + 1);
                 return i;
@@ -3638,7 +3774,7 @@ impl Simulator {
     pub(super) fn set_queue_size(&mut self, obj_name: &str, size: u64) {
         let requested = size;
         // §7.10.5: an assignment or method drops elements above the bound.
-        let size = if let Some(&max) = self.module.queue_max_sizes.get(obj_name)
+        let size = if let Some(max) = self.queue_max_size_for(obj_name)
             && size > u64::from(max)
         {
             eprintln!(
@@ -3704,6 +3840,13 @@ impl Simulator {
         if let Some(&id) = self.signal_name_to_id.get(key.as_str()) {
             self.mark_dirty_id(id);
             self.dirty_any = true;
+        }
+        if let Some((root, _)) = obj_name.split_once('[') {
+            let rkey = Self::name_with_suffix(root, ".size");
+            if let Some(&id) = self.signal_name_to_id.get(rkey.as_str()) {
+                self.mark_dirty_id(id);
+                self.dirty_any = true;
+            }
         }
     }
 
@@ -4534,6 +4677,16 @@ impl Simulator {
         {
             return ((0..sz).map(|i| i.to_string()).collect(), false);
         }
+        let is_str = self
+            .module
+            .associative_arrays
+            .get(name)
+            .copied()
+            .unwrap_or(false)
+            || self.is_string_keyed_array(name);
+        if self.is_associative_array(name) || self.assoc_tables.contains_key(name) {
+            return (self.assoc_top_level_keys(name), is_str);
+        }
         let prefix = format!("{}[", name);
         let mut ks: Vec<String> = self
             .signals
@@ -4545,13 +4698,6 @@ impl Simulator {
             .collect();
         ks.sort();
         ks.dedup();
-        let is_str = self
-            .module
-            .associative_arrays
-            .get(name)
-            .copied()
-            .unwrap_or(false)
-            || self.is_string_keyed_array(name);
         if is_str {
             Self::sort_name_keys(&mut ks);
         } else {
@@ -5041,6 +5187,7 @@ impl Simulator {
         self.module.assoc_key_type_names.remove(key);
         self.module.assoc_defaults.remove(key);
         self.class_assoc_defaults.remove(key);
+        self.assoc_tables.remove(key);
         self.module.queue_max_sizes.remove(key);
         self.module.queue_vars.remove(key);
         self.module.unpacked_decl_dims.remove(key);
@@ -5125,6 +5272,7 @@ impl Simulator {
                 queue_max: self.module.queue_max_sizes.remove(name),
                 width: self.widths.get(name).copied(),
                 assoc_entry: self.module.associative_arrays.remove(name),
+                assoc_table: self.assoc_tables.remove(name),
             }
         } else {
             QueueLocalSave {
@@ -5135,6 +5283,7 @@ impl Simulator {
                 queue_max: self.module.queue_max_sizes.get(name).copied(),
                 width: self.widths.get(name).copied(),
                 assoc_entry: self.module.associative_arrays.get(name).copied(),
+                assoc_table: self.assoc_tables.get(name).cloned(),
             }
         };
         let mut key = self.queue_name_pool.pop().unwrap_or_default();
@@ -5251,6 +5400,7 @@ impl Simulator {
                 queue_max,
                 width,
                 assoc_entry,
+                assoc_table,
             } = save;
             for (k, v) in signals {
                 self.signals.insert(k, v);
@@ -5298,6 +5448,14 @@ impl Simulator {
                 }
                 None => {
                     self.module.associative_arrays.remove(&name);
+                }
+            }
+            match assoc_table {
+                Some(t) => {
+                    self.assoc_tables.insert(name.clone(), t);
+                }
+                None => {
+                    self.assoc_tables.remove(&name);
                 }
             }
             if self.queue_name_pool.len() < 64 {

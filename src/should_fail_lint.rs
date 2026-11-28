@@ -2717,7 +2717,7 @@ fn check_unpacked_dims(
                     ));
                 } else {
                     match scope.fold(bound) {
-                        Folded::Value(v) if v < 0 => errs.push(format!(
+                        Folded::Value(v) if v <= 0 => errs.push(format!(
                             "queue '{}' bound must be positive (LRM 1800-2017 §7.10)",
                             name
                         )),

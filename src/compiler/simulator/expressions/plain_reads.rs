@@ -1072,7 +1072,15 @@ impl Simulator {
         if self.is_associative_array(&name) {
             let keys = self.assoc_top_level_keys_shared(&name);
             let found = handles
-                .then(|| keys.iter().find(|k| live(self, &format!("{name}[{k}]"))))
+                .then(|| {
+                    keys.iter().find(|k| {
+                        self.assoc_get_by_canon(&name, k)
+                            .and_then(|v| v.to_u64())
+                            .is_some_and(|h| {
+                                h != 0 && self.heap.get(h as usize).is_some_and(|o| o.is_some())
+                            })
+                    })
+                })
                 .flatten();
             let Some(key) = found.or(keys.first()) else {
                 return zero();

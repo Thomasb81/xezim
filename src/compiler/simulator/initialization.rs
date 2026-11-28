@@ -3358,6 +3358,11 @@ impl Simulator {
         let mut named_elem_count: usize = 0;
         let mut packed_reserve_bytes: usize = 0;
         for (name, &(lo, hi, w)) in module.arrays.iter() {
+            if module.dynamic_arrays.contains(name.as_str())
+                || module.queue_vars.contains(name.as_str())
+            {
+                continue;
+            }
             let count = (hi - lo + 1).max(0) as usize;
             check_array_size(name, count);
             if can_pack_array(name.as_str(), count, w) {
@@ -3371,6 +3376,11 @@ impl Simulator {
             }
         }
         for (name, &((lo1, hi1), (lo2, hi2), w)) in module.arrays_2d.iter() {
+            if module.dynamic_arrays.contains(name.as_str())
+                || module.queue_vars.contains(name.as_str())
+            {
+                continue;
+            }
             let d1 = (hi1 - lo1 + 1).max(0) as usize;
             let d2 = (hi2 - lo2 + 1).max(0) as usize;
             let count = d1.saturating_mul(d2);
@@ -3386,6 +3396,11 @@ impl Simulator {
             }
         }
         for (name, (shape, w)) in module.arrays_nd.iter() {
+            if module.dynamic_arrays.contains(name.as_str())
+                || module.queue_vars.contains(name.as_str())
+            {
+                continue;
+            }
             let count = shape.iter().fold(1usize, |acc, &(lo, hi)| {
                 acc.saturating_mul((hi - lo + 1).max(0) as usize)
             });
@@ -3497,7 +3512,15 @@ impl Simulator {
             std::collections::HashSet::default();
         let mut packed_cells: usize = 0;
         for (base, &(lo, hi, w)) in arrays_sorted {
+            if module.dynamic_arrays.contains(base.as_str())
+                || module.queue_vars.contains(base.as_str())
+            {
+                continue;
+            }
             let count = (hi - lo + 1).max(0) as usize;
+            if count == 0 {
+                continue;
+            }
             let _oom_array = trace_array_storage(base, count, w);
             if mem_census && count > 0 {
                 census.push((base.clone(), count, w));
@@ -3740,7 +3763,15 @@ impl Simulator {
             module.arrays_2d.iter().collect();
         arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
+            if module.dynamic_arrays.contains(base.as_str())
+                || module.queue_vars.contains(base.as_str())
+            {
+                continue;
+            }
             let count = ((hi1 - lo1 + 1).max(0) as usize).saturating_mul((hi2 - lo2 + 1).max(0) as usize);
+            if count == 0 {
+                continue;
+            }
             let _oom_array = trace_array_storage(base, count, w);
             let shape = vec![(lo1, hi1), (lo2, hi2)];
             let (elem_dt, elem_signed, ts_base) = elem_decl_traits(base.as_str());
@@ -3826,9 +3857,17 @@ impl Simulator {
             module.arrays_nd.iter().collect();
         arrays_nd_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, (shape, w)) in arrays_nd_sorted {
+            if module.dynamic_arrays.contains(base.as_str())
+                || module.queue_vars.contains(base.as_str())
+            {
+                continue;
+            }
             let count = shape.iter().fold(1usize, |count, &(lo, hi)| {
                 count.saturating_mul((hi - lo + 1).max(0) as usize)
             });
+            if count == 0 {
+                continue;
+            }
             let _oom_array = if xezim_core::oom_trace::enabled() {
                 Some(trace_array_storage(base, count, *w))
             } else {
@@ -4581,6 +4620,7 @@ impl Simulator {
             sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
+            sva_preponed_names: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
             sva_abort_step: false,
@@ -5662,6 +5702,10 @@ impl Simulator {
             has_modclass: std::cell::Cell::new(None),
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
             assoc_keys_cache: RefCell::new(HashMap::default()),
+            assoc_tables: HashMap::default(),
+            queue_elem_ids: HashMap::default(),
+            detached_qref_vals: HashMap::default(),
+            next_qref_id: 1,
             sampled_watches: Vec::new(),
             sampled_defaults: HashMap::default(),
             time0_settled: false,

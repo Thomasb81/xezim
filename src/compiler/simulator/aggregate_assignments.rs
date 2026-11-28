@@ -473,13 +473,7 @@ impl Simulator {
         val_w: u32,
         items: &[AssignmentPatternItem],
     ) {
-        for k in self
-            .signals
-            .keys_with_elem_prefix(&Self::name_with_suffix(scoped, "["))
-        {
-            self.signals.remove(&k);
-        }
-        self.class_assoc_defaults.remove(scoped);
+        self.assoc_clear(scoped, true);
         let elem_dt = self
             .class_member_coll_type(scoped)
             .cloned()
@@ -507,19 +501,35 @@ impl Simulator {
                             &self.module.typedef_types,
                         );
                     }
-                    self.class_assoc_defaults.insert(scoped.to_string(), v);
+                    self.class_assoc_defaults.insert(scoped.to_string(), v.clone());
+                    self.assoc_tables
+                        .entry(scoped.to_string())
+                        .or_default()
+                        .evaluated_default = Some(v);
                 }
                 continue;
             }
             let Some(k) = self.array_pattern_key(item) else {
                 continue;
             };
-            let kv = self.eval_expr(&k);
-            let key = self.assoc_key_str(scoped, &kv);
-            let target = Self::name_with_key(scoped, &key);
+            let Some(key) = self.eval_assoc_key(scoped, &k) else {
+                continue;
+            };
+            let target = Self::name_with_key(scoped, &key.to_canon_string());
             match &elem_dt {
-                Some(dt) => self.assign_pattern_or_leaf(&target, dt, item.expr()),
-                None => self.pattern_leaf_at_elem_width(&target, item.expr(), val_w),
+                Some(dt) => {
+                    self.assign_pattern_or_leaf(&target, dt, item.expr());
+                    self.assoc_mark_compound(scoped, key, target);
+                }
+                None => {
+                    let v = if val_w > 0 {
+                        self.eval_expr_ctx(item.expr(), val_w)
+                    } else {
+                        self.eval_expr(item.expr())
+                    };
+                    let fitted = self.fit_assoc_elem_val(scoped, v);
+                    self.assoc_set_scalar(scoped, key, fitted);
+                }
             }
         }
     }
@@ -773,25 +783,49 @@ impl Simulator {
         match &self.unpacked_pattern(e).kind {
             ExprKind::AssignmentPattern(items) => {
                 if is_assoc {
-                    self.eval_builtin_method(name, "delete", &[]);
-                    self.module.assoc_defaults.remove(name);
+                    self.assoc_clear(name, true);
+                    let compound = elem_dt.is_some_and(|dt| {
+                        let r = self.resolve_dt_ref(dt);
+                        matches!(r, DataType::Struct(su) if Self::spreads_member_wise(su))
+                    }) || self
+                        .coll_shape_at(name)
+                        .is_some_and(|(shape, depth)| depth + 1 < shape.dims.len());
                     for item in items {
                         if let AssignmentPatternItem::Default(d) = item {
-                            self.module
-                                .assoc_defaults
-                                .insert(name.to_string(), d.clone());
+                            let v = if elem_w > 0 {
+                                self.eval_expr_ctx(d, elem_w)
+                            } else {
+                                self.eval_expr(d)
+                            };
+                            let fitted = self.fit_assoc_elem_val(name, v);
+                            self.assoc_tables
+                                .entry(name.to_string())
+                                .or_default()
+                                .evaluated_default = Some(fitted);
                             continue;
                         }
                         let Some(k) = self.array_pattern_key(item) else {
                             continue;
                         };
-                        let kv = self.eval_expr(&k);
-                        let key = self.assoc_key_str(name, &kv);
-                        let cell = format!("{}[{}]", name, key);
+                        let Some(key) = self.eval_assoc_key(name, &k) else {
+                            continue;
+                        };
+                        let cell = format!("{}[{}]", name, key.to_canon_string());
                         let v = item.expr();
-                        match elem_dt {
-                            Some(dt) => self.assign_pattern_or_leaf(&cell, dt, v),
-                            None => self.pattern_leaf_at_elem_width(&cell, v, elem_w),
+                        if compound {
+                            match elem_dt {
+                                Some(dt) => self.assign_pattern_or_leaf(&cell, dt, v),
+                                None => self.pattern_leaf_at_elem_width(&cell, v, elem_w),
+                            }
+                            self.assoc_mark_compound(name, key, cell);
+                        } else {
+                            let val = if elem_w > 0 {
+                                self.eval_expr_ctx(v, elem_w)
+                            } else {
+                                self.eval_expr(v)
+                            };
+                            let fitted = self.fit_assoc_elem_val(name, val);
+                            self.assoc_set_scalar(name, key, fitted);
                         }
                     }
                     if !items.is_empty() {
@@ -1017,7 +1051,50 @@ impl Simulator {
     }
 
     pub(super) fn copy_assoc_entries(&mut self, dst: &str, src: &str) {
-        self.eval_builtin_method(dst, "delete", &[]);
+        self.assoc_clear(dst, true);
+        // Propagate key/element metadata onto `dst` when `dst` is a snapshot/nested element.
+        if !self.module.associative_arrays.contains_key(dst)
+            && let Some(&is_str) = self.module.associative_arrays.get(src)
+        {
+            self.module
+                .associative_arrays
+                .insert(dst.to_string(), is_str);
+        }
+        if !self.module.assoc_index_widths.contains_key(dst)
+            && let Some(&iw) = self.module.assoc_index_widths.get(src)
+        {
+            self.module.assoc_index_widths.insert(dst.to_string(), iw);
+        }
+        if !self.module.assoc_elem_widths.contains_key(dst)
+            && let Some(&ew) = self.module.assoc_elem_widths.get(src)
+        {
+            self.module.assoc_elem_widths.insert(dst.to_string(), ew);
+        }
+        if !self.module.assoc_key_type_names.contains_key(dst)
+            && let Some(kt) = self.module.assoc_key_type_names.get(src).cloned()
+        {
+            self.module.assoc_key_type_names.insert(dst.to_string(), kt);
+        }
+        if self.module.wildcard_assoc_arrays.contains(src) {
+            self.module.wildcard_assoc_arrays.insert(dst.to_string());
+        }
+        if !self.module.assoc_key_struct_types.contains_key(dst)
+            && let Some(ks) = self.module.assoc_key_struct_types.get(src).cloned()
+        {
+            self.module
+                .assoc_key_struct_types
+                .insert(dst.to_string(), ks);
+        }
+        if !self.module.two_state_signals.contains(dst)
+            && self.module.two_state_signals.contains(src)
+        {
+            self.module.two_state_signals.insert(dst.to_string());
+        }
+        if !self.module.var_decl_types.contains_key(dst)
+            && let Some(dt) = self.module.var_decl_types.get(src).cloned()
+        {
+            self.module.var_decl_types.insert(dst.to_string(), dt);
+        }
         // §7.9.9: every element, including the member leaves of an
         // unpacked-struct element (`src[k].x`), which do not end in `]`.
         let prefix = format!("{}[", src);
@@ -1030,7 +1107,7 @@ impl Simulator {
                 Some((format!("{}{}", dst, &k[src.len()..]), v))
             })
             .collect();
-        let any = !entries.is_empty();
+        let sig_any = !entries.is_empty();
         // §7.4.5: each copied row is a collection of its own; create it as
         // declared (creating empties it, so before its cells land).
         for (k, _) in &entries {
@@ -1046,7 +1123,131 @@ impl Simulator {
         if let Some(d) = self.module.assoc_defaults.get(src).cloned() {
             self.module.assoc_defaults.insert(dst.to_string(), d);
         }
-        if any {
+        if let Some(d) = self.class_assoc_defaults.get(src).cloned() {
+            self.class_assoc_defaults.insert(dst.to_string(), d);
+        }
+        let mut table_any = false;
+        if let Some(src_table) = self.assoc_tables.get(src).cloned() {
+            let mut dst_entries = std::collections::BTreeMap::new();
+            table_any = !src_table.entries.is_empty();
+            for (ak, entry) in src_table.entries {
+                match entry {
+                    super::assoc_store::AssocEntry::Scalar(v) => {
+                        dst_entries.insert(ak, super::assoc_store::AssocEntry::Scalar(v));
+                    }
+                    super::assoc_store::AssocEntry::Compound(_) => {
+                        let dst_prefix = format!("{dst}[{}]", ak.to_canon_string());
+                        if !self.signals.contains_key(&dst_prefix) {
+                            self.signals.insert(dst_prefix.clone(), Value::zero(1));
+                        }
+                        dst_entries.insert(ak, super::assoc_store::AssocEntry::Compound(dst_prefix));
+                    }
+                }
+            }
+            self.assoc_tables.insert(
+                dst.to_string(),
+                super::assoc_store::AssocTable {
+                    entries: dst_entries,
+                    evaluated_default: src_table.evaluated_default,
+                },
+            );
+        } else if let Some(ev_def) = self.assoc_default_val(src) {
+            self.assoc_tables.insert(
+                dst.to_string(),
+                super::assoc_store::AssocTable {
+                    entries: Default::default(),
+                    evaluated_default: Some(ev_def),
+                },
+            );
+        }
+        let nested_prefix = format!("{src}[");
+        let nested_tables: Vec<(String, super::assoc_store::AssocTable)> = self
+            .assoc_tables
+            .iter()
+            .filter(|(k, _)| k.starts_with(&nested_prefix))
+            .map(|(k, t)| (format!("{dst}{}", &k[src.len()..]), t.clone()))
+            .collect();
+        for (dk, mut tbl) in nested_tables {
+            for entry in tbl.entries.values_mut() {
+                if let super::assoc_store::AssocEntry::Compound(cp) = entry
+                    && cp.starts_with(&nested_prefix)
+                {
+                    *cp = format!("{dst}{}", &cp[src.len()..]);
+                }
+            }
+            self.assoc_tables.insert(dk, tbl);
+        }
+        let nested_assoc: Vec<(String, bool)> = self
+            .module
+            .associative_arrays
+            .iter()
+            .filter(|(k, _)| k.starts_with(&nested_prefix))
+            .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
+            .collect();
+        for (dk, v) in nested_assoc {
+            self.module.associative_arrays.insert(dk, v);
+        }
+        let nested_iw: Vec<(String, (u32, bool))> = self
+            .module
+            .assoc_index_widths
+            .iter()
+            .filter(|(k, _)| k.starts_with(&nested_prefix))
+            .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
+            .collect();
+        for (dk, v) in nested_iw {
+            self.module.assoc_index_widths.insert(dk, v);
+        }
+        let nested_ew: Vec<(String, u32)> = self
+            .module
+            .assoc_elem_widths
+            .iter()
+            .filter(|(k, _)| k.starts_with(&nested_prefix))
+            .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
+            .collect();
+        for (dk, v) in nested_ew {
+            self.module.assoc_elem_widths.insert(dk, v);
+        }
+        let nested_dyn: Vec<String> = self
+            .module
+            .dynamic_arrays
+            .iter()
+            .filter(|k| k.starts_with(&nested_prefix))
+            .map(|k| format!("{dst}{}", &k[src.len()..]))
+            .collect();
+        for dk in nested_dyn {
+            self.module.dynamic_arrays.insert(dk);
+        }
+        let nested_q: Vec<String> = self
+            .module
+            .queue_vars
+            .iter()
+            .filter(|k| k.starts_with(&nested_prefix))
+            .map(|k| format!("{dst}{}", &k[src.len()..]))
+            .collect();
+        for dk in nested_q {
+            self.module.queue_vars.insert(dk);
+        }
+        let nested_qmax: Vec<(String, u32)> = self
+            .module
+            .queue_max_sizes
+            .iter()
+            .filter(|(k, _)| k.starts_with(&nested_prefix))
+            .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
+            .collect();
+        for (dk, v) in nested_qmax {
+            self.module.queue_max_sizes.insert(dk, v);
+        }
+        let nested_arr: Vec<(String, (i64, i64, u32))> = self
+            .module
+            .arrays
+            .iter()
+            .filter(|(k, _)| k.starts_with(&nested_prefix))
+            .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
+            .collect();
+        for (dk, v) in nested_arr {
+            self.module.arrays.insert(dk, v);
+        }
+        if sig_any || table_any {
             self.mark_struct_coll_owner_present(dst);
         }
     }
@@ -3147,7 +3348,14 @@ impl Simulator {
             self.store_assoc_elem(&dst, &src);
             return;
         }
-        if let Some(v) = self.get_signal_value_by_name(&src) {
+        let val = if self.is_associative_array(src_obj) {
+            let key = si.to_string();
+            self.assoc_get_by_canon(src_obj, &key)
+                .or_else(|| self.get_signal_value_by_name(&src))
+        } else {
+            self.get_signal_value_by_name(&src)
+        };
+        if let Some(v) = val {
             self.set_signal_value_by_name(&dst, v);
         }
     }
@@ -3304,7 +3512,12 @@ impl Simulator {
     /// some other storage could answer for (a call frame, a forced name, a
     /// packed container, a scope-qualified twin).
     fn plain_queue_cells(&self, obj: &str) -> Result<Option<(usize, u64)>, ()> {
-        if !self.forced_names.is_empty() || self.module.arrays_2d.contains_key(obj) {
+        if self.module.arrays_2d.contains_key(obj)
+            || (!self.forced_names.is_empty()
+                && self.forced_names.iter().any(|k| {
+                    k.starts_with(obj) && k.as_bytes().get(obj.len()) == Some(&b'[')
+                }))
+        {
             return Err(());
         }
         if self.has_coll_rows
@@ -4404,8 +4617,10 @@ impl Simulator {
             ka.iter()
                 .map(|k| {
                     (
-                        self.get_signal_value_by_name(&format!("{}[{}]", a, k)),
-                        self.get_signal_value_by_name(&format!("{}[{}]", b, k)),
+                        self.assoc_get_by_canon(a, k)
+                            .or_else(|| self.get_signal_value_by_name(&format!("{}[{}]", a, k))),
+                        self.assoc_get_by_canon(b, k)
+                            .or_else(|| self.get_signal_value_by_name(&format!("{}[{}]", b, k))),
                     )
                 })
                 .collect()
@@ -5218,10 +5433,23 @@ impl Simulator {
             ));
         }
         let leaf = coll.rsplit('.').next().unwrap_or(coll);
+        let mut prefix = coll;
+        let mut prefix_dt = None;
+        while let Some(pos) = prefix.rfind('[') {
+            if !prefix.ends_with(']') {
+                break;
+            }
+            prefix = &prefix[..pos];
+            if let Some(dt) = self.module.var_decl_types.get(prefix) {
+                prefix_dt = Some(dt);
+                break;
+            }
+        }
         let Some(dt) = self
             .module
             .var_decl_types
             .get(coll)
+            .or(prefix_dt)
             .or_else(|| self.module.var_decl_types.get(leaf))
             .or_else(|| {
                 // A collection formal's or local's per-call key `@name#N`.
@@ -6055,19 +6283,43 @@ impl Simulator {
         // for absent-key reads (elaboration records declaration defaults via
         // `assoc_defaults`; a RUN-TIME `m = '{...}` must record it here).
         if self.module.associative_arrays.contains_key(base) {
+            self.assoc_clear(base, true);
+            let compound = matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if Self::spreads_member_wise(su))
+                || self
+                    .coll_shape_at(base)
+                    .is_some_and(|(shape, depth)| depth + 1 < shape.dims.len());
             let mut wrote = false;
             for item in items {
                 if let AssignmentPatternItem::Default(e) = item {
-                    self.module
-                        .assoc_defaults
-                        .insert(base.to_string(), e.clone());
+                    let v = match self.assoc_elem_width(base) {
+                        Some(w) if w > 0 => self.eval_expr_ctx(e, w),
+                        _ => self.eval_expr(e),
+                    };
+                    let fitted = self.fit_assoc_elem_val(base, v);
+                    self.assoc_tables
+                        .entry(base.to_string())
+                        .or_default()
+                        .evaluated_default = Some(fitted);
                     wrote = true;
                 } else if let Some(k) = self.array_pattern_key(item) {
-                    let kv = self.eval_expr(&k);
-                    let key = self.assoc_key_str(base, &kv);
-                    let elem = format!("{}[{}]", base, key);
-                    if !self.assign_coll_row_item(base, &elem, &dt, item.expr()) {
-                        self.assign_pattern_or_leaf(&elem, &dt, item.expr());
+                    let Some(key) = self.eval_assoc_key(base, &k) else {
+                        continue;
+                    };
+                    let elem = format!("{}[{}]", base, key.to_canon_string());
+                    if compound {
+                        if !self.assign_coll_row_item(base, &elem, &dt, item.expr()) {
+                            self.assign_pattern_or_leaf(&elem, &dt, item.expr());
+                        }
+                        self.assoc_mark_compound(base, key, elem);
+                    } else if self.assign_coll_row_item(base, &elem, &dt, item.expr()) {
+                        self.assoc_mark_compound(base, key, elem);
+                    } else {
+                        let v = match self.assoc_elem_width(base) {
+                            Some(w) if w > 0 => self.eval_expr_ctx(item.expr(), w),
+                            _ => self.eval_expr(item.expr()),
+                        };
+                        let fitted = self.fit_assoc_elem_val(base, v);
+                        self.assoc_set_scalar(base, key, fitted);
                     }
                     wrote = true;
                 }
@@ -7305,6 +7557,7 @@ impl Simulator {
             Dim::Assoc(_)
                 if depth > 0
                     && !self.module.associative_arrays.contains_key(name)
+                    && !self.assoc_tables.get(name).is_some_and(|t| !t.entries.is_empty())
                     && !self.signal_name_prefix_present(&format!("{name}[")) =>
             {
                 Some("'{}".to_string())
@@ -7487,7 +7740,7 @@ impl Simulator {
                         (Some(d), None) => self.render_p_typed(&elem, d),
                         (None, None) => {
                             let ev = self
-                                .get_signal_value_by_name(&elem)
+                                .assoc_get_by_canon(name, k)
                                 .unwrap_or_else(|| Value::zero(32));
                             Self::render_p_value(&ev, val_is_str)
                         }

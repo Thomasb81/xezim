@@ -870,6 +870,15 @@ impl Simulator {
     /// The populated keys of an associative-array member, in numeric (or
     /// lexicographic, for string keys) order — the §7.8.4 iteration order.
     pub(super) fn assoc_key_strs(&self, scoped: &str) -> Vec<String> {
+        if let Some(table) = self.assoc_tables.get(scoped)
+            && !table.entries.is_empty()
+        {
+            return table
+                .entries
+                .keys()
+                .map(super::assoc_store::AssocKey::to_canon_string)
+                .collect();
+        }
         let prefix = format!("{}[", scoped);
         let mut keys: Vec<String> = self
             .signals
@@ -1227,6 +1236,12 @@ impl Simulator {
             val.is_signed = self.class_prop_signed_of(handle, prop);
         }
         self.signals.insert(key.to_string(), val.clone());
+        if key.ends_with(']')
+            && let Some((base, rest)) = key.rsplit_once('[')
+            && self.is_associative_array(base)
+        {
+            self.assoc_set_by_canon(base, &rest[..rest.len() - 1], val.clone());
+        }
         if let Some((_h, bare)) = key.split_once('#') {
             if self.signal_name_to_id.contains_key(bare) {
                 self.set_signal_value_by_name(bare, val);
@@ -1235,6 +1250,13 @@ impl Simulator {
     }
 
     pub(super) fn read_coll_elem(&self, key: &str) -> Option<Value> {
+        if key.ends_with(']')
+            && let Some((base, rest)) = key.rsplit_once('[')
+            && self.is_associative_array(base)
+            && let Some(v) = self.assoc_get_by_canon(base, &rest[..rest.len() - 1])
+        {
+            return Some(v);
+        }
         self.signals.get(key).cloned()
     }
 

@@ -879,7 +879,10 @@ impl Simulator {
         let fd = self.eval_file_handle_arg(&args[1]);
         // Memory destination?
         if let Some(mem_name) = self.resolve_array_name_from_expr(&args[0]) {
-            if let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() {
+            if let Some((lo, hi, width)) = self.one_dim_memory_bounds(&mem_name) {
+                if hi < lo && self.module.dynamic_arrays.contains(&mem_name) {
+                    return Value::zero(32);
+                }
                 let min_idx = lo.min(hi);
                 let max_idx = lo.max(hi);
                 let start = if args.len() >= 3 {
@@ -1022,6 +1025,18 @@ impl Simulator {
             .find_map(|n| is_mem(n).map(|m| (n.to_string(), m)))
     }
 
+    /// Bounds `(lo, hi, width)` for a 1-D fixed or dynamic/queue memory target.
+    /// For dynamic arrays/queues, uses the live allocated size (returning `hi < lo` when empty).
+    fn one_dim_memory_bounds(&self, name: &str) -> Option<(i64, i64, u32)> {
+        let &(lo, hi, width) = self.module.arrays.get(name)?;
+        if self.module.dynamic_arrays.contains(name) {
+            let size = self.get_queue_size(name) as i64;
+            Some((0, size - 1, width))
+        } else {
+            Some((lo, hi, width))
+        }
+    }
+
     /// The memory a `$readmem*` / `$writemem*` call names. A target that
     /// names no memory is an error; report it rather than skip the call
     /// silently.
@@ -1037,7 +1052,7 @@ impl Simulator {
             return Some(t);
         }
         if let Some(name) = self.resolve_array_name_from_expr(arg) {
-            if let Some(&(lo, hi, width)) = self.module.arrays.get(&name) {
+            if let Some((lo, hi, width)) = self.one_dim_memory_bounds(&name) {
                 return Some(MemoryTaskTarget {
                     name,
                     lo: lo.into(),
@@ -1189,9 +1204,7 @@ impl Simulator {
     /// whether the element changed.
     fn assoc_memory_store(&mut self, name: &str, addr: i128, mut val: Value) -> bool {
         // Two's complement bits of a negative address, and an unsigned one
-        // above `i64::MAX` as it is: the key text takes the index type. An
-        // index type wider than 64 bits takes all 128 bits of the address,
-        // which are an unsigned key's own even with the top one set.
+        // above `i64::MAX` as it is: stored in `assoc_tables` via `AssocKey`.
         let (kw, signed) = self.assoc_index_width_for(name).unwrap_or((64, true));
         let mut key = if kw > 64 {
             Value::from_u128(addr as u128, 128)
@@ -1199,7 +1212,9 @@ impl Simulator {
             Value::from_u64(addr as u64, 64)
         };
         key.is_signed = signed && addr < 0;
-        let elem = Self::name_with_key(name, &self.assoc_key_str(name, &key));
+        let Some(ak) = self.assoc_key_from_val(name, &key) else {
+            return false;
+        };
         if let Some(signed) = self.assoc_elem_signed(name) {
             val.is_signed = signed;
         }
@@ -1212,9 +1227,8 @@ impl Simulator {
         {
             val = val.to_two_state();
         }
-        let changed = self.signals.get(&elem) != Some(&val);
-        self.signals.insert(elem, val);
-        changed
+        let fitted = self.fit_assoc_elem_val(name, val);
+        self.assoc_set_scalar(name, ak, fitted)
     }
 
     /// [`member_chain_as_hier_ident`] with each select folded into its
@@ -1381,6 +1395,7 @@ impl Simulator {
         let step: i128 = if start <= end_addr { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
+        let empty_dyn = !assoc && hi < lo && self.module.dynamic_arrays.contains(&mem_name);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -1427,7 +1442,7 @@ impl Simulator {
                     continue;
                 }
                 next_addr = addr.checked_add(step);
-                if addr >= min_idx && addr <= max_idx {
+                if !empty_dyn && addr >= min_idx && addr <= max_idx {
                     let val = Value::from_str_radix(&digits, radix, width);
                     if assoc {
                         assoc_changed |=
@@ -1555,20 +1570,64 @@ impl Simulator {
                 .assoc_index_width_for(&mem_name)
                 .filter(|&(kw, _)| kw > 64);
             let mut words: Vec<(i128, Value)> = Vec::new();
-            for key in self.assoc_top_level_keys_shared(&mem_name).iter() {
-                // The hex digits of a wide key are its index type's bits.
-                let parsed = match wide_key {
-                    Some(kt) => Self::memory_file_address(key, kt).map(|a| key_order(a, bias)),
-                    None => key.parse::<i128>().ok(),
-                };
-                let Some(addr) = parsed else {
-                    continue;
-                };
-                if addr < from || addr > to {
-                    continue;
+            if let Some(table) = self.assoc_tables.get(&mem_name) {
+                for (ak, entry) in &table.entries {
+                    let parsed = match ak {
+                        super::assoc_store::AssocKey::Int64(i) => {
+                            Some(key_order(i128::from(*i), bias))
+                        }
+                        super::assoc_store::AssocKey::UInt64(u) => {
+                            Some(key_order(i128::from(*u), bias))
+                        }
+                        super::assoc_store::AssocKey::WideUnsigned(ws) => {
+                            let lo = u128::from(ws.first().copied().unwrap_or(0));
+                            let hi = u128::from(ws.get(1).copied().unwrap_or(0));
+                            Some(key_order((lo | (hi << 64)) as i128, bias))
+                        }
+                        super::assoc_store::AssocKey::WideSigned { width, words: ws } => {
+                            let lo = u128::from(ws.first().copied().unwrap_or(0));
+                            let hi = u128::from(ws.get(1).copied().unwrap_or(0));
+                            let raw = lo | (hi << 64);
+                            let shift = 128 - (*width).clamp(1, 128);
+                            Some(key_order(((raw << shift) as i128) >> shift, bias))
+                        }
+                        _ => None,
+                    };
+                    let Some(addr) = parsed else {
+                        continue;
+                    };
+                    if addr < from || addr > to {
+                        continue;
+                    }
+                    let val = match entry {
+                        super::assoc_store::AssocEntry::Scalar(v) => Some(v.clone()),
+                        super::assoc_store::AssocEntry::Compound(elem) => {
+                            self.get_signal_value_by_name(elem)
+                        }
+                    };
+                    if let Some(val) = val {
+                        words.push((addr, val));
+                    }
                 }
-                if let Some(val) = self.lookup_signal_value(&Self::name_with_key(&mem_name, key)) {
-                    words.push((addr, val));
+            } else {
+                for key in self.assoc_top_level_keys_shared(&mem_name).iter() {
+                    // The hex digits of a wide key are its index type's bits.
+                    let parsed = match wide_key {
+                        Some(kt) => Self::memory_file_address(key, kt).map(|a| key_order(a, bias)),
+                        None => key.parse::<i128>().ok(),
+                    };
+                    let Some(addr) = parsed else {
+                        continue;
+                    };
+                    if addr < from || addr > to {
+                        continue;
+                    }
+                    if let Some(val) = self
+                        .assoc_get_by_canon(&mem_name, key)
+                        .or_else(|| self.lookup_signal_value(&Self::name_with_key(&mem_name, key)))
+                    {
+                        words.push((addr, val));
+                    }
                 }
             }
             // Index order: a signed wide key's text sorts as its unsigned bits.

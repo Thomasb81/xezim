@@ -37,6 +37,20 @@ impl Simulator {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             return Some(&self.signal_table[id]);
         }
+        if !self.assoc_tables.is_empty()
+            && name.ends_with(']')
+            && let Some((base, rest)) = name.rsplit_once('[')
+            && let Some(table) = self.assoc_tables.get(base)
+        {
+            let canon = &rest[..rest.len() - 1];
+            if let Some((_, super::assoc_store::AssocEntry::Scalar(v))) = table
+                .entries
+                .iter()
+                .find(|(k, _)| k.to_canon_string() == canon)
+            {
+                return Some(v);
+            }
+        }
         self.signals.get(name)
     }
 
@@ -58,6 +72,16 @@ impl Simulator {
             } else {
                 self.signal_table[id].clone()
             });
+        }
+        if !self.assoc_tables.is_empty()
+            && name.ends_with(']')
+            && let Some((base, rest)) = name.rsplit_once('[')
+            && self.assoc_tables.contains_key(base)
+        {
+            let canon = &rest[..rest.len() - 1];
+            if let Some(v) = self.assoc_get_by_canon(base, canon) {
+                return Some(v);
+            }
         }
         self.signals.get(name).cloned()
     }

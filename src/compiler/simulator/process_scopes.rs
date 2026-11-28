@@ -3852,6 +3852,18 @@ impl Simulator {
         match &e.kind {
             ExprKind::Index { expr, index } => {
                 let base = self.freeze_lvalue_indices(expr);
+                if let Some(dt) = self.assoc_struct_key_type_for_expr(expr) {
+                    let frozen_idx = self
+                        .freeze_struct_key_expr(index, &dt)
+                        .unwrap_or_else(|| Expression::new(ExprKind::AssignmentPattern(Vec::new()), index.span));
+                    return Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: Box::new(frozen_idx),
+                        },
+                        e.span,
+                    );
+                }
                 // Same `$` bound the apply-time path installs, so a frozen
                 // `q[$]` literal is the queue's last index and not u64::MAX.
                 let qbound = if Self::expr_contains_dollar(index) {

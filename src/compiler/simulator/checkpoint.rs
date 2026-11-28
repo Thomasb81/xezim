@@ -53,7 +53,7 @@ use serde::ser::{SerializeSeq, Serializer};
 // §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
 // Per-frame VifAliasFrame, prop_vif_bindings, pending_vif_return, and LoopVarSnapshot replace flat vif keys.
 // Dynamic dependency masks, their controller tables and wide case-selector offsets.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x28";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x29";
 
 #[derive(Default)]
 struct Session {
@@ -1252,6 +1252,10 @@ checkpoint_state!(
     assoc_elem_colls,
     assoc_keys_cache,
     assoc_static_keys_cache,
+    assoc_tables,
+    detached_qref_vals,
+    next_qref_id,
+    queue_elem_ids,
     await_waiters,
     bit_sens_pending,
     block_scope_saves,
@@ -1697,6 +1701,7 @@ checkpoint_state!(
     struct_root_names_built,
     stuck_clock_aborted,
     sva_preponed,
+    sva_preponed_names,
     sva_preponed_slot,
     sva_sites,
     sync_name_pool,
@@ -1775,6 +1780,7 @@ checkpoint_state!(
     module.assoc_defaults,
     module.assoc_elem_widths,
     module.assoc_index_widths,
+    module.assoc_key_struct_types,
     module.assoc_key_type_names,
     module.associative_arrays,
     module.coll_shapes,
@@ -1793,6 +1799,7 @@ checkpoint_state!(
     module.typedefs,
     module.unpacked_decl_dims,
     module.var_decl_types,
+    module.wildcard_assoc_arrays,
 );
 
 /// `XEZIM_CKPT_AUDIT=<file>`: the digest of each field of the simulator,

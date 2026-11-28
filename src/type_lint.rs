@@ -134,6 +134,7 @@ enum AssocKey {
     },
     Class(Rc<str>),
     Enum(Rc<str>),
+    Struct(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -798,6 +799,7 @@ impl<'a> Ck<'a> {
                     } => Some(AssocKey::Int { bits, signed, four }),
                     Ty::Class(c) => Some(AssocKey::Class(c)),
                     Ty::Enum { key, .. } => Some(AssocKey::Enum(key)),
+                    Ty::Struct(st) if !st.packed => Some(AssocKey::Struct(st.key.clone())),
                     _ => None,
                 };
                 Dim::Assoc(key)
@@ -2548,27 +2550,146 @@ impl<'a> Ck<'a> {
                     None => self.walk_value(expr, true),
                 }
             }
+            ExprKind::WithClause { expr, filter } => {
+                self.walk_value(expr, true);
+                self.walk_value(filter, true);
+                self.check_wildcard_with_clause(expr, filter, e.span);
+            }
             ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_value(x, true)),
             _ => {}
+        }
+    }
+
+    fn builtin_call_receiver<'b>(&self, e: &'b Expression) -> Option<(Ty, &'b str)> {
+        let e = peel_parens(e);
+        let call = match &e.kind {
+            ExprKind::WithClause { expr, .. } => expr.as_ref(),
+            _ => e,
+        };
+        let target = match &call.kind {
+            ExprKind::Call { func, .. } => func.as_ref(),
+            other => match other {
+                ExprKind::MemberAccess { .. } | ExprKind::Ident(_) => call,
+                _ => return None,
+            },
+        };
+        match &target.kind {
+            ExprKind::MemberAccess { expr, member } => Some((self.ty_of(expr), member.name.as_str())),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut base = h.clone();
+                let method = &h.path.last()?.name.name;
+                base.path.pop();
+                Some((
+                    self.ty_of(&Expression::new(ExprKind::Ident(base), target.span)),
+                    method.as_str(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_wildcard_assoc_ty(ty: &Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Unpacked { dims, .. }
+                if matches!(dims.first(), Some(Dim::Assoc(Some(AssocKey::Wildcard))))
+        )
+    }
+
+    fn check_wildcard_with_clause(&mut self, expr: &Expression, filter: &Expression, span: Span) {
+        let Some((receiver, method)) = self.builtin_call_receiver(expr) else {
+            return;
+        };
+        if !Self::is_wildcard_assoc_ty(&receiver) {
+            return;
+        }
+        if matches!(
+            method,
+            "find_index" | "find_first_index" | "find_last_index" | "unique_index"
+        ) && self.seen.insert(span.start as usize)
+        {
+            self.report(
+                span,
+                format!(
+                    "method '{method}' cannot be used on a wildcard `[*]` associative array \
+                     (IEEE 1800-2023 §7.8.1)"
+                ),
+            );
+            return;
+        }
+        let iter_name: &str = match &peel_parens(expr).kind {
+            ExprKind::Call { args, .. } if args.len() == 1 => match &args[0].kind {
+                ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                    h.path[0].name.name.as_str()
+                }
+                _ => "item",
+            },
+            _ => "item",
+        };
+        let mut uses_index = false;
+        visit_expr(filter, &mut |x| {
+            if uses_index {
+                return;
+            }
+            match &x.kind {
+                ExprKind::MemberAccess { expr: base, member }
+                    if member.name == "index"
+                        && matches!(&base.kind, ExprKind::Ident(h)
+                            if h.root.is_none() && h.path.len() == 1 && h.path[0].name.name == iter_name) =>
+                {
+                    uses_index = true;
+                }
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() >= 2
+                        && h.path[0].name.name == iter_name
+                        && h.path[1].name.name == "index" =>
+                {
+                    uses_index = true;
+                }
+                _ => {}
+            }
+        });
+        if uses_index && self.seen.insert(filter.span.start as usize) {
+            self.report(
+                filter.span,
+                format!(
+                    "wildcard `[*]` associative array iterator '{iter_name}.index' is not allowed \
+                     (IEEE 1800-2023 §7.8.1)"
+                ),
+            );
         }
     }
 
     /// §15.5.3/§7.10.2/§7.12: known built-in receiver types have a closed
     /// set of methods. Class methods with the same spellings remain legal.
     fn check_builtin_call(&mut self, func: &Expression, span: Span) {
-        let (receiver, method) = match &func.kind {
-            ExprKind::MemberAccess { expr, member } => (self.ty_of(expr), member.name.as_str()),
-            ExprKind::Ident(h) if h.path.len() >= 2 => {
-                let mut base = h.clone();
-                let method = &h.path.last().unwrap().name.name;
-                base.path.pop();
-                (
-                    self.ty_of(&Expression::new(ExprKind::Ident(base), func.span)),
-                    method.as_str(),
-                )
-            }
-            _ => return,
+        let Some((receiver, method)) = self.builtin_call_receiver(func) else {
+            return;
         };
+        if Self::is_wildcard_assoc_ty(&receiver)
+            && matches!(
+                method,
+                "first"
+                    | "last"
+                    | "next"
+                    | "prev"
+                    | "find_index"
+                    | "find_first_index"
+                    | "find_last_index"
+                    | "unique_index"
+            )
+            && self.seen.insert(span.start as usize)
+        {
+            self.report(
+                span,
+                format!(
+                    "method '{method}' cannot be used on a wildcard `[*]` associative array \
+                     (IEEE 1800-2023 §7.8.1)"
+                ),
+            );
+            return;
+        }
         let invalid = match &receiver {
             Ty::Event => method != "triggered",
             Ty::Unpacked { dims, .. } if dims.first() == Some(&Dim::Queue) => !matches!(
@@ -2886,10 +3007,29 @@ impl<'a> Ck<'a> {
                         );
                     }
                 }
+                UnpackedDimension::Queue {
+                    max_size: Some(bound),
+                    span: dspan,
+                } => {
+                    let qwhat = || format!("the queue bound of '{name}'");
+                    self.report_nonconst(bound, &qwhat, "§7.10");
+                    if matches!(self.eval_const(bound), Some(CVal::Xz) | Some(CVal::Int(..=0)))
+                        && self.seen.insert(dspan.start as usize)
+                    {
+                        self.report(
+                            bound.span,
+                            format!(
+                                "bounded queue '{name}' max index must be greater than zero \
+                                 (IEEE 1800-2023 §7.10)"
+                            ),
+                        );
+                    }
+                }
                 UnpackedDimension::Associative {
                     data_type: Some(kdt),
                     span: dspan,
                 } => {
+                    let mut is_param_size = false;
                     if let DataType::TypeReference {
                         name: kname,
                         dimensions,
@@ -2906,15 +3046,53 @@ impl<'a> Ck<'a> {
                         if !is_known_type
                             && !self.is_class_name(kn)
                             && let Some(v) = self.lookup_const_val(kn)
-                            && v <= 0
+                        {
+                            is_param_size = true;
+                            if v <= 0 {
+                                self.report(
+                                    *dspan,
+                                    format!(
+                                        "unpacked array '{name}' dimension size must be greater than zero \
+                                         (IEEE 1800-2023 §7.4)"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    if !is_param_size {
+                        if matches!(kdt.as_ref(), DataType::Struct(_) | DataType::Enum(_))
+                            && self.seen.insert(dspan.start as usize)
                         {
                             self.report(
                                 *dspan,
                                 format!(
-                                    "unpacked array '{name}' dimension size must be greater than zero \
-                                     (IEEE 1800-2023 §7.4)"
+                                    "associative array '{name}' cannot use an inline type \
+                                     declaration as its index type (IEEE 1800-2023 §7.8)"
                                 ),
                             );
+                        } else {
+                            let kty = self.resolve(kdt);
+                            if matches!(kty, Ty::Real { .. })
+                                && self.seen.insert(dspan.start as usize)
+                            {
+                                self.report(
+                                    *dspan,
+                                    format!(
+                                        "associative array '{name}' cannot use real/shortreal as \
+                                         its index type (IEEE 1800-2023 §7.8.2)"
+                                    ),
+                                );
+                            } else if Self::struct_has_real_member(&kty)
+                                && self.seen.insert(dspan.start as usize)
+                            {
+                                self.report(
+                                    *dspan,
+                                    format!(
+                                        "associative array '{name}' index struct cannot contain \
+                                         real/shortreal members (IEEE 1800-2023 §7.8.5)"
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
@@ -3179,8 +3357,39 @@ impl<'a> Ck<'a> {
                 }
             }
             ExprKind::Index { expr, index } => {
+                let base_ty = self.ty_of(expr);
+                self.check_assoc_index_type(&base_ty, index, out);
                 self.operand_errors(expr, false, out);
                 self.operand_errors(index, false, out);
+            }
+            ExprKind::Ident(h) => {
+                if h.root.is_none()
+                    && !h.path.is_empty()
+                    && h.path.iter().any(|s| !s.selects.is_empty())
+                {
+                    let first = &h.path[0];
+                    let mut cur = if first.name.name == "this" {
+                        self.cur_class
+                            .as_deref()
+                            .map(|c| Ty::Class(c.into()))
+                            .unwrap_or(Ty::Unknown)
+                    } else {
+                        self.lookup_var(&first.name.name).unwrap_or(Ty::Unknown)
+                    };
+                    for sel in &first.selects {
+                        self.check_assoc_index_type(&cur, sel, out);
+                        self.operand_errors(sel, false, out);
+                        cur = self.index_ty(cur, sel);
+                    }
+                    for seg in &h.path[1..] {
+                        cur = self.member_ty(cur, &seg.name.name);
+                        for sel in &seg.selects {
+                            self.check_assoc_index_type(&cur, sel, out);
+                            self.operand_errors(sel, false, out);
+                            cur = self.index_ty(cur, sel);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -3478,7 +3687,23 @@ impl<'a> Ck<'a> {
                 self.walk_stmt(body);
                 self.pop();
             }
-            StatementKind::Foreach { vars, body, .. } => {
+            StatementKind::Foreach {
+                array, vars, body, ..
+            } => {
+                if let Ty::Unpacked { dims, .. } = self.ty_of(array) {
+                    for (dim, var) in dims.iter().zip(vars.iter()) {
+                        if let (Dim::Assoc(Some(AssocKey::Wildcard)), Some(v)) = (dim, var)
+                            && self.seen.insert(v.span.start as usize)
+                        {
+                            self.report(
+                                v.span,
+                                "wildcard `[*]` associative array cannot be iterated with \
+                                 foreach (IEEE 1800-2023 §7.8.1)"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
                 self.push();
                 for v in vars.iter().flatten() {
                     self.declare_value(&v.name, Ty::Unknown);
@@ -3910,6 +4135,83 @@ fn ty_has_untagged_union(t: &Ty) -> bool {
         Ty::Struct(s) => s.has_untagged_union,
         Ty::Unpacked { elem, .. } => ty_has_untagged_union(elem),
         _ => false,
+    }
+}
+
+impl Ck<'_> {
+    fn ty_contains_real(t: &Ty) -> bool {
+        match t {
+            Ty::Real { .. } => true,
+            Ty::Struct(s) => s.members.iter().any(|(_, mt)| Self::ty_contains_real(mt)),
+            Ty::Unpacked { elem, .. } => Self::ty_contains_real(elem),
+            _ => false,
+        }
+    }
+
+    fn struct_has_real_member(t: &Ty) -> bool {
+        match t {
+            Ty::Struct(s) => s.members.iter().any(|(_, mt)| Self::ty_contains_real(mt)),
+            _ => false,
+        }
+    }
+
+    fn check_assoc_index_type(
+        &self,
+        base_ty: &Ty,
+        index: &Expression,
+        out: &mut Vec<(Span, String)>,
+    ) {
+        let Ty::Unpacked { dims, .. } = base_ty else {
+            return;
+        };
+        let Some(Dim::Assoc(Some(key_kind))) = dims.first() else {
+            return;
+        };
+        if matches!(index.kind, ExprKind::Range(..)) {
+            return;
+        }
+        let idx_ty = self.ty_of(index);
+        let is_str_lit = matches!(peel_parens(index).kind, ExprKind::StringLiteral(_));
+        match key_kind {
+            AssocKey::Wildcard => {
+                if !is_str_lit && matches!(idx_ty, Ty::Real { .. } | Ty::Str) {
+                    out.push((
+                        index.span,
+                        format!(
+                            "wildcard `[*]` associative array requires an integral index, not {} \
+                             (IEEE 1800-2023 §7.8.1)",
+                            idx_ty.describe()
+                        ),
+                    ));
+                }
+            }
+            AssocKey::Int { .. } => {
+                if !is_str_lit && matches!(idx_ty, Ty::Real { .. } | Ty::Str) {
+                    out.push((
+                        index.span,
+                        format!(
+                            "integral associative array index cannot be {} \
+                             (IEEE 1800-2023 §7.8.4)",
+                            idx_ty.describe()
+                        ),
+                    ));
+                }
+            }
+            AssocKey::Str => {
+                if !is_str_lit && matches!(idx_ty, Ty::Int { .. } | Ty::Real { .. } | Ty::Enum { .. })
+                {
+                    out.push((
+                        index.span,
+                        format!(
+                            "string-keyed associative array cannot be indexed with {} \
+                             (IEEE 1800-2023 §7.8.2)",
+                            idx_ty.describe()
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
     }
 }
 

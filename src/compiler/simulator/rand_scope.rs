@@ -2907,8 +2907,11 @@ impl Simulator {
                             } else {
                                 continue;
                             };
-                            let Some(v) =
-                                self.get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
+                            let Some(v) = self
+                                .assoc_get_by_canon(&coll_name, &key)
+                                .or_else(|| {
+                                    self.get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
+                                })
                             else {
                                 continue;
                             };

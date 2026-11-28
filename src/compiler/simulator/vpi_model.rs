@@ -4465,21 +4465,33 @@ pub(super) fn obj_handle(m: &mut VpiModel, sim: &mut Simulator, o: u32) -> VpiHa
                 }
                 return plain_obj_handle(m, o);
             }
-            let Some(id) = v.sig else {
-                return plain_obj_handle(m, o);
-            };
             if td_is_array(m, v.td) {
                 let t = &m.tdescs[v.td as usize];
                 let lo = match t.unpacked.first() {
                     Some(UDim::Range(l, r)) => (*l).min(*r),
                     _ => 0,
                 };
-                let mut h = VpiHandle::signal(id, ty, &name, &full);
-                h.kind = VpiKind::Memory;
-                h.lsb = lo as u32;
-                h.width = fixed_count(t).unwrap_or(0);
-                return h;
+                if let Some(id) = v.sig {
+                    let mut h = VpiHandle::signal(id, ty, &name, &full);
+                    h.kind = VpiKind::Memory;
+                    h.lsb = lo as u32;
+                    h.width = fixed_count(t).unwrap_or(0);
+                    return h;
+                }
+                if matches!(
+                    t.unpacked.first(),
+                    Some(UDim::Dynamic | UDim::Queue | UDim::Assoc)
+                ) {
+                    let mut h = VpiHandle::signal(usize::MAX, ty, &name, &full);
+                    h.kind = VpiKind::Memory;
+                    h.lsb = lo as u32;
+                    h.width = 0;
+                    return h;
+                }
             }
+            let Some(id) = v.sig else {
+                return plain_obj_handle(m, o);
+            };
             let mut h = VpiHandle::signal(id, ty, &name, &full);
             h.direction = v.dir;
             h
@@ -5022,7 +5034,21 @@ fn element_handle(
         h.width = fixed_count(&et).unwrap_or(0);
         return Some(h);
     }
-    let id = *sim.signal_name_to_id.get(fname.as_str())?;
+    let is_dyn_like = idx.last().is_some()
+        && matches!(
+            t.unpacked.get(idx.len() - 1),
+            Some(UDim::Dynamic | UDim::Queue | UDim::Assoc)
+        );
+    let id = match sim.signal_name_to_id.get(fname.as_str()) {
+        Some(&id) => id,
+        None if is_dyn_like
+            && (sim.signals.contains_key(&fname)
+                || sim.get_signal_value_by_name(&fname).is_some()) =>
+        {
+            usize::MAX
+        }
+        None => return None,
+    };
     let ty = if net {
         m.net_type_code(&et)
     } else {
@@ -6218,7 +6244,7 @@ fn obj_get(
                                         .and_then(|x| x.to_u64())
                                         .unwrap_or(0) as c_int
                                 }
-                                Some(UDim::Assoc) => sim.signals.elem_keys(&v.flat).len() as c_int,
+                                Some(UDim::Assoc) => sim.assoc_len(&v.flat) as c_int,
                                 _ => fixed_count(&t).map(|n| n as c_int).unwrap_or(c::UNDEFINED),
                             }
                         } else if matches!(t.kind, TKind::Event) {

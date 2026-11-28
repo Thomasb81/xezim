@@ -1303,9 +1303,9 @@ impl Simulator {
                                 if inner.len() == 1 {
                                     self.module
                                         .arrays_2d
-                                        .insert(name.clone(), ((0, 63), inner[0], w));
+                                        .insert(name.clone(), ((0, -1), inner[0], w));
                                 } else {
-                                    let mut shape = vec![(0i64, 63i64)];
+                                    let mut shape = vec![(0i64, -1i64)];
                                     shape.extend(inner.iter().cloned());
                                     self.module.arrays_nd.insert(name.clone(), (shape, w));
                                 }
@@ -1378,11 +1378,8 @@ impl Simulator {
                         // Drop any stale elements left by a prior frame's
                         // same-named local before this fresh declaration —
                         // struct-element member leaves (`m[k].x`) included.
-                        let pre = format!("{}[", name);
-                        let stale: Vec<String> = self.signals.keys_with_elem_prefix(&pre);
-                        for k in stale {
-                            self.signals.remove(&k);
-                        }
+                        self.assoc_clear(&name, true);
+                        self.assoc_tables.remove(&name);
                         self.module
                             .associative_arrays
                             .insert(name.clone(), is_string_key);
@@ -2236,7 +2233,7 @@ impl Simulator {
                 }
                 None => {
                     self.module.dynamic_arrays.insert(en.clone());
-                    self.module.arrays.insert(en.clone(), (0, 63, w));
+                    self.module.arrays.insert(en.clone(), (0, -1, w));
                     self.set_queue_size(&en, 0);
                 }
             }

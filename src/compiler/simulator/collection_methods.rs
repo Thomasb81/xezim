@@ -226,10 +226,11 @@ impl Simulator {
     /// tail unless it appends, in which case the new element is discarded.
     fn insert_queue_elem(&mut self, name: &str, index: u64, size: u64, arg: &Expression) {
         let full = self
-            .module
-            .queue_max_sizes
-            .get(name)
-            .is_some_and(|&max| size >= u64::from(max));
+            .queue_max_size_for(name)
+            .is_some_and(|max| size >= u64::from(max));
+        if index > size {
+            return;
+        }
         if full && index == size {
             if matches!(
                 self.unpacked_pattern(arg).kind,
@@ -241,19 +242,21 @@ impl Simulator {
             }
         } else {
             let end = size - u64::from(full);
-            // §13.5.1: the scalar input to insert/push_front is evaluated
-            // before the queue changes, including an input reading this queue.
+            // §13.5.1 / §7.10.2: the scalar input to insert/push_front is
+            // evaluated before the queue changes (for all scalar types incl.
+            // `string`, `real`, handles, integrals), so `sq.push_front(sq[1])`
+            // captures the pre-shift value.
             let saved = if index < end
                 && !matches!(arg.kind, ExprKind::Number(_) | ExprKind::StringLiteral(_))
                 && !crate::compiler::packed_assignment_pattern_plan::has_pattern(arg)
+                && self.queue_elem_struct(name).is_none()
                 && (!self.has_coll_rows
                     || self
                         .coll_shape_at(name)
                         .is_none_or(|(shape, depth)| depth + 1 == shape.dims.len()))
-                && let Some(ty) = self.integral_queue_elem(name)
             {
                 let value = self.queue_eval_arg(name, arg);
-                Some(Self::fit_queue_elem_to(Some(ty), value))
+                Some(Self::fit_queue_elem_to(self.integral_queue_elem(name), value))
             } else {
                 None
             };
@@ -267,6 +270,10 @@ impl Simulator {
                 self.set_signal_value_by_name(&slot, value);
             } else {
                 self.queue_store_elem(name, &slot, arg);
+            }
+            if self.queue_elem_ids.contains_key(name) {
+                let final_len = if full { size } else { size + 1 };
+                self.qref_track_insert(name, index as usize, final_len as usize);
             }
         }
         self.set_queue_size(name, size + 1);
@@ -423,6 +430,31 @@ impl Simulator {
         let ew = self
             .coll_elem_width(&ln)
             .or_else(|| self.coll_elem_width(&rn));
+        if let Some(su) = self
+            .queue_elem_struct(&ln)
+            .or_else(|| self.queue_elem_struct(&rn))
+        {
+            let mut acc = PatCmp::Equal;
+            for i in 0..ls {
+                let lp = format!("{}[{}]", ln, i);
+                let rp = format!("{}[{}]", rn, i);
+                let l_leaves = self.unpacked_struct_leaf_keys(&lp, &su);
+                let r_leaves = self.unpacked_struct_leaf_keys(&rp, &su);
+                for ((lk, lw, _), (rk, _, _)) in l_leaves.iter().zip(r_leaves.iter()) {
+                    let lv = self
+                        .get_signal_value_by_name(lk)
+                        .unwrap_or_else(|| Value::zero(*lw));
+                    let rv = self
+                        .get_signal_value_by_name(rk)
+                        .unwrap_or_else(|| Value::zero(*lw));
+                    acc = acc.and(Self::coll_elem_cmp(&lv, &rv, Some(*lw), mode));
+                    if acc == PatCmp::Unequal {
+                        return Some(PatCmp::Unequal);
+                    }
+                }
+            }
+            return Some(acc);
+        }
         let mut acc = PatCmp::Equal;
         for i in 0..ls {
             let lv = self
@@ -559,16 +591,44 @@ impl Simulator {
         let ew = self
             .coll_elem_width(&ln)
             .or_else(|| self.coll_elem_width(&rn));
+        if let Some(su) = self
+            .queue_elem_struct(&ln)
+            .or_else(|| self.queue_elem_struct(&rn))
+        {
+            let mut acc = PatCmp::Equal;
+            for k in &lkeys {
+                if !rset.contains(k) {
+                    return Some(PatCmp::Unequal);
+                }
+                let lp = format!("{}[{}]", ln, k);
+                let rp = format!("{}[{}]", rn, k);
+                let l_leaves = self.unpacked_struct_leaf_keys(&lp, &su);
+                let r_leaves = self.unpacked_struct_leaf_keys(&rp, &su);
+                for ((lk, lw, _), (rk, _, _)) in l_leaves.iter().zip(r_leaves.iter()) {
+                    let lv = self
+                        .get_signal_value_by_name(lk)
+                        .unwrap_or_else(|| Value::zero(*lw));
+                    let rv = self
+                        .get_signal_value_by_name(rk)
+                        .unwrap_or_else(|| Value::zero(*lw));
+                    acc = acc.and(Self::coll_elem_cmp(&lv, &rv, Some(*lw), mode));
+                    if acc == PatCmp::Unequal {
+                        return Some(PatCmp::Unequal);
+                    }
+                }
+            }
+            return Some(acc);
+        }
         let mut acc = PatCmp::Equal;
         for k in &lkeys {
             if !rset.contains(k) {
                 return Some(PatCmp::Unequal);
             }
             let lv = self
-                .get_signal_value_by_name(&format!("{}[{}]", ln, k))
+                .assoc_get_by_canon(&ln, k)
                 .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
             let rv = self
-                .get_signal_value_by_name(&format!("{}[{}]", rn, k))
+                .assoc_get_by_canon(&rn, k)
                 .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
             acc = acc.and(Self::coll_elem_cmp(&lv, &rv, ew, mode));
             if acc == PatCmp::Unequal {
@@ -2361,9 +2421,13 @@ impl Simulator {
             if elem_su.is_some() {
                 self.item_alias = Some(elem.clone());
             }
-            let v = self
-                .get_signal_value_by_name(&elem)
-                .unwrap_or_else(|| Value::zero(32));
+            let v = if assoc.is_some() {
+                self.assoc_get_by_canon(arr, &assoc.as_ref().unwrap().0[i])
+                    .unwrap_or_else(|| Value::zero(32))
+            } else {
+                self.get_signal_value_by_name(&elem)
+                    .unwrap_or_else(|| Value::zero(32))
+            };
             // §7.12.4: `item.index` (or `<iterator>.index`) is the
             // element's index, an int, or an associative array's key.
             let ix = match &assoc {
@@ -3057,10 +3121,7 @@ impl Simulator {
         let (width, signed) = self.array_elem_sign_width(root);
         let identity = u64::from(op == BuiltinM::Product);
         let mut acc: Option<Value> = None;
-        for name in self.reduction_elem_names(name) {
-            let Some(mut value) = self.get_signal_value_by_name(&name) else {
-                continue;
-            };
+        let step = |acc: &mut Option<Value>, mut value: Value| {
             if !value.is_real {
                 value.is_signed = signed;
                 if value.width != width {
@@ -3078,10 +3139,37 @@ impl Simulator {
                     }
                 })
             });
-            acc = Some(match prefix {
+            *acc = Some(match prefix {
                 Some(prefix) => Self::combine_reduction(op, prefix, value),
                 None => value,
             });
+        };
+        if self.is_associative_array(name) {
+            if let Some(table) = self.assoc_tables.get(name)
+                && !table.entries.is_empty()
+            {
+                for entry in table.entries.values() {
+                    if let Some(value) = match entry {
+                        super::assoc_store::AssocEntry::Scalar(v) => Some(v.clone()),
+                        super::assoc_store::AssocEntry::Compound(elem) => {
+                            self.get_signal_value_by_name(elem)
+                        }
+                    } {
+                        step(&mut acc, value);
+                    }
+                }
+                return acc.unwrap_or_else(|| {
+                    let mut value = Value::from_u64(identity, width);
+                    value.is_signed = signed;
+                    value
+                });
+            }
+        }
+        for ename in self.reduction_elem_names(name) {
+            let Some(value) = self.get_signal_value_by_name(&ename) else {
+                continue;
+            };
+            step(&mut acc, value);
         }
         acc.unwrap_or_else(|| {
             let mut value = Value::from_u64(identity, width);
@@ -3156,9 +3244,14 @@ impl Simulator {
                 Some((k, _)) => format!("{arr}[{k}]"),
                 None => format!("{arr}[{index}]"),
             };
-            let elem = self
-                .get_signal_value_by_name(&elem_name)
-                .unwrap_or_else(|| Value::zero(32));
+            let elem = if assoc.is_some() {
+                let k = assoc.as_ref().unwrap().0[i as usize].as_str();
+                self.assoc_get_by_canon(arr, k)
+                    .unwrap_or_else(|| Value::zero(32))
+            } else {
+                self.get_signal_value_by_name(&elem_name)
+                    .unwrap_or_else(|| Value::zero(32))
+            };
             if alias_elements {
                 self.item_alias = Some(elem_name);
             }
@@ -4449,29 +4542,8 @@ impl Simulator {
         }
         if bm == BuiltinM::Size || bm == BuiltinM::Len {
             // An associative array's size() == num(): count populated keys.
-            // (Without this it falls through to the queue/.size-shadow/string
-            // paths and reads 0 for a true assoc array — sv_22.)
             if self.is_associative_array(obj_name) {
-                let prefix = Self::name_with_suffix(obj_name, "[");
-                // §7.8.1: an associative array of associative arrays (or of
-                // queues) stores its elements under compound keys
-                // (`m[A][B]`); size() counts the distinct first-level keys,
-                // as num() does, not the stored leaves. Any compound key
-                // tells: an associative array of queues also stores the
-                // queue's own `m[A]` entry, and the key order is not fixed.
-                // One borrowing pass both counts and checks.
-                let mut count = 0usize;
-                let mut compound = false;
-                for k in self.signals.elem_keys_with_prefix(&prefix) {
-                    count += 1;
-                    compound = compound || k[prefix.len()..].contains("][");
-                }
-                if compound {
-                    let n = self.assoc_top_level_keys(obj_name).len();
-                    return Some(Self::int_count(n as u64));
-                }
-                let c2 = self.assoc_static_keys(&prefix).len();
-                return Some(Self::int_count((count + c2) as u64));
+                return Some(Self::int_count(self.assoc_len(obj_name) as u64));
             }
             if let Some(v) = self.signals.get(&Self::name_with_suffix(obj_name, ".size")) {
                 return Some(Self::int_count(v.to_u64().unwrap_or(0)));
@@ -4629,6 +4701,9 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self.queue_elem_value(obj_name, 0);
+                if self.queue_elem_ids.contains_key(obj_name) {
+                    self.qref_track_remove(obj_name, 0, val.clone());
+                }
                 if !self.queue_shift_fast(obj_name, 0, cur_size, false) {
                     for i in 1..cur_size {
                         self.queue_move_elem(obj_name, i, i - 1);
@@ -4637,16 +4712,33 @@ impl Simulator {
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
             }
-            return Some(Value::zero(32));
+            return Some(
+                self.coll_missing_elem_value(obj_name)
+                    .or_else(|| {
+                        self.is_string_collection(obj_name)
+                            .then(|| Value::from_string(""))
+                    })
+                    .unwrap_or_else(|| Value::zero(32)),
+            );
         }
         if bm == BuiltinM::PopBack {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self.queue_elem_value(obj_name, cur_size as i64 - 1);
+                if self.queue_elem_ids.contains_key(obj_name) {
+                    self.qref_track_remove(obj_name, (cur_size - 1) as usize, val.clone());
+                }
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
             }
-            return Some(Value::zero(32));
+            return Some(
+                self.coll_missing_elem_value(obj_name)
+                    .or_else(|| {
+                        self.is_string_collection(obj_name)
+                            .then(|| Value::from_string(""))
+                    })
+                    .unwrap_or_else(|| Value::zero(32)),
+            );
         }
         if bm == BuiltinM::Sort {
             let cur_size = self.get_queue_size(obj_name) as usize;
@@ -4749,13 +4841,9 @@ impl Simulator {
             {
                 return Some(Self::int_count(q.len() as u64));
             }
-            // Count distinct TOP-LEVEL keys: for `obj[KEY]` storage this is
-            // just the element count (== queue/dynamic-array size), but for
-            // an assoc-of-queue `obj[KEY][IDX]` it collapses every element of
-            // a key's queue onto that one key (so `num()` reports the number
-            // of associative keys, not the total element count). The
-            // first-`]` extraction + dedup is uniform across plain assoc,
-            // assoc-of-queue, queues, and dynamic arrays.
+            if self.is_associative_array(obj_name) {
+                return Some(Self::int_count(self.assoc_len(obj_name) as u64));
+            }
             return Some(Self::int_count(
                 self.assoc_top_level_keys_shared(obj_name).len() as u64
             ));
@@ -4895,16 +4983,38 @@ impl Simulator {
         }
         if bm == BuiltinM::Exists {
             if let Some(arg) = args.first() {
+                if self.is_associative_array(obj_name) {
+                    let Some(key) = self.eval_assoc_key(obj_name, arg) else {
+                        return Some(Value::from_u64(0, 1));
+                    };
+                    if self
+                        .assoc_tables
+                        .get(obj_name)
+                        .is_some_and(|t| t.entries.contains_key(&key))
+                    {
+                        return Some(Value::from_u64(1, 1));
+                    }
+                    let elem_name = Self::name_with_key(obj_name, &key.to_canon_string());
+                    if self.signals.contains_key(&elem_name)
+                        || self.signal_name_to_id.contains_key(elem_name.as_str())
+                        || self.module.dynamic_arrays.contains(&elem_name)
+                    {
+                        return Some(Value::from_u64(1, 1));
+                    }
+                    let found = self
+                        .signals
+                        .contains_key(&Self::name_with_suffix(&elem_name, ".size"))
+                        || self
+                            .signals
+                            .any_key_with_prefix(&Self::name_with_suffix(&elem_name, "["))
+                        || self
+                            .signals
+                            .any_key_with_prefix(&Self::name_with_suffix(&elem_name, "."));
+                    return Some(Value::from_u64(found as u64, 1));
+                }
                 let kv = self.eval_expr(arg);
                 let key = self.assoc_key_str(obj_name, &kv);
                 let elem_name = Self::name_with_key(obj_name, &key);
-                // class-perf: the hot path (a flat key that exists) must not pay
-                // for the prefix/`.size` probes that only disambiguate MAP and
-                // STRUCT assoc elements. Probe the direct scalar entry first and
-                // build the sacrificial Strings lazily on the miss only — every
-                // entry probe here allocates a heap String (`name_with_suffix`),
-                // and the common regex-cache loop looks up an existing key every
-                // iteration.
                 if self.signals.contains_key(&elem_name)
                     || self.signal_name_to_id.contains_key(elem_name.as_str())
                     || self.module.dynamic_arrays.contains(&elem_name)
@@ -4914,30 +5024,12 @@ impl Simulator {
                 if self
                     .assoc_elem_decl_type(obj_name)
                     .is_some_and(|dt| !self.assoc_elem_typedef_is_array(obj_name, dt))
-                    // Scalar-integral fast path: a flat-key miss with a scalar
-                    // element can have no compound children, so `.exists` is
-                    // false. But a MULTIDIMENSIONAL row (`v[0]` of
-                    // `int v[2][string][string]`, or `x["k"]` of
-                    // `int x[string][3]`) still stores its entries under a
-                    // compound key `v[0]["A"]["B"]`; the scalar element type is
-                    // only reported via the §7.4.5 dimension collapse, and the
-                    // element below the current select chain is itself an
-                    // array (of any kind, fixed-size too), so `.exists` must
-                    // fall through to the prefix scan. Skip the fast path then.
                     && !self
                         .coll_shape_at(obj_name)
                         .is_some_and(|(shape, depth)| shape.dims.get(depth + 1).is_some())
                 {
                     return Some(Value::from_u64(0, 1));
                 }
-                // A multidimensional associative array (`m[K1][K2]`, IEEE
-                // 1800-2023 §7.8.1) stores elements under the compound key
-                // `m[K1][K2]`; the bare `m[K1]` is never a direct entry. So a
-                // hit is EITHER the flat 1D key OR any compound `m[K1][...]`
-                // element (prefix scan). An assoc element that is itself a
-                // collection is stored under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
-                // A STRUCT element stores member-wise leaves (`sa[k].id`) — no
-                // `sa[k]` entry ever exists.
                 let found = self
                     .signals
                     .contains_key(&Self::name_with_suffix(&elem_name, ".size"))
@@ -4961,37 +5053,11 @@ impl Simulator {
             }
             if self.is_associative_array(obj_name) {
                 if let Some(arg) = args.first() {
-                    let key = self.eval_expr(arg);
-                    let key_str = self.assoc_key_str(obj_name, &key);
-                    let elem_name = format!("{}[{}]", obj_name, key_str);
-                    let aggregate = self
-                        .class_member_coll_type(obj_name)
-                        .map(std::borrow::Cow::Borrowed)
-                        .or_else(|| self.p_elem_type_ref(obj_name))
-                        .is_some_and(|ty| {
-                            matches!(self.resolve_dt_ref(ty.as_ref()), DataType::Struct(su)
-                            if Self::spreads_member_wise(su))
-                        });
-                    if self.signals.remove(&elem_name).is_none() || aggregate {
-                        // §7.9.2: deleting an unpacked struct removes its
-                        // member cells even when a pattern store also left
-                        // an `aa[k]` marker. Scalar entries keep the direct
-                        // removal path without scanning the array (#1124).
-                        let member = Self::name_with_suffix(&elem_name, ".");
-                        let sub = Self::name_with_suffix(&elem_name, "[");
-                        let prefix = format!("{}[", obj_name);
-                        for k in self.signals.keys_with_elem_prefix(&prefix) {
-                            if k.starts_with(member.as_str()) || k.starts_with(sub.as_str()) {
-                                self.signals.remove(&k);
-                            }
-                        }
+                    if let Some(key) = self.eval_assoc_key(obj_name, arg) {
+                        self.assoc_delete_key(obj_name, &key);
                     }
                 } else {
-                    let prefix = format!("{}[", obj_name);
-                    let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-                    for k in keys {
-                        self.signals.remove(&k);
-                    }
+                    self.assoc_clear(obj_name, false);
                 }
                 return Some(Value::zero(32));
             }
@@ -5005,9 +5071,18 @@ impl Simulator {
                         .contains_key(&Self::name_with_suffix(obj_name, ".size")))
             {
                 if let Some(arg) = args.first() {
-                    let idx = self.eval_expr(arg).to_u64().unwrap_or(0) as usize;
+                    let iv = self.eval_expr(arg);
                     let cur_size = self.get_queue_size(obj_name) as usize;
-                    if idx < cur_size {
+                    if !iv.has_xz()
+                        && let Some(idx_i) = iv.to_i64()
+                        && idx_i >= 0
+                        && (idx_i as usize) < cur_size
+                    {
+                        let idx = idx_i as usize;
+                        if self.queue_elem_ids.contains_key(obj_name) {
+                            let detached_v = self.queue_elem_value(obj_name, idx_i);
+                            self.qref_track_remove(obj_name, idx, detached_v);
+                        }
                         // Member-wise, for the same reason as `insert`.
                         if !self.queue_shift_fast(obj_name, idx as u64, cur_size as u64, false) {
                             for i in idx..cur_size - 1 {
@@ -5017,6 +5092,10 @@ impl Simulator {
                         self.set_queue_size(obj_name, (cur_size - 1) as u64);
                     }
                 } else {
+                    if self.queue_elem_ids.contains_key(obj_name) {
+                        self.detach_all_qrefs(obj_name);
+                    }
+                    self.clear_dynamic_assoc_rows(obj_name, 0);
                     self.set_queue_size(obj_name, 0);
                 }
                 return Some(Value::zero(32));
@@ -5028,25 +5107,64 @@ impl Simulator {
             || bm == BuiltinM::Prev)
             && self.is_associative_array(obj_name)
         {
-            let keys = self.assoc_top_level_keys_shared(obj_name);
-            // i128, not i64: a full-range unsigned 64-bit key
-            // (18446744073709551615) is numeric too — treating it as a
-            // string wrote the key's ASCII bytes into the ref arg.
-            // A key type wider than 64 bits is keyed by fixed-width hex
-            // digits (`assoc_key_str`), which order as the values do.
-            // A STRING key whose KEY is a type parameter bound to `string`
-            // (`pool#(string,..)`/`VAL aa[KEY]`) reports a spurious 1024-bit
-            // index width (elaboration can't resolve the type param to
-            // `SimpleType::String`), so the hex path below would ship the
-            // key's ASCII bytes as an integer into the ref arg (e.g. "ID103"
-            // -> 2 garbage bytes). String keys are strings however they read;
-            // never treat a string-keyed array as a wide numeric key.
             let index_type = self.assoc_index_width_for(obj_name);
+            let struct_dt = self.assoc_struct_key_type(obj_name);
+            let is_str = self.is_string_keyed_array(obj_name);
+            let is_wild = self.is_wildcard_assoc_array(obj_name);
+            let table_has_keys = self
+                .assoc_tables
+                .get(obj_name)
+                .is_some_and(|t| !t.entries.is_empty());
+            if table_has_keys {
+                let found_key = if bm == BuiltinM::First {
+                    self.assoc_tables
+                        .get(obj_name)
+                        .and_then(|t| t.entries.keys().next().cloned())
+                } else if bm == BuiltinM::Last {
+                    self.assoc_tables
+                        .get(obj_name)
+                        .and_then(|t| t.entries.keys().next_back().cloned())
+                } else if let Some(arg) = args.first() {
+                    let Some(cur_key) = self.eval_assoc_key(obj_name, arg) else {
+                        return Some(Value::zero(32));
+                    };
+                    self.assoc_tables.get(obj_name).and_then(|t| {
+                        use std::ops::Bound;
+                        if bm == BuiltinM::Next {
+                            t.entries
+                                .range((Bound::Excluded(&cur_key), Bound::Unbounded))
+                                .next()
+                                .map(|(k, _)| k.clone())
+                        } else {
+                            t.entries
+                                .range((Bound::Unbounded, Bound::Excluded(&cur_key)))
+                                .next_back()
+                                .map(|(k, _)| k.clone())
+                        }
+                    })
+                } else {
+                    None
+                };
+                if let Some(found) = found_key {
+                    let mut status = 1i64;
+                    if let Some(arg) = args.first() {
+                        if struct_dt.is_none() && !is_str && !is_wild {
+                            let arg_w = self.eval_lvalue_width(arg);
+                            if index_type.is_some_and(|(kw, _)| arg_w < kw) {
+                                status = -1;
+                            }
+                        }
+                        self.write_assoc_key_var(arg, &found, index_type, struct_dt.as_ref());
+                    }
+                    return Some(Self::signed_loop_val(status));
+                }
+                return Some(Value::zero(32));
+            }
+            let keys = self.assoc_top_level_keys_shared(obj_name);
             let wide =
-                index_type.filter(|&(kw, _)| kw > 64 && !self.is_string_keyed_array(obj_name));
-            // §7.8.2, §7.9.4: string keys are strings however they read.
+                index_type.filter(|&(kw, _)| kw > 64 && !is_str);
             let all_numeric = wide.is_none()
-                && !self.is_string_keyed_array(obj_name)
+                && !is_str
                 && keys.iter().all(|k| k.parse::<i128>().is_ok());
             if keys.is_empty() {
                 return Some(Value::zero(32));
@@ -5058,11 +5176,6 @@ impl Simulator {
             } else {
                 if let Some(arg) = args.first() {
                     let cur_val = self.eval_expr(arg);
-                    // Canonicalize exactly like the STORE side
-                    // (assoc_key_str): a signed ref var must read back
-                    // "-3", not its zero-extended u64 form — otherwise
-                    // next()/prev() never find the current position.
-                    // §7.8.5: the given index need not exist.
                     let (cur_num, cur_str) = if all_numeric {
                         (
                             self.assoc_key_str(obj_name, &cur_val).parse::<i128>().ok(),
@@ -5097,7 +5210,7 @@ impl Simulator {
                 if let Some(arg) = args.first() {
                     // §7.9.8: a narrower integral argument receives the
                     // truncated key and the method returns a signed -1.
-                    let width = self.infer_width(arg);
+                    let width = self.eval_lvalue_width(arg);
                     if (all_numeric || wide.is_some())
                         && index_type.is_some_and(|(kw, _)| width < kw)
                     {

@@ -379,6 +379,7 @@ impl Simulator {
                 self.widths.remove(&key);
             }
         }
+        self.assoc_tables.retain(|key, _| !discard(key));
         self.module
             .associative_arrays
             .retain(|key, _| !discard(key));

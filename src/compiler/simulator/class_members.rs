@@ -284,6 +284,26 @@ impl Simulator {
         false
     }
 
+    /// Is `member` a STATIC associative-array property of `start_class` or an ancestor?
+    pub(super) fn member_is_static_assoc(&self, start_class: &str, member: &str) -> bool {
+        let mut cur: Option<&str> = Some(start_class);
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(cn) {
+                if cd
+                    .static_collections
+                    .iter()
+                    .any(|(n, is_a, _)| n == member && *is_a)
+                {
+                    return true;
+                }
+                cur = cd.extends.as_deref();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     /// A block-local non-string declaration clears a stale string flag for
     /// its bare name. Inside a subroutine frame the removal is logged so the
     /// frame's exit re-inserts it — an enclosing scope's `string m` must not
@@ -3716,9 +3736,11 @@ impl Simulator {
         // table lookup (`rtab[name].get(i)`).
         let string_keyed = self.is_string_keyed_array(coll) || self.is_string_keyed_array(bare);
         let key_str = if string_keyed {
-            self.eval_index_value_self(index)
+            let s = self
+                .eval_index_value_self(index)
                 .map(|v| v.to_sv_string())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            encode_name_key(&s).into_owned()
         } else {
             self.eval_scalar_self(index)?.to_string()
         };

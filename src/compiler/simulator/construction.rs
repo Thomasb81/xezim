@@ -57,11 +57,11 @@ impl Simulator {
                 self.module.arrays.remove(scoped);
                 self.module
                     .arrays_2d
-                    .insert(scoped.to_string(), ((0, 63), *d2, width));
+                    .insert(scoped.to_string(), ((0, -1), *d2, width));
             }
             Some(dims) if dims.len() >= 2 => {
                 self.module.arrays.remove(scoped);
-                let mut shape = vec![(0, 63)];
+                let mut shape = vec![(0, -1)];
                 shape.extend_from_slice(dims);
                 self.module
                     .arrays_nd
@@ -70,7 +70,7 @@ impl Simulator {
             _ => {
                 self.module
                     .arrays
-                    .insert(scoped.to_string(), (0, 63, width));
+                    .insert(scoped.to_string(), (0, -1, width));
             }
         }
     }
@@ -240,38 +240,36 @@ impl Simulator {
                 }
             }
             for (prop, &is_str) in &cd.assoc_properties {
-                let s_pre = format!("{}#{}[", src_handle, prop);
+                let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
                 self.module
                     .associative_arrays
                     .insert(n_name.clone(), is_str);
-                let widths = &mut self.module.assoc_index_widths;
-                if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
-                    widths.insert(n_name.clone(), kw);
-                }
-                // §7.4.5: a row that is a queue or dynamic array keeps its
-                // size (`<h>#m[k].size`) and its registration in the copy.
-                let entries: Vec<(String, Value)> = self
+                // Preserve row registrations for nested queue/dynamic-array rows before copying.
+                let s_pre = format!("{}[", s_name);
+                let row_metas: Vec<(String, bool, Option<(i64, i64, u32)>)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)
                     .into_iter()
-                    .filter(|k| k.ends_with(']') || k.ends_with("].size"))
                     .filter_map(|k| {
-                        let v = self.signals.get(&k)?.clone();
-                        Some((k[s_pre.len()..].to_string(), v))
+                        let rest = &k[s_pre.len()..];
+                        let row = rest.strip_suffix(".size")?;
+                        let srow = format!("{s_pre}{row}");
+                        Some((
+                            format!("{n_name}[{row}"),
+                            self.module.dynamic_arrays.contains(&srow),
+                            self.module.arrays.get(&srow).copied(),
+                        ))
                     })
                     .collect();
-                for (rest, v) in entries {
-                    if let Some(row) = rest.strip_suffix(".size") {
-                        let (srow, nrow) = (format!("{s_pre}{row}"), format!("{n_name}[{row}"));
-                        if self.module.dynamic_arrays.contains(&srow) {
-                            self.module.dynamic_arrays.insert(nrow.clone());
-                        }
-                        if let Some(&t) = self.module.arrays.get(&srow) {
-                            self.module.arrays.insert(nrow, t);
-                        }
+                self.copy_assoc_entries(&n_name, &s_name);
+                for (nrow, is_dyn, arr_t) in row_metas {
+                    if is_dyn {
+                        self.module.dynamic_arrays.insert(nrow.clone());
                     }
-                    self.signals.insert(format!("{}[{}", n_name, rest), v);
+                    if let Some(t) = arr_t {
+                        self.module.arrays.insert(nrow, t);
+                    }
                 }
             }
             // §8.12: a shallow copy copies every property's value — a fixed

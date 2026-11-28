@@ -1365,7 +1365,11 @@ impl Simulator {
                     // §25.10: whole-array binding (`vifs = interfaces`). Each
                     // virtual-interface element is an independent alias to the
                     // corresponding structural interface instance.
-                    if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
+                    if !self.module.dynamic_arrays.contains(name)
+                        && !self.module.queue_vars.contains(name)
+                        && let Some(&(lo, hi, _)) = self.module.arrays.get(name)
+                        && lo <= hi
+                    {
                         let lhs_dims = self.module.unpacked_decl_dims.get(name)
                             .and_then(|dims| dims.first()).copied()
                             .unwrap_or_else(|| if self.module.descending_arrays.contains(name) {
@@ -1397,7 +1401,9 @@ impl Simulator {
                                 let actual = if left <= right { left + offset } else { left - offset };
                                 format!("{base}[{actual}]")
                             }).collect();
-                            if targets.iter().all(|target| self.is_interface_instance(target)) {
+                            if !targets.is_empty()
+                                && targets.iter().all(|target| self.is_interface_instance(target))
+                            {
                                 for (idx, target) in (lo..=hi).zip(targets) {
                                     self.vif_tokens_stored = true;
                                     self.set_signal_value_by_name(
@@ -1723,7 +1729,10 @@ impl Simulator {
                     return false;
                 }
                 let storage = if obj_handle == 0 {
-                    prop_base.clone()
+                    static_scope
+                        .as_deref()
+                        .map(|sc| self.spec_static_coll_key_in_class(&prop_base, sc))
+                        .unwrap_or_else(|| prop_base.clone())
                 } else {
                     format!("{}#{}", obj_handle, prop_base)
                 };
@@ -1731,7 +1740,7 @@ impl Simulator {
                 let mut key = prop_base.clone();
                 for (n, iv) in index_values.iter().enumerate() {
                     let idx = if n == 0 && string_keyed {
-                        iv.to_sv_string()
+                        encode_name_key(&iv.to_sv_string()).into_owned()
                     } else {
                         iv.to_i64().unwrap_or(0).to_string()
                     };
@@ -1871,7 +1880,7 @@ impl Simulator {
                     format!("{}#{}", owner, seg.name.name)
                 };
                 let i = if self.is_string_keyed_array(&storage) {
-                    value.to_sv_string()
+                    encode_name_key(&value.to_sv_string()).into_owned()
                 } else {
                     value.to_i64()?.to_string()
                 };
@@ -3450,7 +3459,7 @@ impl Simulator {
                         .unwrap_or_else(|| name.to_string()),
                 };
                 let index = if self.is_string_keyed_array(&storage) {
-                    self.eval_index_value_self(ix)?.to_sv_string()
+                    encode_name_key(&self.eval_index_value_self(ix)?.to_sv_string()).into_owned()
                 } else {
                     self.eval_scalar_self(ix)?.to_string()
                 };

@@ -1660,20 +1660,43 @@ impl Simulator {
                             || self.module.queue_vars.contains(&bname)
                             || self.module.associative_arrays.contains_key(&bname))
                     {
-                        let iv = self.eval_expr(index);
-                        let cell = if self.module.associative_arrays.contains_key(&bname) {
-                            format!("{}[{}]", bname, self.assoc_key_str(&bname, &iv))
-                        } else {
-                            let idx = iv.to_i64().filter(|&i| i >= 0)?;
-                            if idx as u64 >= self.get_queue_size(&bname) {
-                                return None;
+                        if self.module.associative_arrays.contains_key(&bname) {
+                            let key = self.eval_assoc_key(&bname, index)?;
+                            let canon = key.to_canon_string();
+                            let in_table = self
+                                .assoc_tables
+                                .get(&bname)
+                                .is_some_and(|t| t.entries.contains_key(&key));
+                            if in_table {
+                                return Some(format!(
+                                    "{}{}\x1f{}",
+                                    super::ref_aliases::REF_AELEM_PREFIX,
+                                    bname,
+                                    canon
+                                ));
                             }
-                            format!("{}[{}]", bname, idx)
-                        };
-                        if self.signals.contains_key(&cell)
-                            || self.signal_name_to_id.contains_key(cell.as_str())
-                        {
-                            return Some(cell);
+                            let cell = format!("{}[{}]", bname, canon);
+                            if self.signals.contains_key(&cell)
+                                || self.signal_name_to_id.contains_key(cell.as_str())
+                            {
+                                return Some(cell);
+                            }
+                        } else {
+                            let sz = self.get_queue_size(&bname);
+                            self.dollar_bound.push(sz as i64 - 1);
+                            let iv = self.eval_expr(index);
+                            self.dollar_bound.pop();
+                            let idx = iv.to_i64().filter(|&i| !iv.has_xz() && i >= 0)?;
+                            if (idx as u64) < sz {
+                                let id = self.ensure_queue_elem_ids(&bname, sz as usize)
+                                    [idx as usize];
+                                return Some(format!(
+                                    "{}{}\x1f{}",
+                                    super::ref_aliases::REF_QELEM_PREFIX,
+                                    bname,
+                                    id
+                                ));
+                            }
                         }
                     }
                 }

@@ -858,6 +858,45 @@ impl SignalMap {
                 .any(|(name, run)| Self::run_has_key_with_prefix(name, run, prefix))
     }
 
+    /// All stored keys beginning with any `prefix` (works for both `.`- and `[`-prefixes).
+    pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        let Some(outer) = Self::base_of(prefix) else {
+            let mut out: Vec<String> = self
+                .map
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect();
+            for (name, run) in &self.runs {
+                if !run.items.is_empty() && name.starts_with(prefix) {
+                    out.extend(
+                        (run.start..run.end())
+                            .rev()
+                            .map(|i| format!("{name}[{i}]")),
+                    );
+                }
+            }
+            return out;
+        };
+        let mut out: Vec<String> = self
+            .elems
+            .get(outer)
+            .into_iter()
+            .flat_map(|set| set.iter().filter(|k| k.starts_with(prefix)).cloned())
+            .collect();
+        for (name, run) in self.runs_under(outer) {
+            if Self::run_has_key_with_prefix(name, run, prefix) {
+                for i in (run.start..run.end()).rev() {
+                    let k = format!("{name}[{i}]");
+                    if k.starts_with(prefix) {
+                        out.push(k);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Whether a key `name[i]` of the non-empty `run` begins with `prefix`.
     fn run_has_key_with_prefix(name: &str, run: &ElemRun, prefix: &str) -> bool {
         if prefix.len() <= name.len() {

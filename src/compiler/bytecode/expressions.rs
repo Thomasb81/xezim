@@ -1527,6 +1527,21 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("nd_unpacked_dyn_index");
                     return None;
                 }
+                if matches!(expr.kind, ExprKind::Index { .. }) {
+                    let mut root = expr.as_ref();
+                    while let ExprKind::Index { expr: inner, .. } = &root.kind {
+                        root = inner.as_ref();
+                    }
+                    if let ExprKind::Ident(hier) = &root.kind
+                        && (self.is_assoc_target(hier)
+                            || self
+                                .lookup_array_name(hier)
+                                .is_some_and(|n| self.is_dynamic_collection(&n)))
+                    {
+                        self.bail("nested_dynamic_collection_index");
+                        return None;
+                    }
+                }
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
                     // An ASSOCIATIVE array element has no dense storage and no

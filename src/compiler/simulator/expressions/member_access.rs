@@ -1146,6 +1146,10 @@ impl Simulator {
                             segs.push(self.resolve_hier_name(h).into_owned());
                             segs.reverse();
                             break Some(segs.join("."));
+                        } else if let Some(flat_c) = self.flat_member_name(c) {
+                            segs.push(flat_c);
+                            segs.reverse();
+                            break Some(segs.join("."));
                         }
                         break None;
                     }
@@ -1272,11 +1276,7 @@ impl Simulator {
                     return Self::int_count(count as u64);
                 }
                 if mname == "delete" {
-                    let prefix = format!("{}[", name);
-                    let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-                    for k in keys {
-                        self.signals.remove(&k);
-                    }
+                    self.assoc_clear(&name, false);
                     return Value::zero(32);
                 }
                 let qualified = format!("{}.{}", name, mname);

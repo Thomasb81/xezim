@@ -76,6 +76,12 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
                 Some(v) => v,
                 None => return false,
             }
+        } else if sig_id == usize::MAX {
+            let rel = vpi_strip_top(sim, &h.full_name);
+            match sim.get_signal_value_by_name(rel) {
+                Some(v) => v,
+                None => return false,
+            }
         } else {
             match vpi_api::cell_value(sim, sig_id) {
                 Some(v) => v,
@@ -84,7 +90,9 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
         };
         let current_time = sim.time;
         // vpiStrengthVal reports the driving strength of a net.
-        vpi_api::set_strength_hint(sim, sig_id, h.type_code, vp.format);
+        if sig_id != usize::MAX {
+            vpi_api::set_strength_hint(sim, sig_id, h.type_code, vp.format);
+        }
         let ok = fill_vpi_value(&val, current_time, Some(h.type_code), vp);
         vpi_api::clear_strength_hint();
         ok

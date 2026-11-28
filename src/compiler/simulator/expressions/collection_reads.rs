@@ -136,16 +136,82 @@ impl Simulator {
         if has_bound {
             self.dollar_bound.push(self.get_queue_size(&store) as i64 - 1);
         }
-        let key = self.eval_expr(row);
+        let elem = if self.is_associative_array(&store) {
+            self.assoc_read_expr(&store, &store, row, width)
+        } else {
+            let key = self.eval_expr(row);
+            self.coll_elem_read(&store, &store, key, width)
+        };
         if has_bound {
             self.dollar_bound.pop();
         }
-        let elem = self.coll_elem_read(&store, &store, key, width);
         let indices: Vec<_> = packed.iter().map(|sel| self.eval_expr(sel)).collect();
         Some(match Self::packed_chain_slice(u64::from(width), &dims, &indices) {
             Some((lo, w)) => elem.range_select((lo + w - 1) as usize, lo as usize),
             None => Value::new(remaining),
         })
+    }
+
+    pub(in crate::compiler::simulator) fn assoc_type_default(&self, name: &str, ctx_width: u32) -> Value {
+        if self.is_string_collection(name) {
+            return Value::from_string("");
+        }
+        if let Some(v) = self.coll_missing_elem_value(name) {
+            return v;
+        }
+        let ew = self.assoc_elem_width(name).unwrap_or(ctx_width.max(1)).max(1);
+        let mut v = if self.is_assoc_elem_two_state(name) {
+            Value::zero(ew)
+        } else {
+            Value::new(ew)
+        };
+        if let Some(sg) = self.assoc_elem_signed(name) {
+            v.is_signed = sg;
+        }
+        v
+    }
+
+    pub(in crate::compiler::simulator) fn assoc_read_expr(
+        &mut self,
+        name: &str,
+        store_name: &str,
+        index: &Expression,
+        ctx_width: u32,
+    ) -> Value {
+        let Some(key) = self.eval_assoc_key(name, index) else {
+            self.warn_invalid_assoc_index(name);
+            return self.assoc_type_default(name, ctx_width);
+        };
+        if let Some(v) = self.assoc_get_scalar(store_name, &key) {
+            return v;
+        }
+        if store_name != name
+            && let Some(v) = self.assoc_get_scalar(name, &key)
+        {
+            return v;
+        }
+        let elem_name = Self::name_with_key(store_name, &key.to_canon_string());
+        if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
+            let mut v = self.signal_table[eid].clone();
+            if self.signal_signed[eid] {
+                v.is_signed = true;
+            }
+            return v;
+        }
+        if let Some(sv) = self.signals.get(&elem_name) {
+            let mut v = sv.clone();
+            if self.signed_signals.contains(&elem_name) {
+                v.is_signed = true;
+            }
+            return v;
+        }
+        if let Some(def) = self
+            .assoc_default_val(store_name)
+            .or_else(|| (store_name != name).then(|| self.assoc_default_val(name)).flatten())
+        {
+            return def;
+        }
+        self.assoc_type_default(name, ctx_width)
     }
 
     pub(in crate::compiler::simulator) fn coll_elem_read(
@@ -155,10 +221,52 @@ impl Simulator {
         idx_val: Value,
         ctx_width: u32,
     ) -> Value {
+        if self.is_associative_array(name) {
+            let Some(key) = self.assoc_key_from_val(name, &idx_val) else {
+                self.warn_invalid_assoc_index(name);
+                return self.assoc_type_default(name, ctx_width);
+            };
+            if let Some(v) = self.assoc_get_scalar(store_name, &key) {
+                return v;
+            }
+            if store_name != name
+                && let Some(v) = self.assoc_get_scalar(name, &key)
+            {
+                return v;
+            }
+            let elem_name = Self::name_with_key(store_name, &key.to_canon_string());
+            if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
+                let mut v = self.signal_table[eid].clone();
+                if self.signal_signed[eid] {
+                    v.is_signed = true;
+                }
+                return v;
+            }
+            if let Some(sv) = self.signals.get(&elem_name) {
+                let mut v = sv.clone();
+                if self.signed_signals.contains(&elem_name) {
+                    v.is_signed = true;
+                }
+                return v;
+            }
+            if let Some(def) = self
+                .assoc_default_val(store_name)
+                .or_else(|| (store_name != name).then(|| self.assoc_default_val(name)).flatten())
+            {
+                return def;
+            }
+            return self.assoc_type_default(name, ctx_width);
+        }
         // A side-effecting selector bypasses speculative
         // probes; validate its single evaluated result here
         // before either fixed-array storage lookup.
         if !self.is_associative_array(&name) && idx_val.has_xz() {
+            if let Some(v) = self.coll_missing_elem_value(&name) {
+                return v;
+            }
+            if self.is_string_collection(&name) {
+                return Value::from_string("");
+            }
             if let Some(ew) = self.module.arrays.get(&*name).map(|a| a.2) {
                 return Value::new(ew.max(1));
             }

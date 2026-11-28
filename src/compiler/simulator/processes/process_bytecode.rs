@@ -506,6 +506,13 @@ impl Simulator {
                 else_expr,
             } => pure(condition) && pure(then_expr) && pure(else_expr),
             ExprKind::Concatenation(xs) => xs.iter().all(pure),
+            ExprKind::AssignmentPattern(items) => items.iter().all(|it| match it {
+                crate::ast::expr::AssignmentPatternItem::Ordered(x)
+                | crate::ast::expr::AssignmentPatternItem::Named(_, x)
+                | crate::ast::expr::AssignmentPatternItem::Typed(_, x)
+                | crate::ast::expr::AssignmentPatternItem::Default(x) => pure(x),
+                crate::ast::expr::AssignmentPatternItem::Keyed(k, x) => pure(k) && pure(x),
+            }),
             ExprKind::Replication { count, exprs } => pure(count) && exprs.iter().all(pure),
             ExprKind::Index { expr, index } => pure(expr) && pure(index),
             ExprKind::RangeSelect {

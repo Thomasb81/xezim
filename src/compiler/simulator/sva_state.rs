@@ -160,6 +160,8 @@ pub(super) struct SvaClockedSite {
     /// after its first `fixed` entries.
     pub(super) sels: Vec<(Expression, Option<(usize, i64, i64)>)>,
     pub(super) fixed: usize,
+    pub(super) sampled_names: Vec<String>,
+    pub(super) fixed_names: usize,
     /// §16.10: the initial values of the attempt's local variable slots
     /// (empty when the property has none).
     pub(super) lv_init: SvaEnv,

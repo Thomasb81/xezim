@@ -963,3 +963,15 @@ mod ch07_array_legality;
 
 #[path = "types/ch07_array_packed_mem.rs"]
 mod ch07_array_packed_mem;
+
+#[path = "types/ch07_assoc_semantics.rs"]
+mod ch07_assoc_semantics;
+
+#[path = "types/ch07_assoc_legality.rs"]
+mod ch07_assoc_legality;
+
+#[path = "types/ch07_queue_semantics.rs"]
+mod ch07_queue_semantics;
+
+#[path = "types/ch07_coll_containers_perf.rs"]
+mod ch07_coll_containers_perf;

@@ -4049,9 +4049,25 @@ impl Simulator {
     /// `num` and `foreach` enumerate) for every associative ancestor of
     /// `name`.
     pub(super) fn mark_struct_coll_owner_present(&mut self, name: &str) {
-        for elem in self.assoc_elem_owners(name) {
-            if self.get_signal_value_by_name(elem).is_none() {
-                self.set_signal_value_by_name(elem, Value::zero(1));
+        let owners: Vec<String> = self
+            .assoc_elem_owners(name)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for elem in owners {
+            if let Some((base, rest)) = elem.rsplit_once('[')
+                && rest.ends_with(']')
+                && self.is_associative_array(base)
+                && let Some(ak) = self.assoc_key_from_canon(base, &rest[..rest.len() - 1])
+            {
+                if let Some(su) = self.queue_elem_struct(base) {
+                    self.init_assoc_struct_elem_defaults(base, ak, &elem, &su);
+                } else {
+                    self.assoc_mark_compound(base, ak, elem.clone());
+                }
+            }
+            if self.get_signal_value_by_name(&elem).is_none() {
+                self.set_signal_value_by_name(&elem, Value::zero(1));
             }
         }
     }

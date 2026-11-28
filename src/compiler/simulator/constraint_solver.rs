@@ -1716,22 +1716,18 @@ impl Simulator {
                 if is_coll {
                     if self.is_associative_array(&coll_name) {
                         // Associative array: iterate the stored keys.
-                        let prefix = format!("{}[", coll_name);
-                        let keys: Vec<String> = self
-                            .signals
-                            .keys_with_elem_prefix(&prefix)
-                            .into_iter()
-                            .filter(|k| k.ends_with(']'))
-                            .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                            .collect();
+                        let keys = self.assoc_top_level_keys(&coll_name);
                         for key in keys {
                             // §18.8: an element handle whose rand_mode is
                             // off keeps its object as it is.
                             if rand_disabled.contains(&format!("{}[{}]", p, key)) {
                                 continue;
                             }
-                            if let Some(v) =
-                                self.get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
+                            if let Some(v) = self
+                                .assoc_get_by_canon(&coll_name, &key)
+                                .or_else(|| {
+                                    self.get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
+                                })
                             {
                                 let sub = v.to_u64().unwrap_or(0) as usize;
                                 if sub != 0

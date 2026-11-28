@@ -1334,11 +1334,8 @@ impl Simulator {
             if param_name == caller_name {
                 continue; // identity binding — the keys ARE the caller's
             }
-            let prefix = format!("{}[", param_name);
-            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-            for k in keys {
-                self.signals.remove(&k);
-            }
+            self.assoc_clear(&param_name, true);
+            self.assoc_tables.remove(&param_name);
             self.module.associative_arrays.remove(&param_name);
             if !self.module.assoc_defaults.is_empty() {
                 self.module.assoc_defaults.remove(&param_name);
@@ -3351,7 +3348,7 @@ impl Simulator {
             alias_map.extend([marker]);
             self.ref_park_flags |= super::ref_aliases::REF_PARK_LEAVES;
         }
-        if alias_map.values().any(|s| s.ends_with(']')) {
+        if alias_map.values().any(|s| Self::is_ref_elem_storage(s)) {
             self.ref_park_flags |= super::ref_aliases::REF_PARK_ELEMS;
         }
         // An aliased ref writes through during the call — a return copy-out

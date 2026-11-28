@@ -2598,6 +2598,8 @@ impl Simulator {
                         {
                             self.coll_missing_elem_value(&an)
                                 .unwrap_or_else(|| Value::zero(32))
+                        } else if self.is_associative_array(&an) {
+                            self.coll_elem_read(&an, &an, idx_val, 32)
                         } else {
                             self.signals
                                 .get(&elem)
@@ -2641,11 +2643,43 @@ impl Simulator {
                     }
                 };
                 if let Some(an) = store {
+                    let is_assoc = self.is_associative_array(&an);
+                    if is_assoc {
+                        let Some(key) = self.assoc_key_from_val(&an, &idx_val) else {
+                            self.warn_invalid_assoc_index(&an);
+                            return 1;
+                        };
+                        let fitted = self.fit_assoc_elem_val(&an, val);
+                        let changed = self.assoc_set_scalar(&an, key, fitted);
+                        if changed {
+                            self.touch_queue(&an);
+                            if !self.condition_waiters.is_empty() {
+                                let lhs = Expression::new(
+                                    ExprKind::Ident(HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: member.to_string(),
+                                                span: crate::ast::Span::dummy(),
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: crate::ast::Span::dummy(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                        bound: crate::ast::binding::Bound::UNSET,
+                                    }),
+                                    crate::ast::Span::dummy(),
+                                );
+                                self.check_condition_waiters_for_write(&lhs);
+                            }
+                        }
+                        return 1;
+                    }
                     let key = self.assoc_key_str(&an, &idx_val);
                     // class-perf: pre-sized manual renderer, as in `LoadCollElem`.
                     let elem_name = Self::name_with_key(&an, &key);
-                    let is_assoc = self.is_associative_array(&an);
-                    if !is_assoc && self.prepare_sequence_write(&an, &idx_val).is_none() {
+                    if self.prepare_sequence_write(&an, &idx_val).is_none() {
                         return 1;
                     }
                     // §10.7: fit to the DECLARED element width when one
@@ -2654,26 +2688,12 @@ impl Simulator {
                         Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
                         _ => val.clone(),
                     };
-                    // The element takes its declared signedness, not the RHS's
-                    // (`byte m[int]; m[k] = 8'hF0` is -16) — mirror the AST
-                    // store (`assignments.rs::assign_queue_elem_value`). The
-                    // compiled path dropped this, so a byte array element
-                    // written as a negative RHS stored unsigned 8'hFF and
-                    // later sign-RE-ad to 255.
-                    if is_assoc {
-                        if !fitted.is_real
-                            && let Some(sg) = self.assoc_elem_signed(&an)
-                        {
-                            fitted.is_signed = sg;
-                        }
-                    } else {
-                        // §7.10/§10.7: a queue or dynamic-array element takes
-                        // the element type (an `int unsigned` element of -1
-                        // is 2**32-1).
-                        fitted = self.fit_coll_store_elem(&an, fitted);
-                        if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
-                            fitted = self.fit_signed_class_coll_elem(&an, fitted);
-                        }
+                    // §7.10/§10.7: a queue or dynamic-array element takes
+                    // the element type (an `int unsigned` element of -1
+                    // is 2**32-1).
+                    fitted = self.fit_coll_store_elem(&an, fitted);
+                    if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
+                        fitted = self.fit_signed_class_coll_elem(&an, fitted);
                     }
                     let changed = self.signals.get(&elem_name) != Some(&fitted);
                     self.signals.insert(elem_name, fitted);

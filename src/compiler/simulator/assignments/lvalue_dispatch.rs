@@ -161,7 +161,7 @@ impl Simulator {
         // clobbered a[0]. The right-hand side is still evaluated by the caller
         // (its side effects stand); only the store is dropped.
         if let ExprKind::Index { expr: base, index } = &lhs.kind {
-            if !Self::expr_is_stream(base) {
+            if !Self::expr_is_stream(base) && self.assoc_struct_key_type_for_expr(base).is_none() {
                 let iv = self.eval_expr(index);
                 if iv.has_xz() && !iv.is_real {
                     let store = self.expr_assoc_name(base).or_else(|| self.flat_member_name(base));
@@ -1233,6 +1233,9 @@ impl Simulator {
                     self.mark_dirty(&name);
                 }
                 self.signals.insert(name.to_string(), resized.clone());
+                if !self.module.associative_arrays.is_empty() && name.contains("].") {
+                    self.mark_struct_coll_owner_present(&name);
+                }
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
@@ -1578,8 +1581,13 @@ impl Simulator {
                     index,
                 } = &expr.kind
                 {
-                    let index_value = self.eval_expr(index);
-                    if index_value.has_xz() && !index_value.is_real {
+                    let is_struct_aa_key = self.assoc_struct_key_type_for_expr(array_expr).is_some();
+                    let index_value = if is_struct_aa_key {
+                        Value::zero(1)
+                    } else {
+                        self.eval_expr(index)
+                    };
+                    if !is_struct_aa_key && index_value.has_xz() && !index_value.is_real {
                         return false;
                     }
                     // §7.8.6: a select write to an ABSENT associative element
@@ -1607,6 +1615,46 @@ impl Simulator {
                         Some(format!("{}[{}]", base, index))
                     });
                     if let Some(element_name) = element_name {
+                        let base_assoc = self.expr_assoc_name(array_expr).or_else(|| {
+                            let ExprKind::Ident(h) = &array_expr.kind else {
+                                return None;
+                            };
+                            let n = self.resolve_hier_name(h).into_owned();
+                            let n = self.instance_assoc_member(&n).unwrap_or(n);
+                            self.is_associative_array(&n).then_some(n)
+                        });
+                        if let Some(an) = base_assoc.filter(|n| self.is_associative_array(n)) {
+                            let Some(key) = self.eval_assoc_key(&an, index) else {
+                                self.warn_invalid_assoc_index(&an);
+                                return false;
+                            };
+                            let mut current = self
+                                .assoc_get_scalar(&an, &key)
+                                .or_else(|| self.assoc_default_val(&an))
+                                .unwrap_or_else(|| self.assoc_type_default(&an, 32));
+                            let width = current.width as usize;
+                            let hi = msb.min(width.saturating_sub(1));
+                            if oob_write_discard(msb_i, src_base, width as u32) {
+                                return false;
+                            }
+                            let base_src = if src_base < 0 { src_base } else { lsb as i64 };
+                            if msb_i >= 0 && hi >= lsb {
+                                for bit in lsb..=hi {
+                                    let source = bit as i64 - base_src;
+                                    if source < 0 {
+                                        continue;
+                                    }
+                                    let next = val.get_bit(source as usize);
+                                    current.set_bit(bit, next);
+                                }
+                            }
+                            let fitted = self.fit_assoc_elem_val(&an, current);
+                            let changed = self.assoc_set_scalar(&an, key, fitted);
+                            if changed {
+                                self.touch_queue(&an);
+                            }
+                            return changed;
+                        }
                         if let Some(mut current) = self
                             .get_signal_value_by_name(&element_name)
                             .or(assoc_default)
@@ -2434,6 +2482,82 @@ impl Simulator {
                     // INSTANCE one does not — `u.q[0].latency = v` fell through
                     // every arm and vanished, so a router's per-element
                     // `q[i].latency--` never drained its queue.
+                    if let Some((elem, top_opt, su)) = self.resolve_assoc_struct_elem(expr)
+                        && self.coll_field_width(&su, &member.name).is_some()
+                    {
+                        if let Some((base_name, key)) = top_opt {
+                            self.init_assoc_struct_elem_defaults(&base_name, key, &elem, &su);
+                        }
+                        let target = format!("{}.{}", elem, member.name);
+                        let prev = self.get_signal_value_by_name(&target);
+                        let (w, is_signed, is_two_state, is_real, is_string) = su
+                            .members
+                            .iter()
+                            .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))
+                            .map(|m| {
+                                let w = super::elaborate::resolve_type_width(
+                                    &m.data_type,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                                .max(1);
+                                let sg = super::elaborate::is_type_signed_resolved(
+                                    &m.data_type,
+                                    &self.module.typedef_types,
+                                );
+                                let ts = super::elaborate::is_type_two_state_resolved(
+                                    &m.data_type,
+                                    &self.module.typedef_types,
+                                );
+                                let rl = super::elaborate::is_type_real_resolved(
+                                    &m.data_type,
+                                    &self.module.typedef_types,
+                                );
+                                let st = matches!(
+                                    self.resolve_dt_ref(&m.data_type),
+                                    DataType::Simple {
+                                        kind: crate::ast::types::SimpleType::String,
+                                        ..
+                                    }
+                                );
+                                (w, sg, ts, rl, st)
+                            })
+                            .unwrap_or_else(|| {
+                                let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                                (
+                                    w,
+                                    prev.as_ref().is_some_and(|v| v.is_signed),
+                                    false,
+                                    prev.as_ref().is_some_and(|v| v.is_real),
+                                    self.string_signals.contains(&target),
+                                )
+                            });
+                        let mut resized = if is_string {
+                            self.string_signals.insert(target.clone());
+                            val.clone()
+                        } else if is_real && !val.is_real {
+                            Value::from_f64(val.to_f64())
+                        } else if !is_real && val.is_real {
+                            Self::real_to_int(val.to_f64(), w)
+                        } else {
+                            val.resize_for_assign(w)
+                        };
+                        if !is_string && !is_real && is_two_state && resized.has_xz() {
+                            resized = resized.to_two_state();
+                        }
+                        if !is_string {
+                            resized.is_signed = is_signed;
+                        }
+                        let changed = prev.as_ref() != Some(&resized);
+                        self.set_signal_value_by_name(&target, resized);
+                        if self.get_signal_value_by_name(&elem).is_none() {
+                            self.set_signal_value_by_name(&elem, Value::zero(1));
+                        }
+                        if let Some((base_name, _)) = elem.rsplit_once('[') {
+                            self.touch_queue(base_name);
+                        }
+                        return changed;
+                    }
                     if let Some((parent, _)) = flat.rsplit_once('.') {
                         if let Some(cont) = parent.rfind('[').map(|i| &parent[..i]) {
                             // A class-member collection stores under its
@@ -2492,6 +2616,12 @@ impl Simulator {
                                 };
                                 let changed = prev.as_ref() != Some(&fitted);
                                 self.set_signal_value_by_name(&flat_s, fitted);
+                                if !self.module.associative_arrays.is_empty() && flat_s.contains("].") {
+                                    self.mark_struct_coll_owner_present(&flat_s);
+                                }
+                                if changed {
+                                    self.touch_queue(&cont_s);
+                                }
                                 return changed;
                             }
                         }
@@ -2611,6 +2741,7 @@ impl Simulator {
                             if self.get_signal_value_by_name(&elem).is_none() {
                                 self.set_signal_value_by_name(&elem, Value::zero(1));
                             }
+                            self.mark_struct_coll_owner_present(&target);
                             return changed;
                         }
                     }
@@ -2931,6 +3062,10 @@ impl Simulator {
                                 }
                                 if let ExprKind::Ident(h) = &c.kind {
                                     segs.push(self.resolve_hier_name(h).into_owned());
+                                    segs.reverse();
+                                    break Some(segs.join("."));
+                                } else if let Some(flat_c) = self.flat_member_name(c) {
+                                    segs.push(flat_c);
                                     segs.reverse();
                                     break Some(segs.join("."));
                                 }

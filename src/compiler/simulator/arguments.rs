@@ -198,12 +198,10 @@ impl Simulator {
         }
         // An array item, also an associative one or a call returning an
         // array (§11.4.13, §13.4.1), matches any of its elements.
-        if let Some(keys) = self.inside_operand_keys(pat) {
-            for key in keys {
-                if let Some(ev) = self.get_signal_value_by_name(&key) {
-                    if Self::inside_values_equal(val, &ev).is_true() {
-                        return true;
-                    }
+        if let Some(vals) = self.inside_operand_values(pat) {
+            for ev in vals {
+                if Self::inside_values_equal(val, &ev).is_true() {
+                    return true;
                 }
             }
             return false;
@@ -2344,27 +2342,15 @@ impl Simulator {
         // §13.5.1: copied associative elements retain their packed fields.
         self.register_packed_leaf_layout(&key, &port.data_type);
         self.register_formal_shape(&key, &port.dimensions);
-        if !matches!(port.direction, PortDirection::Output) {
-            // §13.5.1: copy every element in, including unpacked-struct
-            // member leaves (`caller[k].x`).
-            let prefix = format!("{}[", caller);
-            let entries: Vec<(String, Value)> = self
-                .signals
-                .keys_with_elem_prefix(&prefix)
-                .into_iter()
-                .filter_map(|k| {
-                    let v = self.signals.get(&k)?.clone();
-                    Some((format!("{}{}", key, &k[caller.len()..]), v))
-                })
-                .collect();
-            for (k, v) in entries {
-                self.signals.insert(k, v);
-            }
-        }
         let is_string_key = self.is_string_keyed_array(&caller);
         self.module
             .associative_arrays
             .insert(key.clone(), is_string_key);
+        if !matches!(port.direction, PortDirection::Output) {
+            // §13.5.1: copy every element in, including `AssocTable` (with
+            // evaluated `default:`), nested row tables, and unpacked-struct member leaves.
+            self.copy_assoc_entries(&key, &caller);
+        }
         if let Some(&w) = self.widths.get(caller.as_str()) {
             self.widths.insert(key.clone(), w);
         }
@@ -2381,15 +2367,7 @@ impl Simulator {
     /// happens to share the name — the flat `module.associative_arrays` table
     /// is shared across nesting depths.
     pub(super) fn purge_assoc_param(&mut self, param: &str, prior: Option<bool>) {
-        let prefix = format!("{}[", param);
-        let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-        for k in keys {
-            self.signals.remove(&k);
-        }
-        // A pattern-bound formal's `default:` (see `bind_assoc_param`).
-        if !self.module.assoc_defaults.is_empty() {
-            self.module.assoc_defaults.remove(param);
-        }
+        self.assoc_clear(param, true);
         match prior {
             // An entry predated THIS call (it belongs to an enclosing frame
             // whose bindings are still live) — put it back.
@@ -2416,6 +2394,30 @@ impl Simulator {
         let id = self.next_dyn_id;
         self.next_dyn_id += 1;
         let tmp = format!("@wb#{}", id);
+        if let Some(table) = self.assoc_tables.get(param).cloned() {
+            let mut moved_entries = std::collections::BTreeMap::new();
+            for (ak, entry) in table.entries {
+                match entry {
+                    super::assoc_store::AssocEntry::Scalar(v) => {
+                        moved_entries.insert(ak, super::assoc_store::AssocEntry::Scalar(v));
+                    }
+                    super::assoc_store::AssocEntry::Compound(_) => {
+                        let dst_prefix = Self::name_with_key(&tmp, &ak.to_canon_string());
+                        moved_entries.insert(
+                            ak,
+                            super::assoc_store::AssocEntry::Compound(dst_prefix),
+                        );
+                    }
+                }
+            }
+            self.assoc_tables.insert(
+                tmp.clone(),
+                super::assoc_store::AssocTable {
+                    entries: moved_entries,
+                    evaluated_default: table.evaluated_default,
+                },
+            );
+        }
         let pre = format!("{}[", param);
         let moved: Vec<(String, Value)> = self
             .signals
@@ -2457,10 +2459,8 @@ impl Simulator {
     pub(super) fn apply_assoc_writebacks(&mut self, staged: Vec<(String, String)>) {
         for (tmp, caller) in staged {
             self.writeback_assoc_param(&tmp, &caller);
-            let tprefix = format!("{}[", tmp);
-            for k in self.signals.keys_with_elem_prefix(&tprefix) {
-                self.signals.remove(&k);
-            }
+            self.assoc_clear(&tmp, true);
+            self.assoc_tables.remove(&tmp);
             self.signals.remove(&format!("{}.size", tmp));
         }
     }
@@ -2475,24 +2475,7 @@ impl Simulator {
         if param == caller {
             return;
         }
-        let cprefix = format!("{}[", caller);
-        let old: Vec<String> = self.signals.keys_with_elem_prefix(&cprefix);
-        for k in old {
-            self.signals.remove(&k);
-        }
-        let pprefix = format!("{}[", param);
-        let entries: Vec<(String, Value)> = self
-            .signals
-            .keys_with_elem_prefix(&pprefix)
-            .into_iter()
-            .filter_map(|k| {
-                let v = self.signals.get(&k)?.clone();
-                Some((format!("{}{}", caller, &k[param.len()..]), v))
-            })
-            .collect();
-        for (k, v) in entries {
-            self.signals.insert(k, v);
-        }
+        self.copy_assoc_entries(caller, param);
     }
 
     /// §13.5.1: the per-call storage key of a fixed unpacked array formal (see

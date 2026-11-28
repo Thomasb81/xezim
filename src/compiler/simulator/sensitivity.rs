@@ -1234,6 +1234,9 @@ impl Simulator {
             _ => return None,
         };
         rev_indices.reverse();
+        if module.dynamic_arrays.contains(&name) || module.queue_vars.contains(&name) {
+            return Some(vec![format!("{}.size", name)]);
+        }
         let shape: Vec<(i64, i64)> = if let Some(&(a, b, _)) = module.arrays_2d.get(&name) {
             vec![a, b]
         } else {

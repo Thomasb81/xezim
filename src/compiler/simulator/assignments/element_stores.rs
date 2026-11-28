@@ -224,8 +224,11 @@ impl Simulator {
         let Some(b) = bv.to_i64().filter(|_| !bv.has_xz()) else {
             return Some(false);
         };
-        let key = self.assoc_key_str(&name, &kv);
-        let elem = format!("{}[{}]", name, key);
+        let Some(key) = self.assoc_key_from_val(&name, &kv) else {
+            self.warn_invalid_assoc_index(&name);
+            return Some(false);
+        };
+        let elem = format!("{}[{}]", name, key.to_canon_string());
         // A row that is itself a collection (`aq[k]` of `int aq[int][$]`):
         // `[j]` selects its element, which the collection paths handle.
         if self.is_associative_array(&elem)
@@ -236,8 +239,11 @@ impl Simulator {
         {
             return None;
         }
-        let fresh = !self.signals.contains_key(&elem);
-        let mut cur = self.get_signal_value_by_name(&elem).unwrap_or(default);
+        let existing = self.assoc_get_scalar(&name, &key);
+        let fresh = existing.is_none();
+        let mut cur = existing
+            .or_else(|| self.assoc_default_val(&name))
+            .unwrap_or(default);
         let phys = match self.select_base_elem_dim(expr) {
             Some((dl, dr)) if dl < dr => dr - b,
             Some((dl, dr)) => b - dl.min(dr),
@@ -274,7 +280,8 @@ impl Simulator {
             cur.set_bit(lsb + i, nb);
         }
         if changed || fresh {
-            self.set_signal_value_by_name(&elem, cur);
+            let fitted = self.fit_assoc_elem_val(&name, cur);
+            self.assoc_set_scalar(&name, key, fitted);
             self.mark_dirty(&elem);
             self.touch_queue(&name);
         }

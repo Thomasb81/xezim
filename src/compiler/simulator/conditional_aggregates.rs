@@ -803,16 +803,42 @@ impl Simulator {
             self.ensure_struct_member_coll(&name);
             if matches!(dims.first(), Some(UD::Associative { .. })) {
                 let string_keyed = self.string_keyed_dim(&dims[0]);
-                let default = self
-                    .module
-                    .assoc_defaults
-                    .get(&name)
-                    .cloned()
-                    .map(|e| self.eval_expr(&e));
+                let default = self.assoc_default_val(&name);
                 let keys = self.assoc_top_level_keys(&name);
+                let resolved_elem = self.resolve_dt(dt);
+                let leaf_scalar = !matches!(
+                    resolved_elem,
+                    DataType::Struct(ref su) if Self::spreads_member_wise(su)
+                ) && dims.len() == 1;
+                let scalar_default = leaf_scalar
+                    .then(|| {
+                        default.clone().or_else(|| self.coll_missing_elem_value(&name)).unwrap_or_else(|| {
+                            let ew = self.assoc_elem_width(&name).unwrap_or(32).max(1);
+                            if self.is_assoc_elem_two_state(&name) {
+                                Value::zero(ew)
+                            } else {
+                                Value::new(ew)
+                            }
+                        })
+                    });
                 let entries = keys
                     .into_iter()
                     .map(|key| {
+                        if let Some(def) = &scalar_default {
+                            let val = self
+                                .assoc_get_by_canon(&name, &key)
+                                .unwrap_or_else(|| def.clone());
+                            return (
+                                key,
+                                AggregateValue {
+                                    data_type: dt.clone(),
+                                    kind: AggregateKind::Scalar {
+                                        value: val,
+                                        default: def.clone(),
+                                    },
+                                },
+                            );
+                        }
                         let leaf = Self::hier_ident_expr(
                             vec![crate::ast::expr::HierPathSegment {
                                 name: crate::ast::Identifier {
@@ -1113,15 +1139,24 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(name.into(), *string_keyed);
-                self.eval_builtin_method(name, "delete", &[]);
+                self.assoc_clear(name, true);
                 if let Some(default) = default {
-                    let expr = self.value_method_arg_expr(default);
-                    self.module.assoc_defaults.insert(name.into(), expr);
-                } else {
-                    self.module.assoc_defaults.remove(name);
+                    let fitted = self.fit_assoc_elem_val(name, default.clone());
+                    self.assoc_tables
+                        .entry(name.to_string())
+                        .or_default()
+                        .evaluated_default = Some(fitted);
                 }
                 for (key, child) in entries {
-                    self.store_conditional_aggregate(&format!("{name}[{key}]"), child);
+                    let elem = format!("{name}[{key}]");
+                    if let AggregateKind::Scalar { value, .. } = &child.kind {
+                        self.assoc_set_by_canon(name, key, value.clone());
+                        continue;
+                    }
+                    self.store_conditional_aggregate(&elem, child);
+                    if let Some(ak) = self.assoc_key_from_canon(name, key) {
+                        self.assoc_mark_compound(name, ak, elem.clone());
+                    }
                 }
             }
             AggregateKind::Array {

@@ -455,11 +455,8 @@ impl Simulator {
         }
     }
 
-    /// §11.4.13: an unpacked array in an inside set contributes its values,
-    /// including associative arrays with sparse or string keys.
-    pub(super) fn inside_operand_keys(&mut self, expr: &Expression) -> Option<Vec<String>> {
-        // §11.4.13, §13.4.1: a call returning an unpacked array contributes
-        // the elements it returns, evaluated once; read as a scalar it was 0.
+    /// §11.4.13: evaluate the element values of an unpacked array / AA operand in `inside`.
+    pub(super) fn inside_operand_values(&mut self, expr: &Expression) -> Option<Vec<Value>> {
         if let Some(src) = self.ret_collection_operand(expr) {
             let Some(src) = src else {
                 return Some(Vec::new());
@@ -468,19 +465,16 @@ impl Simulator {
                 return Some(
                     self.assoc_top_level_keys(&src)
                         .into_iter()
-                        .map(|key| format!("{}[{}]", src, key))
+                        .filter_map(|key| self.assoc_get_by_canon(&src, &key))
                         .collect(),
                 );
             }
             return Some(
                 (0..self.get_queue_size(&src))
-                    .map(|i| format!("{}[{}]", src, i))
+                    .filter_map(|i| self.get_signal_value_by_name(&format!("{}[{}]", src, i)))
                     .collect(),
             );
         }
-        // An associative member (`h.aa`), or a module, package or local
-        // associative variable by its own name (`v inside {aa}` read the
-        // whole array as a scalar).
         let assoc = match self.expr_assoc_name(expr) {
             Some(name) if self.is_associative_array(&name) => Some(name),
             _ if !self.module.associative_arrays.is_empty()
@@ -494,13 +488,13 @@ impl Simulator {
             return Some(
                 self.assoc_top_level_keys(&name)
                     .into_iter()
-                    .map(|key| format!("{}[{}]", name, key))
+                    .filter_map(|key| self.assoc_get_by_canon(&name, &key))
                     .collect(),
             );
         }
         self.array_operand_name(expr).map(|name| {
             (0..self.get_queue_size(&name))
-                .map(|i| format!("{}[{}]", name, i))
+                .filter_map(|i| self.get_signal_value_by_name(&format!("{}[{}]", name, i)))
                 .collect()
         })
     }
@@ -823,18 +817,6 @@ impl Simulator {
         } else {
             None
         }
-    }
-
-    /// Flat storage name of `<assoc>[key]` for such an element.
-    pub(super) fn indexed_assoc_elem(
-        &mut self,
-        base: &Expression,
-        index: &Expression,
-    ) -> Option<String> {
-        let an = self.indexed_assoc_base(base)?;
-        let kv = self.eval_expr(index);
-        let key = self.assoc_key_str(&an, &kv);
-        Some(format!("{}[{}]", an, key))
     }
 
     /// The text of key `kv` selecting into `level` of the nested associative

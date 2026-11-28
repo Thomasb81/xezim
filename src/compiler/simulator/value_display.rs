@@ -394,6 +394,29 @@ impl Simulator {
 
     /// Render the value stored at flat signal `name`, interpreted as `dt`.
     pub(super) fn render_p_typed(&mut self, name: &str, dt: &DataType) -> String {
+        if let Some((base, rest)) = name.rsplit_once('[')
+            && rest.ends_with(']')
+            && let Some(table) = self.assoc_tables.get(base)
+        {
+            let canon = &rest[..rest.len() - 1];
+            if let Some(super::assoc_store::AssocEntry::Scalar(v)) = table
+                .entries
+                .iter()
+                .find(|(k, _)| k.to_canon_string() == canon)
+                .map(|(_, e)| e)
+            {
+                let v = v.clone();
+                let resolved = self.resolve_dt(dt);
+                if matches!(resolved, DataType::Struct(ref su) if su.packed) {
+                    if let DataType::Struct(su) = resolved {
+                        return self.render_p_packed(&v, &su);
+                    }
+                }
+                if !matches!(resolved, DataType::Struct(ref su) if Self::spreads_member_wise(su)) {
+                    return self.p_leaf_value(&v, dt);
+                }
+            }
+        }
         use crate::ast::types::SimpleType;
         // Enum member -> its label (LRM prints the name, not the encoding).
         if let DataType::TypeReference { name: tn, .. } = dt

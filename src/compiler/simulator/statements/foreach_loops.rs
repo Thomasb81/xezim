@@ -224,6 +224,10 @@ impl Simulator {
     /// with whether the keys are strings. Shared by the single-variable key
     /// scan and the multi-variable member arm's associative nesting.
     fn foreach_member_keys(&self, an: &str) -> (Vec<String>, bool) {
+        let is_str = self.is_string_keyed_array(an);
+        if self.is_associative_array(an) {
+            return (self.assoc_top_level_keys(an), is_str);
+        }
         let prefix = format!("{}[", an);
         // An assoc-of-collections member (e.g. `bq_t all[int]`) stores
         // elements as `all[5][0]` etc. — extract the key up to the FIRST
@@ -239,21 +243,9 @@ impl Simulator {
             .collect();
         Self::sort_name_keys(&mut ks);
         ks.dedup();
-        let is_str = self
-            .module
-            .associative_arrays
-            .get(an)
-            .copied()
-            .unwrap_or(false)
-            || self.is_string_keyed_array(an);
-        // Integer-keyed members iterate in NUMERIC order; lexicographic
-        // sort would visit "10" before "2". Use i64 so negative (signed)
-        // keys keep order.
         if is_str {
             Self::sort_name_keys(&mut ks);
         } else {
-            // §7.9: int keys traverse in NUMERIC order including NEGATIVE
-            // keys — u64 parsing mangled "-7" to 0.
             let wide = self.assoc_index_width_for(an).is_some_and(|(w, _)| w > 64);
             Self::sort_int_keys(&mut ks, wide);
         }
@@ -1580,68 +1572,104 @@ impl Simulator {
                     }
                 } else if self.is_associative_array(&name) {
                     // §7.8.2: the loop variable takes the AA's index
-                    // type (width + signedness). A signed shortint key
-                    // like -11823 must stay signed, not be re-parsed as
-                    // u64 (which fails and yields 0) or widened to 32.
+                    // type (width + signedness). Use native typed keys from
+                    // `assoc_tables` when populated so full-range unsigned 64b,
+                    // signed >64b, wildcard, and unpacked-struct keys work
+                    // without truncation or string parsing.
                     let (kw, ks_sign) = self.assoc_index_width_for(&name).unwrap_or((32, false));
-                    self.widths.insert(var.name.clone(), kw);
-                    let prefix = format!("{}[", name);
-                    // An assoc-of-collections (e.g. `bq_t all[int]`
-                    // where `bq_t = Base[$]`) stores elements as
-                    // `all[5][0]` etc. — extract the key up to the
-                    // FIRST `]` and dedup so multiple sub-elements
-                    // don't each produce a phantom key.
-                    let mut keys: Vec<String> = self
-                        .signals
-                        .elem_keys_with_prefix(&prefix)
-                        .filter_map(|k| {
-                            let rest = k.strip_prefix(prefix.as_str())?;
-                            Self::assoc_first_key_seg(rest).map(|s| s.to_string())
-                        })
-                        .collect();
-                    Self::sort_name_keys(&mut keys);
-                    keys.dedup();
-                    let is_str = self
-                        .module
-                        .associative_arrays
+                    let struct_dt = self.assoc_struct_key_type(&name);
+                    let typed_keys: Option<Vec<super::assoc_store::AssocKey>> = self
+                        .assoc_tables
                         .get(&*name)
-                        .copied()
-                        .unwrap_or(false)
-                        || self.is_string_keyed_array(&name);
-                    // Numeric key order for integer-keyed arrays (see
-                    // note above); lexicographic would scramble order.
-                    if is_str {
-                        Self::sort_name_keys(&mut keys);
+                        .filter(|t| !t.entries.is_empty())
+                        .map(|t| t.entries.keys().cloned().collect());
+                    if let Some(tkeys) = typed_keys {
+                        self.widths.insert(var.name.clone(), kw);
+                        for key in tkeys {
+                            if self.finished {
+                                break;
+                            }
+                            if let Some(dt) = &struct_dt {
+                                let var_lval = Expression::new(
+                                    ExprKind::Ident(HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![HierPathSegment {
+                                            name: var.clone(),
+                                            selects: Vec::new(),
+                                        }],
+                                        span: var.span,
+                                        cached_signal_id: Default::default(),
+                                        cached_resolved_name: Default::default(),
+                                        bound: crate::ast::binding::Bound::UNSET,
+                                    }),
+                                    var.span,
+                                );
+                                self.write_assoc_key_var(
+                                    &var_lval,
+                                    &key,
+                                    Some((kw, ks_sign)),
+                                    Some(dt),
+                                );
+                            } else {
+                                let kv = key.to_value(kw, ks_sign);
+                                self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
+                            }
+                            self.continue_flag = false;
+                            *iterations = iterations.saturating_add(1);
+                            self.exec_statement(body);
+                            if self.break_flag {
+                                break;
+                            }
+                            self.continue_flag = false;
+                        }
                     } else {
-                        Self::sort_int_keys(&mut keys, kw > 64);
-                    }
-                    for key in keys {
-                        if self.finished {
-                            break;
-                        }
-                        let kv = if is_str {
-                            Self::name_key_value(&key)
-                        } else if kw > 64 {
-                            Value::from_str_radix(&key, 16, kw)
+                        self.widths.insert(var.name.clone(), kw);
+                        let prefix = format!("{}[", name);
+                        let mut keys: Vec<String> = self
+                            .signals
+                            .elem_keys_with_prefix(&prefix)
+                            .filter_map(|k| {
+                                let rest = k.strip_prefix(prefix.as_str())?;
+                                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
+                            })
+                            .collect();
+                        Self::sort_name_keys(&mut keys);
+                        keys.dedup();
+                        let is_str = self
+                            .module
+                            .associative_arrays
+                            .get(&*name)
+                            .copied()
+                            .unwrap_or(false)
+                            || self.is_string_keyed_array(&name);
+                        if is_str {
+                            Self::sort_name_keys(&mut keys);
                         } else {
-                            // §7.9 + §7.8.2: SIGNED parse (negative keys
-                            // must not collapse to 0) at the DECLARED
-                            // index width/signedness.
-                            let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
-                            v.is_signed = ks_sign;
-                            v
-                        };
-                        self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
-                        self.continue_flag = false;
-                        *iterations = iterations.saturating_add(1);
-                        self.exec_statement(body);
-                        // `continue` is per-iteration (clear it); a
-                        // `break`/`return` (both set break_flag) exits
-                        // the loop and propagates — do NOT clear it.
-                        if self.break_flag {
-                            break;
+                            Self::sort_int_keys(&mut keys, kw > 64);
                         }
-                        self.continue_flag = false;
+                        for key in keys {
+                            if self.finished {
+                                break;
+                            }
+                            let kv = if is_str {
+                                Self::name_key_value(&key)
+                            } else if kw > 64 {
+                                Value::from_str_radix(&key, 16, kw)
+                            } else {
+                                let mut v =
+                                    Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+                                v.is_signed = ks_sign;
+                                v
+                            };
+                            self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
+                            self.continue_flag = false;
+                            *iterations = iterations.saturating_add(1);
+                            self.exec_statement(body);
+                            if self.break_flag {
+                                break;
+                            }
+                            self.continue_flag = false;
+                        }
                     }
                 } else if self.module.dynamic_arrays.contains(&*name)
                     || self.is_per_spec_dynamic_static(&name)

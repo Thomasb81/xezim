@@ -1923,12 +1923,14 @@ impl Simulator {
     fn sva_abort_step_site(&mut self, i: usize) {
         let node = self.sva_sites[i].node.clone();
         let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+        let sampled_names = std::mem::take(&mut self.sva_sites[i].sampled_names);
         let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
         let metas = self.sva_take_meta(i, attempts.len());
         let prev_active = self.active_sva_site.replace(i);
         let prev_scope = self.activation_scope.borrow().clone();
         *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
         let saved = self.install_preponed(&sampled_ids);
+        let saved_names = self.install_preponed_names(&sampled_names);
         self.sva_abort_step = true;
         let mut settled = Vec::new();
         let mut settled_meta = Vec::new();
@@ -1950,6 +1952,7 @@ impl Simulator {
             }
         });
         self.sva_abort_step = false;
+        self.restore_preponed_names(saved_names);
         self.restore_preponed(saved);
         self.sva_sites[i].attempts = attempts;
         self.sva_sites[i].attempt_meta = live_meta;
@@ -1966,6 +1969,7 @@ impl Simulator {
         self.sva_sites[i].settled.extend(settled);
         self.sva_sites[i].settled_meta.extend(settled_meta);
         self.sva_sites[i].sampled_ids = sampled_ids;
+        self.sva_sites[i].sampled_names = sampled_names;
         self.active_sva_site = prev_active;
         *self.activation_scope.borrow_mut() = prev_scope;
     }
@@ -2086,15 +2090,16 @@ impl Simulator {
         for action in [&a.action, &a.else_action].into_iter().flatten() {
             self.sva_collect_action_sampled(action, &mut sampled_ids, &mut sels);
         }
+        let mut sampled_names = Vec::new();
         let mut var_sels = Vec::new();
         for mut e in sels {
             if matches!(e.kind, ExprKind::Ident(_)) {
-                self.sva_all_cells(&e, &mut sampled_ids);
+                self.sva_all_cells_with_names(&e, &mut sampled_ids, &mut sampled_names);
                 continue;
             }
             match Self::sva_sel_kind(&e) {
                 Some(true) => {
-                    self.sva_cells(&e, &mut sampled_ids);
+                    self.sva_cells_with_names(&e, &mut sampled_ids, &mut sampled_names);
                 }
                 Some(false) => {
                     self.sva_resolve_signals(&mut e);
@@ -2104,14 +2109,17 @@ impl Simulator {
                     });
                     var_sels.push((e, dims));
                 }
-                None => self.sva_all_cells(&e, &mut sampled_ids),
+                None => self.sva_all_cells_with_names(&e, &mut sampled_ids, &mut sampled_names),
             }
         }
         sampled_ids.sort_unstable();
         sampled_ids.dedup();
+        sampled_names.sort_unstable();
+        sampled_names.dedup();
         let fixed = sampled_ids.len();
+        let fixed_names = sampled_names.len();
         for (e, _) in &var_sels {
-            self.sva_cells(e, &mut sampled_ids);
+            self.sva_cells_with_names(e, &mut sampled_ids, &mut sampled_names);
         }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
@@ -2123,6 +2131,13 @@ impl Simulator {
             if !self.sva_preponed.contains_key(&id) {
                 if let Some(v) = self.slot0_default(id).or_else(|| self.sva_cell_value(id)) {
                     self.sva_preponed.insert(id, v);
+                }
+            }
+        }
+        for name in &sampled_names {
+            if !self.sva_preponed_names.contains_key(name.as_str()) {
+                if let Some(v) = self.get_signal_value_by_name(name) {
+                    self.sva_preponed_names.insert(name.clone(), v);
                 }
             }
         }
@@ -2270,6 +2285,8 @@ impl Simulator {
             sampled_ids,
             sels: var_sels,
             fixed,
+            sampled_names,
+            fixed_names,
             lv_init,
             procedural,
             captured,
@@ -2609,10 +2626,28 @@ impl Simulator {
     /// for `p[1][2]` of an array of packed vectors; `sa[2]` and `sa[2].x`;
     /// each cell of a slice).
     pub(super) fn sva_cells(&mut self, e: &Expression, out: &mut Vec<usize>) -> Option<String> {
+        self.sva_cells_inner(e, out, None)
+    }
+
+    pub(super) fn sva_cells_with_names(
+        &mut self,
+        e: &Expression,
+        out: &mut Vec<usize>,
+        out_names: &mut Vec<String>,
+    ) -> Option<String> {
+        self.sva_cells_inner(e, out, Some(out_names))
+    }
+
+    fn sva_cells_inner(
+        &mut self,
+        e: &Expression,
+        out: &mut Vec<usize>,
+        mut out_names: Option<&mut Vec<String>>,
+    ) -> Option<String> {
         let name = match &e.kind {
             ExprKind::Ident(h) => return Some(self.resolve_hier_name(h).into_owned()),
             ExprKind::Index { expr, index } => {
-                let base = self.sva_cells(expr, out)?;
+                let base = self.sva_cells_inner(expr, out, out_names.as_deref_mut())?;
                 let i = self.eval_expr(index);
                 if i.has_xz() {
                     return None;
@@ -2620,7 +2655,7 @@ impl Simulator {
                 Self::name_with_index(&base, i.to_i64()?)
             }
             ExprKind::MemberAccess { expr, member } => {
-                let mut base = self.sva_cells(expr, out)?;
+                let mut base = self.sva_cells_inner(expr, out, out_names.as_deref_mut())?;
                 base.push('.');
                 base.push_str(&member.name);
                 base
@@ -2631,7 +2666,7 @@ impl Simulator {
                 right,
                 kind,
             } => {
-                let base = self.sva_cells(expr, out)?;
+                let base = self.sva_cells_inner(expr, out, out_names.as_deref_mut())?;
                 // A part-select of a cell reads that cell.
                 if self.resolve_signal_id(&base).is_some() {
                     return Some(base);
@@ -2658,10 +2693,14 @@ impl Simulator {
                 // Only the indices the array has.
                 let (alo, ahi) = self.sva_slice_bounds(&base)?;
                 for i in lo.max(i128::from(alo))..=hi.min(i128::from(ahi)) {
-                    if let Some(id) =
-                        self.resolve_signal_id(&Self::name_with_index(&base, i as i64))
-                    {
+                    let elem = Self::name_with_index(&base, i as i64);
+                    if let Some(id) = self.resolve_signal_id(&elem) {
                         out.push(id);
+                    } else if let Some(names) = out_names.as_deref_mut()
+                        && (self.module.dynamic_arrays.contains(&base)
+                            || self.module.queue_vars.contains(&base))
+                    {
+                        names.push(elem);
                     }
                 }
                 return None;
@@ -2670,6 +2709,14 @@ impl Simulator {
         };
         if let Some(id) = self.resolve_signal_id(&name) {
             out.push(id);
+        } else if let Some(names) = out_names.as_deref_mut()
+            && name.split_once('[').is_some_and(|(b, _)| {
+                self.module.dynamic_arrays.contains(b)
+                    || self.module.queue_vars.contains(b)
+                    || self.is_associative_array(b)
+            })
+        {
+            names.push(name.clone());
         }
         // A row of a multi-dimensional array (`m2[1] == m`, the receiver of
         // `m2[1].sum()`) reads each of its cells.
@@ -2715,6 +2762,10 @@ impl Simulator {
     /// The index range of the unpacked array or sub-array `base` (`a`, or
     /// `m[1]` of a two-dimensional `m`).
     pub(super) fn sva_slice_bounds(&self, base: &str) -> Option<(i64, i64)> {
+        if self.module.dynamic_arrays.contains(base) || self.module.queue_vars.contains(base) {
+            let sz = self.get_queue_size(base);
+            return (sz > 0).then(|| (0, sz as i64 - 1));
+        }
         if let Some(&(_, lo, hi)) = self.array_first_id.get(base) {
             return Some((lo, hi));
         }
@@ -2745,6 +2796,33 @@ impl Simulator {
                 .filter(|(n, _)| n.starts_with(&pre))
                 .map(|(_, &id)| id),
         );
+    }
+
+    /// Every cell (id and/or name) of the array select chain `e` reads, for an
+    /// index the Preponed region cannot evaluate.
+    pub(super) fn sva_all_cells_with_names(
+        &self,
+        e: &Expression,
+        out: &mut Vec<usize>,
+        out_names: &mut Vec<String>,
+    ) {
+        self.sva_all_cells(e, out);
+        let Some(h) = Self::sva_sel_root(e) else {
+            return;
+        };
+        let root = self.resolve_hier_name(h);
+        if self.module.dynamic_arrays.contains(root.as_ref())
+            || self.module.queue_vars.contains(root.as_ref())
+        {
+            let sz = self.get_queue_size(&root);
+            for idx in 0..sz {
+                out_names.push(format!("{root}[{idx}]"));
+            }
+        } else if self.is_associative_array(&root) {
+            for k in self.assoc_top_level_keys(&root) {
+                out_names.push(format!("{root}[{k}]"));
+            }
+        }
     }
 
     /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
@@ -3174,6 +3252,7 @@ impl Simulator {
         }
         self.sva_preponed_slot = Some(self.time);
         self.sva_preponed.clear();
+        self.sva_preponed_names.clear();
         for i in 0..self.sva_sites.len() {
             if !self.sva_sites[i].sels.is_empty() {
                 self.sva_sel_cells(i);
@@ -3184,6 +3263,12 @@ impl Simulator {
                     self.sva_preponed.insert(id, self.signal_table[id].clone());
                 } else if is_packed_id(id) {
                     self.sva_preponed.insert(id, self.packed.read(id));
+                }
+            }
+            for j in 0..self.sva_sites[i].sampled_names.len() {
+                let name = self.sva_sites[i].sampled_names[j].clone();
+                if let Some(v) = self.get_signal_value_by_name(&name) {
+                    self.sva_preponed_names.insert(name, v);
                 }
             }
         }
@@ -3203,7 +3288,9 @@ impl Simulator {
     pub(super) fn sva_sel_cells(&mut self, i: usize) {
         let sels = std::mem::take(&mut self.sva_sites[i].sels);
         let mut ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+        let mut names = std::mem::take(&mut self.sva_sites[i].sampled_names);
         ids.truncate(self.sva_sites[i].fixed);
+        names.truncate(self.sva_sites[i].fixed_names);
         // No class context, as at a tick (`tick_sva_sites`).
         let this = std::mem::take(&mut self.this_stack);
         let cls = std::mem::take(&mut self.class_context_stack);
@@ -3219,12 +3306,13 @@ impl Simulator {
                 }
                 continue;
             }
-            self.sva_cells(e, &mut ids);
+            self.sva_cells_with_names(e, &mut ids, &mut names);
         }
         self.this_stack = this;
         self.class_context_stack = cls;
         self.sva_sites[i].sels = sels;
         self.sva_sites[i].sampled_ids = ids;
+        self.sva_sites[i].sampled_names = names;
     }
 
     /// The array and the index of `mem[k]`, or of a part-select of it.
@@ -3268,6 +3356,57 @@ impl Simulator {
                 self.sync_mirror(id);
             } else {
                 self.packed.put_value(id, &v);
+            }
+        }
+    }
+
+    /// Swap in the Preponed sample for each named collection element; returns
+    /// the saved live values for `restore_preponed_names`.
+    pub(super) fn install_preponed_names(
+        &mut self,
+        names: &[String],
+    ) -> Vec<(String, Option<Value>)> {
+        if self.sva_preponed_names.is_empty() || names.is_empty() {
+            return Vec::new();
+        }
+        let mut saved: Vec<(String, Option<Value>)> = Vec::new();
+        for name in names {
+            if let Some(pre) = self.sva_preponed_names.get(name).cloned() {
+                if name.ends_with(']')
+                    && let Some((base, rest)) = name.rsplit_once('[')
+                    && self.assoc_tables.contains_key(base)
+                {
+                    let canon = &rest[..rest.len() - 1];
+                    let live = self.assoc_get_by_canon(base, canon);
+                    saved.push((name.clone(), live));
+                    self.assoc_set_by_canon(base, canon, pre);
+                } else {
+                    let live = self.signals.get(name).cloned();
+                    saved.push((name.clone(), live));
+                    self.signals.insert(name.clone(), pre);
+                }
+            }
+        }
+        saved
+    }
+
+    /// Restore the live named collection elements swapped out by `install_preponed_names`.
+    pub(super) fn restore_preponed_names(&mut self, saved: Vec<(String, Option<Value>)>) {
+        for (name, v) in saved.into_iter().rev() {
+            if name.ends_with(']')
+                && let Some((base, rest)) = name.rsplit_once('[')
+                && self.assoc_tables.contains_key(base)
+            {
+                let canon = &rest[..rest.len() - 1];
+                if let Some(v) = v {
+                    self.assoc_set_by_canon(base, canon, v);
+                } else if let Some(ak) = self.assoc_key_from_canon(base, canon) {
+                    self.assoc_delete_key(base, &ak);
+                }
+            } else if let Some(v) = v {
+                self.signals.insert(name, v);
+            } else {
+                self.signals.remove(&name);
             }
         }
     }
@@ -3396,6 +3535,7 @@ impl Simulator {
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read through the sampled-value overlay.
             let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+            let sampled_names = std::mem::take(&mut self.sva_sites[i].sampled_names);
             let prev_active = self.active_sva_site.replace(i);
             let prev_activation_scope = self.activation_scope.borrow().clone();
             *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
@@ -3410,6 +3550,7 @@ impl Simulator {
             // evaluating a disable condition that refers to that history.
             if self.sva_cancel_disabled(i) {
                 self.sva_sites[i].sampled_ids = sampled_ids;
+                self.sva_sites[i].sampled_names = sampled_names;
                 self.sva_report_outcomes(i, settled, settled_meta);
                 self.active_sva_site = prev_active;
                 *self.activation_scope.borrow_mut() = prev_activation_scope;
@@ -3454,6 +3595,7 @@ impl Simulator {
                 }
             }
             let saved = self.install_preponed(&sampled_ids);
+            let saved_names = self.install_preponed_names(&sampled_names);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             let mut metas = self.sva_take_meta(i, attempts.len());
             // A late start steps only the attempts it started (the last ones;
@@ -3512,8 +3654,10 @@ impl Simulator {
             // dropping it at a fixed queue depth changes assertion results.
             self.sva_sites[i].attempts = live;
             self.sva_sites[i].attempt_meta = live_meta;
+            self.restore_preponed_names(saved_names);
             self.restore_preponed(saved);
             self.sva_sites[i].sampled_ids = sampled_ids;
+            self.sva_sites[i].sampled_names = sampled_names;
             // IEEE 1800-2017 Clause 39: with stepping enabled, report attempts
             // still in flight after advancing; `sva_report_outcomes` reports
             // the ones it decided.
@@ -3611,7 +3755,8 @@ impl Simulator {
                 .get(name.as_str())
                 .copied()
                 .filter(|id| sampled_ids.contains(id))
-                .and_then(|id| self.sva_preponed.get(&id).cloned());
+                .and_then(|id| self.sva_preponed.get(&id).cloned())
+                .or_else(|| self.sva_preponed_names.get(name.as_str()).cloned());
             let v = pre
                 .or_else(|| self.get_signal_value_by_name(name))
                 .unwrap_or_else(|| Value::zero(32));

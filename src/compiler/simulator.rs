@@ -664,6 +664,7 @@ mod event_stamps;
 mod module_paths;
 mod names;
 mod rand_csp;
+mod assoc_store;
 mod ref_aliases;
 mod rand_diag;
 
@@ -1248,6 +1249,10 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
+    /// §16.5.1: Preponed (slot-entry) snapshots for dynamic-array / queue /
+    /// associative-array elements that live in `signals` / `assoc_tables`
+    /// rather than `signal_table`.
+    sva_preponed_names: HashMap<String, Value>,
     /// The time slot `sva_preponed` was captured for. The Preponed region
     /// runs once per slot (§4.4.2.1), so the later deltas of a slot (a VPI
     /// write from cbReadWriteSynch reopening the Active region) keep it.
@@ -4780,6 +4785,13 @@ pub struct Simulator {
     /// `assoc_top_level_keys` results, valid while the array's element-key
     /// stamp (`SignalMap::elem_gen_for_prefix`) is unchanged.
     assoc_keys_cache: RefCell<HashMap<String, (u64, Arc<Vec<String>>)>>,
+    /// Typed `BTreeMap`-backed storage for associative arrays (§7.8–§7.9).
+    assoc_tables: HashMap<String, assoc_store::AssocTable>,
+    /// Per-element identity tracking for queues with live `ref` element aliases (§7.10.3).
+    queue_elem_ids: HashMap<String, std::collections::VecDeque<u64>>,
+    /// Values captured when a `ref`-aliased queue element is removed from its queue.
+    detached_qref_vals: HashMap<u64, Value>,
+    next_qref_id: u64,
     /// §16.9.3 sampled-value function watches: per call site, a history of
     /// the operand sampled (preponed) at each matching clock edge. hist[0]
     /// is the sample at the most recent edge, hist[1] one edge earlier, …

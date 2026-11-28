@@ -394,4 +394,5 @@ pub(super) struct QueueLocalSave {
     /// keys): a same-named callee local drops it at its declaration, and an
     /// int-keyed array re-registered as string-keyed reads its keys as text.
     pub(super) assoc_entry: Option<bool>,
+    pub(super) assoc_table: Option<super::assoc_store::AssocTable>,
 }

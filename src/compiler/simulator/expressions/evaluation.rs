@@ -1513,11 +1513,7 @@ impl Simulator {
                                 return Self::int_count(count as u64);
                             }
                             if mname == "delete" {
-                                let prefix = format!("{}[", obj_name);
-                                let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-                                for k in keys {
-                                    self.signals.remove(&k);
-                                }
+                                self.assoc_clear(obj_name, false);
                                 return Value::zero(32);
                             }
                         }
@@ -2932,11 +2928,7 @@ impl Simulator {
                     if let Some(src) = self.take_pending_ret_collection() {
                         let iv = self.eval_expr(index);
                         if self.is_associative_array(&src) {
-                            let key = self.assoc_key_str(&src, &iv);
-                            return self
-                                .get_signal_value_by_name(&format!("{}[{}]", src, key))
-                                .or_else(|| self.assoc_missing_elem_value(&src))
-                                .unwrap_or_else(|| Value::new(32));
+                            return self.coll_elem_read(&src, &src, iv, ctx_width);
                         }
                         if let Some(i) = iv.to_i64().filter(|_| !iv.has_xz()) {
                             if i >= 0 && (i as u64) < self.get_queue_size(&src) {
@@ -3098,8 +3090,21 @@ impl Simulator {
                     && Self::cond_expr_is_effect_free(index, false)
                 {
                     let nm = base_nm.as_deref().unwrap_or("");
-                    if let Some(&(_, _, ew)) = self.module.arrays.get(nm) {
+                    if !self.is_associative_array(nm)
+                        && let Some(&(_, _, ew)) = self.module.arrays.get(nm)
+                    {
                         if self.eval_expr(index).has_xz() {
+                            if let Some(v) = self.coll_missing_elem_value(nm) {
+                                return v;
+                            }
+                            if self.is_string_collection(nm) {
+                                return Value::from_string("");
+                            }
+                            if self.module.two_state_signals.contains(nm) {
+                                let mut v = Value::zero(ew.max(1));
+                                v.is_signed = self.signed_signals.contains(nm);
+                                return v;
+                            }
                             return Value::new(ew.max(1));
                         }
                     }
@@ -3375,20 +3380,21 @@ impl Simulator {
                 }
                 // Element of an unpacked array of ASSOCIATIVE arrays:
                 // `a[i][key]` looks the key up in the assoc array `a[i]`.
-                if let Some(elem) = self.indexed_assoc_elem(expr, index) {
-                    return self.get_signal_value_by_name(&elem).unwrap_or_else(|| {
-                        // §7.8.6: a missing key reads the element type's
-                        // default (0 for a 2-state type), not x.
-                        let base = elem.rfind('[').map_or(elem.as_str(), |p| &elem[..p]);
-                        self.assoc_missing_elem_value(base)
-                            .unwrap_or_else(|| Value::new(32))
-                    });
+                if let Some(an) = self.indexed_assoc_base(expr) {
+                    return self.assoc_read_expr(&an, &an, index, ctx_width);
                 }
                 // Multidimensional associative-array read `m[k1][k2]...[kn]`:
                 // look up the flat compound key `m[K1][K2]...[Kn]`. Mirrors
                 // the write path (`multidim_assoc_elem`) so the two agree on
                 // the key for every type (handle / int / signed / string).
                 if let Some((base, key)) = self.multidim_assoc_elem(expr, index) {
+                    if let Some((row, canon)) = key.rsplit_once('[')
+                        && canon.ends_with(']')
+                        && self.is_associative_array(row)
+                        && let Some(v) = self.assoc_get_by_canon(row, &canon[..canon.len() - 1])
+                    {
+                        return v;
+                    }
                     if let Some(v) = self.get_signal_value_by_name(&key) {
                         return v;
                     }
@@ -3422,11 +3428,7 @@ impl Simulator {
                     // Associative element of an array-of-collections class
                     // property (`aa[0][key]`).
                     if self.is_associative_array(&row) {
-                        let kv = self.eval_expr(index);
-                        let key = self.assoc_key_str(&row, &kv);
-                        return self
-                            .get_signal_value_by_name(&format!("{}[{}]", row, key))
-                            .unwrap_or_else(|| Value::new(ctx_width.max(1)));
+                        return self.assoc_read_expr(&row, &row, index, ctx_width);
                     }
                 }
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
@@ -3449,6 +3451,9 @@ impl Simulator {
                 // (e.g. `instr_category[cat][i]`). The base `assoc[key]` maps to
                 // a compound queue name; read its `[i]` element.
                 if let Some(cn) = self.nested_index_name(expr) {
+                    if self.is_associative_array(&cn) {
+                        return self.assoc_read_expr(&cn, &cn, index, ctx_width);
+                    }
                     // §11.5.1: an x/z index reads x.
                     let Some(i) = self.eval_expr(index).to_index() else {
                         return Value::new(ctx_width.max(1));
@@ -3460,6 +3465,9 @@ impl Simulator {
                 // Class associative-array / queue member element read — base
                 // may be a bare member (`m[k]`) or another object's (`obj.m[k]`).
                 if let Some(an) = self.expr_assoc_name(expr) {
+                    if self.is_associative_array(&an) {
+                        return self.assoc_read_expr(&an, &an, index, ctx_width);
+                    }
                     // For a queue member, `$` in the index means last-index;
                     // make its bound available (e.g. `instr_list[$]`).
                     let is_dyn = self.module.dynamic_arrays.contains(&an);
@@ -3475,6 +3483,12 @@ impl Simulator {
                     // reads an all-x element (an associative array's key may
                     // legitimately carry x bits, so it is left alone).
                     if !self.is_associative_array(&an) && idx_val.has_xz() && !idx_val.is_real {
+                        if let Some(v) = self.coll_missing_elem_value(&an) {
+                            return v;
+                        }
+                        if self.is_string_collection(&an) {
+                            return Value::from_string("");
+                        }
                         let ew = self.assoc_elem_width(&an).unwrap_or(ctx_width.max(1));
                         return Value::new(ew.max(1));
                     }
@@ -3898,6 +3912,9 @@ impl Simulator {
                         // specialization gets its own cells (matching
                         // `eval_builtin_method`'s push_back/size).
                         let store_name = self.spec_static_coll_key(&name);
+                        if self.is_associative_array(&name) {
+                            return self.assoc_read_expr(&name, &store_name, index, ctx_width);
+                        }
                         // Array element access: look up signal "name[idx]"
                         if self.module.dynamic_arrays.contains(&*name) {
                             self.dollar_bound
@@ -4592,12 +4609,10 @@ impl Simulator {
                             // A queue/array operand means set membership: the
                             // value matches any element (e.g. `group inside
                             // {supported_isa}`). Scalars compare directly.
-                            if let Some(keys) = self.inside_operand_keys(r) {
-                                for key in keys {
-                                    if let Some(ev) = self.get_signal_value_by_name(&key) {
-                                        if Self::inside_values_equal(&val, &ev).is_true() {
-                                            return Value::from_u64(1, 1);
-                                        }
+                            if let Some(vals) = self.inside_operand_values(r) {
+                                for ev in vals {
+                                    if Self::inside_values_equal(&val, &ev).is_true() {
+                                        return Value::from_u64(1, 1);
                                     }
                                 }
                                 continue;

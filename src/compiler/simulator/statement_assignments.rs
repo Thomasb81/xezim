@@ -3702,6 +3702,12 @@ impl Simulator {
                 // elements + size, not re-key assoc entries. Distinguish
                 // by whether the collection is a true assoc array.
                 let dst_is_assoc = self.is_associative_array(&dst);
+                if dst_is_assoc && self.is_associative_array(&src) {
+                    self.copy_assoc_entries(&dst, &src);
+                    self.touch_queue(&dst);
+                    self.settle_after_proc_write();
+                    return;
+                }
                 // §7.6, §7.2: a FIXED class-property array of unpacked
                 // structs from a queue or dynamic array (`fx = da`): each
                 // element member by member, from the destination's left
@@ -5153,35 +5159,19 @@ impl Simulator {
             let lname = self.resolve_hier_name(lhier);
             let rname = self.resolve_hier_name(rhier);
             if self.is_associative_array(&lname) && self.is_associative_array(&rname) {
-                let prefix = format!("{}[", rname);
-                let entries: Vec<(String, Value)> = self
-                    .signals
-                    .keys_with_elem_prefix(&prefix)
-                    .into_iter()
-                    .filter(|k| k.ends_with(']'))
-                    .filter_map(|k| {
-                        let v = self.signals.get(&k)?.clone();
-                        let key = &k[prefix.len()..k.len() - 1];
-                        Some((format!("{}[{}]", lname, key), v))
-                    })
-                    .collect();
-                for (k, v) in entries {
-                    self.signals.insert(k, v);
-                }
-                // §7.2/§7.2.1: a struct element's members are leaves under
-                // the element (`aa[k].m`), and its dynamic members are
-                // collections with sizes of their own — not cells of the
-                // array the raw copy above moved. Copy each element whole.
-                if let Some(su) = self.queue_elem_struct(&rname) {
-                    let (lname, rname) = (lname.into_owned(), rname.into_owned());
-                    for key in self.assoc_top_level_keys(&rname) {
-                        let (d, s) = (format!("{}[{}]", lname, key), format!("{}[{}]", rname, key));
+                let (lname_s, rname_s) = (lname.into_owned(), rname.into_owned());
+                self.copy_assoc_entries(&lname_s, &rname_s);
+                if let Some(su) = self.queue_elem_struct(&rname_s) {
+                    for key in self.assoc_top_level_keys(&rname_s) {
+                        let (d, s) =
+                            (format!("{}[{}]", lname_s, key), format!("{}[{}]", rname_s, key));
                         self.copy_unpacked_struct(&d, &s, &su);
                         if self.get_signal_value_by_name(&d).is_none() {
                             self.set_signal_value_by_name(&d, Value::zero(1));
                         }
                     }
                 }
+                self.touch_queue(&lname_s);
                 self.settle_after_proc_write();
                 return;
             }
