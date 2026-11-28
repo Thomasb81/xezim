@@ -69,8 +69,10 @@ impl Simulator {
                         .contains_key(cn.split('#').next().unwrap_or(cn)));
             if cn_is_class {
                 self.record_local_class_type(name, cn);
-                self.var_class_types
-                    .insert(name.to_string(), cn.to_string());
+                class_metadata!(
+                    self.var_class_types,
+                    insert(name.to_string(), cn.to_string())
+                );
                 // A typedef'd local (e.g. `table_q_t rq` where
                 // `table_q_t = shared#(Foo[$])`) resolves to
                 // `cn` but hides the type_args inside the
@@ -80,7 +82,7 @@ impl Simulator {
                 // (§8.25 — otherwise `T` stays unbound).
                 if let crate::ast::types::DataType::TypeReference { name: tref, .. } = data_type {
                     if let Some((_, Some(ta))) = self.resolve_typeref_class_with_type_args(tref) {
-                        self.var_type_args.insert(name.to_string(), ta);
+                        class_metadata!(self.var_type_args, insert(name.to_string(), ta));
                     }
                 }
             } else if self.resolve_type_param_binding(cn).is_some() {
@@ -102,8 +104,10 @@ impl Simulator {
                 // `new()` could not resolve CB, and the return
                 // value came back null to the caller.
                 self.record_local_class_type(name, cn);
-                self.var_class_types
-                    .insert(name.to_string(), cn.to_string());
+                class_metadata!(
+                    self.var_class_types,
+                    insert(name.to_string(), cn.to_string())
+                );
             }
         }
         // Record a parameterized local's declared `#(...)` type
@@ -122,18 +126,20 @@ impl Simulator {
                 None
             };
         if let Some(ta) = self.scoped_class_type_args(data_type) {
-            self.var_type_args.insert(name.to_string(), ta);
+            class_metadata!(self.var_type_args, insert(name.to_string(), ta));
         } else if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
             if !type_args.is_empty() {
-                self.var_type_args
-                    .insert(name.to_string(), type_args.clone());
+                class_metadata!(
+                    self.var_type_args,
+                    insert(name.to_string(), type_args.clone())
+                );
             } else if let Some(ta) = resolved_ta {
-                self.var_type_args.insert(name.to_string(), ta);
+                class_metadata!(self.var_type_args, insert(name.to_string(), ta));
             } else {
-                self.var_type_args.remove(name);
+                class_metadata!(self.var_type_args, remove(name));
             }
         } else {
-            self.var_type_args.remove(name);
+            class_metadata!(self.var_type_args, remove(name));
         }
         // §15.3/§15.4: record a mailbox/semaphore-typed local so
         // a later separate `name = new(bound)` allocates the right
@@ -142,11 +148,13 @@ impl Simulator {
         // var_class_types) when this decl isn't a container.
         match class_name.and_then(|t| self.builtin_container_kind(t)) {
             Some(k) => {
-                self.var_container_types
-                    .insert(name.to_string(), k.to_string());
+                class_metadata!(
+                    self.var_container_types,
+                    insert(name.to_string(), k.to_string())
+                );
             }
             None => {
-                self.var_container_types.remove(name);
+                class_metadata!(self.var_container_types, remove(name));
             }
         }
         // LRM §6.19.6: track typedef-typed locals so
@@ -182,7 +190,7 @@ impl Simulator {
                 || self.module.typedefs.contains_key(&tn)
                 || self.module.typedef_types.contains_key(&tn)
             {
-                self.var_typedef_types.insert(name.to_string(), tn.clone());
+                class_metadata!(self.var_typedef_types, insert(name.to_string(), tn.clone()));
                 // Record the frame-scoped typedef too so a
                 // method-local enum type is resolvable without
                 // the flat `var_class_types`/`var_typedef_types`
@@ -368,80 +376,74 @@ impl Simulator {
     /// Make `meta` the name-keyed metadata of local `name` again, replacing
     /// `out`, the installed declaration's entries just captured.
     fn apply_local_meta(&mut self, name: &str, meta: &LocalMeta, out: &LocalMeta) {
-        fn put<V: Clone>(map: &mut HashMap<String, V>, k: &str, v: &Option<V>) {
-            match v {
-                Some(v) => {
-                    map.insert(k.to_string(), v.clone());
+        macro_rules! restore {
+            ($($field:ident).+, $value:expr) => {
+                if let Some(value) = $value {
+                    class_metadata!(self.$($field).+, insert(name.to_owned(), value.clone()));
+                } else {
+                    class_metadata!(self.$($field).+, remove(name));
                 }
-                None => {
-                    map.remove(k);
+            };
+        }
+        macro_rules! flag {
+            ($field:ident, $on:expr) => {
+                if $on {
+                    class_metadata!(self.$field, insert(name.to_owned()));
+                } else {
+                    class_metadata!(self.$field, remove(name));
                 }
-            }
+            };
         }
-        fn flag(set: &mut HashSet<String>, k: &str, on: bool) {
-            if on {
-                set.insert(k.to_string());
-            } else {
-                set.remove(k);
-            }
-        }
-        put(&mut self.var_typedef_types, name, &meta.typedef);
-        put(&mut self.var_class_types, name, &meta.class);
-        put(&mut self.var_container_types, name, &meta.container);
-        put(&mut self.var_type_args, name, &meta.type_args);
+        restore!(var_typedef_types, &meta.typedef);
+        restore!(var_class_types, &meta.class);
+        restore!(var_container_types, &meta.container);
+        restore!(var_type_args, &meta.type_args);
         if let Some(w) = meta.width {
             self.widths.insert(name.to_owned(), w);
         } else {
             self.widths.remove(name);
         }
-        flag(&mut self.signed_signals, name, meta.signed);
-        flag(&mut self.real_signals, name, meta.real);
-        flag(&mut self.string_signals, name, meta.string);
-        let m = &mut self.module;
-        m.var_decl_types.remove(name);
-        for (key, _) in &out.decl_types {
-            m.var_decl_types.remove(key);
+        flag!(signed_signals, meta.signed);
+        flag!(real_signals, meta.real);
+        flag!(string_signals, meta.string);
+
+        // Clear the outgoing shape, then install the saved shape.
+        macro_rules! replace_members {
+            ($field:ident, $old:expr, $new:expr, $insert:ident) => {
+                class_metadata!(self.module.$field, remove(name));
+                for (key, _) in $old {
+                    class_metadata!(self.module.$field, remove(key.as_str()));
+                }
+                for (key, value) in $new {
+                    class_metadata!(self.module.$field, $insert(key.clone(), value.clone()));
+                }
+            };
         }
-        for (key, ty) in &meta.decl_types {
-            m.var_decl_types.insert_shared(key.clone(), ty.clone());
-        }
-        fn keyed_shared<T: Clone + Eq + std::hash::Hash>(
-            map: &mut xezim_core::shared_names::SharedSliceMap<T>,
-            name: &str,
-            out: &[(String, Vec<T>)],
-            v: &[(String, Vec<T>)],
-        ) {
-            map.remove(name);
-            for (k, _) in out {
-                map.remove(k.as_str());
-            }
-            map.extend(v.iter().cloned());
-        }
-        keyed_shared(
-            &mut m.struct_members,
-            name,
+        replace_members!(
+            var_decl_types,
+            &out.decl_types,
+            &meta.decl_types,
+            insert_shared
+        );
+        replace_members!(
+            struct_members,
             &out.struct_members,
             &meta.struct_members,
+            insert
         );
-        keyed_shared(
-            &mut m.packed_struct_fields,
-            name,
+        replace_members!(
+            packed_struct_fields,
             &out.packed_fields,
             &meta.packed_fields,
+            insert
         );
-        m.packed_signal_elem_widths.remove(name);
-        for (k, _) in &out.elem_widths {
-            m.packed_signal_elem_widths.remove(k.as_str());
-        }
-        for (k, v) in &meta.elem_widths {
-            m.packed_signal_elem_widths.insert(k.clone(), *v);
-        }
-        keyed_shared(
-            &mut m.packed_full_dims,
-            name,
-            &out.full_dims,
-            &meta.full_dims,
+        replace_members!(
+            packed_signal_elem_widths,
+            &out.elem_widths,
+            &meta.elem_widths,
+            insert
         );
+        replace_members!(packed_full_dims, &out.full_dims, &meta.full_dims, insert);
     }
 
     /// Capture the installed metadata of `name`, which declaration `origin`
@@ -755,19 +757,19 @@ impl Simulator {
             }
         }
         if m.1 {
-            self.signed_signals.insert(name.to_string());
+            class_metadata!(self.signed_signals, insert(name.to_string()));
         } else {
-            self.signed_signals.remove(name);
+            class_metadata!(self.signed_signals, remove(name));
         }
         if m.2 {
-            self.real_signals.insert(name.to_string());
+            class_metadata!(self.real_signals, insert(name.to_string()));
         } else {
-            self.real_signals.remove(name);
+            class_metadata!(self.real_signals, remove(name));
         }
         if m.3 {
-            self.string_signals.insert(name.to_string());
+            class_metadata!(self.string_signals, insert(name.to_string()));
         } else {
-            self.string_signals.remove(name);
+            class_metadata!(self.string_signals, remove(name));
         }
     }
 
@@ -910,9 +912,9 @@ impl Simulator {
         let mut v = v.resize(w);
         v.is_signed = self.type_is_signed_concrete(data_type);
         if v.is_signed {
-            self.signed_signals.insert(name.to_string());
+            class_metadata!(self.signed_signals, insert(name.to_string()));
         } else {
-            self.signed_signals.remove(name);
+            class_metadata!(self.signed_signals, remove(name));
         }
         v
     }

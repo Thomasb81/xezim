@@ -1781,18 +1781,18 @@ impl Simulator {
             }
         }
         for (base, (lo, hi), w) in new_outer {
-            self.module.arrays_2d.remove(&base);
-            self.module.arrays.insert(base, (lo, hi, w));
+            class_metadata!(self.module.arrays_2d, remove(&base));
+            class_metadata!(self.module.arrays, insert(base, (lo, hi, w)));
         }
         for (name, w, is_q) in new_dyn {
             if self.module.dynamic_arrays.contains(&name) {
                 continue;
             }
-            self.module.dynamic_arrays.insert(name.clone());
+            class_metadata!(self.module.dynamic_arrays, insert(name.clone()));
             if is_q {
-                self.module.queue_vars.insert(name.clone());
+                class_metadata!(self.module.queue_vars, insert(name.clone()));
             }
-            self.module.arrays.insert(name.clone(), (0, 63, w));
+            class_metadata!(self.module.arrays, insert(name.clone(), (0, 63, w)));
             self.set_queue_size(&name, 0);
         }
         // Every other statically named dynamic member: one inside a NESTED

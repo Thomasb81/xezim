@@ -1152,7 +1152,7 @@ impl Simulator {
                         .max(1);
                         if !self.module.arrays.contains_key(&key) {
                             self.meta_note(&key);
-                            self.module.arrays.insert(key, (lo, hi, w));
+                            class_metadata!(self.module.arrays, insert(key, (lo, hi, w)));
                         }
                     }
                     _ => {}
@@ -1353,9 +1353,10 @@ impl Simulator {
         self.meta_note(key);
         if let Some(fields) = self.packed_struct_layout_in_ctx(dt) {
             if !fields.is_empty() {
-                self.module
-                    .packed_struct_fields
-                    .insert(key.to_string(), fields);
+                class_metadata!(
+                    self.module.packed_struct_fields,
+                    insert(key.to_string(), fields)
+                );
             }
         }
     }
@@ -2316,9 +2317,10 @@ impl Simulator {
                 ),
                 _ => false,
             });
-            self.module
-                .associative_arrays
-                .insert(key.clone(), is_string_key);
+            class_metadata!(
+                self.module.associative_arrays,
+                insert(key.clone(), is_string_key)
+            );
             let w = resolve_type_width(
                 &port.data_type,
                 Some(&self.module.parameters),
@@ -2362,14 +2364,15 @@ impl Simulator {
             }
         }
         let is_string_key = self.is_string_keyed_array(&caller);
-        self.module
-            .associative_arrays
-            .insert(key.clone(), is_string_key);
+        class_metadata!(
+            self.module.associative_arrays,
+            insert(key.clone(), is_string_key)
+        );
         if let Some(&w) = self.widths.get(caller.as_str()) {
             self.widths.insert(key.clone(), w);
         }
         if self.string_signals.contains(caller.as_str()) {
-            self.string_signals.insert(key.clone());
+            class_metadata!(self.string_signals, insert(key.clone()));
         }
         Some((key, caller, None))
     }
@@ -2388,20 +2391,21 @@ impl Simulator {
         }
         // A pattern-bound formal's `default:` (see `bind_assoc_param`).
         if !self.module.assoc_defaults.is_empty() {
-            self.module.assoc_defaults.remove(param);
+            class_metadata!(self.module.assoc_defaults, remove(param));
         }
         match prior {
             // An entry predated THIS call (it belongs to an enclosing frame
             // whose bindings are still live) — put it back.
             Some(is_string_key) => {
-                self.module
-                    .associative_arrays
-                    .insert(param.to_string(), is_string_key);
+                class_metadata!(
+                    self.module.associative_arrays,
+                    insert(param.to_string(), is_string_key)
+                );
             }
             // This call created the registration; no enclosing frame wanted
             // it — drop it.
             None => {
-                self.module.associative_arrays.remove(param);
+                class_metadata!(self.module.associative_arrays, remove(param));
             }
         }
     }
@@ -2457,11 +2461,7 @@ impl Simulator {
     pub(super) fn apply_assoc_writebacks(&mut self, staged: Vec<(String, String)>) {
         for (tmp, caller) in staged {
             self.writeback_assoc_param(&tmp, &caller);
-            let tprefix = format!("{}[", tmp);
-            for k in self.signals.keys_with_elem_prefix(&tprefix) {
-                self.signals.remove(&k);
-            }
-            self.signals.remove(&format!("{}.size", tmp));
+            self.cleanup_dyn_storage(&tmp);
         }
     }
 
@@ -2502,7 +2502,7 @@ impl Simulator {
     pub(super) fn array_formal_key(&mut self, port: &crate::ast::decl::FunctionPort) -> String {
         let dt = &port.data_type;
         let key = self.formal_dyn_key(&port.name.name, dt);
-        self.module.var_decl_types.insert(key.clone(), dt.clone());
+        class_metadata!(self.module.var_decl_types, insert(key.clone(), dt.clone()));
         key
     }
 
@@ -2588,9 +2588,9 @@ impl Simulator {
             )
             .max(1);
             let param = self.array_formal_key(port);
-            self.module.arrays.insert(param.clone(), (lo, hi, w));
+            class_metadata!(self.module.arrays, insert(param.clone(), (lo, hi, w)));
             if descending {
-                self.module.descending_arrays.insert(param.clone());
+                class_metadata!(self.module.descending_arrays, insert(param.clone()));
             }
             if self.assign_struct_concat(&param, parts.iter().collect()) {
                 return Some((param, String::new(), lo, hi));
@@ -2626,7 +2626,7 @@ impl Simulator {
             )
             .max(1);
             let param = self.array_formal_key(port);
-            self.module.arrays.insert(param.clone(), (lo, hi, w));
+            class_metadata!(self.module.arrays, insert(param.clone(), (lo, hi, w)));
             self.note_formal_direction(&param, descending);
             let indices: Vec<i64> = if descending {
                 (lo..=hi).rev().collect()
@@ -2706,16 +2706,18 @@ impl Simulator {
                 .map(|s| s.2)
                 .or_else(|| self.module.arrays_nd.get(&*caller).map(|s| s.1))?;
             if numeric.len() == 2 {
-                self.module
-                    .arrays_2d
-                    .insert(param.clone(), (numeric[0], numeric[1], w));
+                class_metadata!(
+                    self.module.arrays_2d,
+                    insert(param.clone(), (numeric[0], numeric[1], w))
+                );
             } else {
-                self.module.arrays_nd.insert(param.clone(), (numeric, w));
+                class_metadata!(self.module.arrays_nd, insert(param.clone(), (numeric, w)));
             }
-            self.module
-                .unpacked_decl_dims
-                .insert(param.clone(), declared);
-            self.multi_dim_array_names.insert(param.clone());
+            class_metadata!(
+                self.module.unpacked_decl_dims,
+                insert(param.clone(), declared)
+            );
+            class_metadata!(self.multi_dim_array_names, insert(param.clone()));
             if param != caller {
                 let w = match self.module.arrays_2d.get(&param) {
                     Some(&(_, _, w)) => w,
@@ -2794,7 +2796,7 @@ impl Simulator {
                 self.signals.insert(format!("{}[{}]", param, idx), v);
             }
         }
-        self.module.arrays.insert(param.clone(), (lo, hi, w));
+        class_metadata!(self.module.arrays, insert(param.clone(), (lo, hi, w)));
         // §7.6: a store to a descending formal (`output int o[5:3]`) starts
         // at its left bound, as for any other descending array.
         self.note_formal_direction(&param, descending);
@@ -2805,9 +2807,9 @@ impl Simulator {
     /// descending, for the stores of the body (§7.6).
     fn note_formal_direction(&mut self, param: &str, descending: bool) {
         if descending {
-            self.module.descending_arrays.insert(param.to_string());
+            class_metadata!(self.module.descending_arrays, insert(param.to_string()));
         } else {
-            self.module.descending_arrays.remove(param);
+            class_metadata!(self.module.descending_arrays, remove(param));
         }
     }
 
@@ -3001,12 +3003,12 @@ impl Simulator {
 
     /// Drop the array registrations a formal received in `bind_array_arg`.
     pub(super) fn purge_array_formal(&mut self, param: &str) {
-        self.module.arrays.remove(param);
-        if self.module.arrays_2d.remove(param).is_some()
-            | self.module.arrays_nd.remove(param).is_some()
+        class_metadata!(self.module.arrays, remove(param));
+        if class_metadata!(self.module.arrays_2d, remove(param)).is_some()
+            | class_metadata!(self.module.arrays_nd, remove(param)).is_some()
         {
-            self.module.unpacked_decl_dims.remove(param);
-            self.multi_dim_array_names.remove(param);
+            class_metadata!(self.module.unpacked_decl_dims, remove(param));
+            class_metadata!(self.multi_dim_array_names, remove(param));
         }
     }
 
@@ -3272,19 +3274,19 @@ impl Simulator {
                 self.signals.insert(k, v);
             }
             if let Some(shape) = self.module.arrays.get(param).copied() {
-                self.module.arrays.insert(tmp.clone(), shape);
+                class_metadata!(self.module.arrays, insert(tmp.clone(), shape));
             }
             if let Some(shape) = self.module.arrays_2d.get(param).copied() {
-                self.module.arrays_2d.insert(tmp.clone(), shape);
+                class_metadata!(self.module.arrays_2d, insert(tmp.clone(), shape));
             }
             if let Some(shape) = self.module.arrays_nd.get(param).cloned() {
-                self.module.arrays_nd.insert(tmp.clone(), shape);
+                class_metadata!(self.module.arrays_nd, insert(tmp.clone(), shape));
             }
             if let Some(bounds) = self.module.unpacked_decl_dims.get(param).cloned() {
-                self.module.unpacked_decl_dims.insert(tmp.clone(), bounds);
+                class_metadata!(self.module.unpacked_decl_dims, insert(tmp.clone(), bounds));
             }
             if self.multi_dim_array_names.contains(param) {
-                self.multi_dim_array_names.insert(tmp.clone());
+                class_metadata!(self.multi_dim_array_names, insert(tmp.clone()));
             }
             staged.push((tmp, caller.clone(), *lo, *hi));
         }

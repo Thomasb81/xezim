@@ -52,7 +52,7 @@ impl Simulator {
                 })
                 .collect();
             for (k, v) in ret_layouts {
-                self.module.packed_struct_fields.insert_if_absent(k, || v);
+                class_metadata!(self.module.packed_struct_fields, insert_if_absent(k, || v));
             }
         }
         self.sanitize_class_hierarchy();
@@ -481,7 +481,7 @@ impl Simulator {
         // into the bit-concat path and truncates to one operand's 1024-bit
         // width. LRM §6.16 / §11.4.12.
         for name in self.module.string_signals.iter() {
-            self.string_signals.insert(name.clone());
+            class_metadata!(self.string_signals, insert(name.clone()));
         }
 
         // Register static member collections (`static T m[$]`, `static T
@@ -572,22 +572,17 @@ impl Simulator {
         self.register_struct_member_collections();
         for (name, is_assoc, width, is_str, is_queue, capacity) in static_cols {
             if is_queue {
-                self.module.queue_vars.insert(name.clone());
+                class_metadata!(self.module.queue_vars, insert(name.clone()));
                 if let Some(capacity) = capacity {
-                    self.module.queue_max_sizes.insert(name.clone(), capacity);
+                    class_metadata!(self.module.queue_max_sizes, insert(name.clone(), capacity));
                 }
             }
             if is_assoc {
-                self.module
-                    .associative_arrays
-                    .entry(name.clone())
+                class_metadata!(self.module.associative_arrays, entry(name.clone()))
                     .or_insert(is_str);
             } else {
-                self.module.dynamic_arrays.insert(name.clone());
-                self.module
-                    .arrays
-                    .entry(name.clone())
-                    .or_insert((0, 63, width));
+                class_metadata!(self.module.dynamic_arrays, insert(name.clone()));
+                class_metadata!(self.module.arrays, entry(name.clone())).or_insert((0, 63, width));
                 self.set_queue_size(&name, 0);
             }
         }
@@ -631,10 +626,7 @@ impl Simulator {
             } else {
                 Value::all_x(width)
             };
-            self.module
-                .arrays
-                .entry(key.clone())
-                .or_insert((lo, hi, width));
+            class_metadata!(self.module.arrays, entry(key.clone())).or_insert((lo, hi, width));
             for i in lo..=hi {
                 let elem = format!("{}[{}]", key, i);
                 self.widths.insert(elem.clone(), width);

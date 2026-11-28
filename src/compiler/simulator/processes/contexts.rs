@@ -272,11 +272,12 @@ impl Simulator {
     ) {
         if let Some(dd) = cdef.array_prop_decl_dims.get(prop) {
             if dd.first().is_some_and(|&(l, r)| l > r) {
-                self.module.descending_arrays.insert(scoped.to_string());
+                class_metadata!(self.module.descending_arrays, insert(scoped.to_string()));
             }
-            self.module
-                .unpacked_decl_dims
-                .insert(scoped.to_string(), dd.clone());
+            class_metadata!(
+                self.module.unpacked_decl_dims,
+                insert(scoped.to_string(), dd.clone())
+            );
         }
     }
 

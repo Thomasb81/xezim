@@ -1244,10 +1244,10 @@ impl Simulator {
                                 if len >= bound {
                                     let value = self.mbx_message(&args[0]);
                                     let cont = pc.resume_at(pc.start + i + 1);
-                                    self.mailbox_put_waiters
-                                        .entry(handle)
-                                        .or_default()
-                                        .push_back(MailboxPutWaiter { pid, value, cont });
+                                    self.park_mailbox_put(
+                                        handle,
+                                        MailboxPutWaiter { pid, value, cont },
+                                    );
                                     return;
                                 }
                             }

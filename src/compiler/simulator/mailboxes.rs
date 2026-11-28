@@ -89,6 +89,98 @@ impl Simulator {
         }
     }
 
+    pub(super) fn park_mailbox_put(&mut self, handle: usize, waiter: MailboxPutWaiter) {
+        self.mailbox_put_by_pid.insert(waiter.pid, handle);
+        self.mailbox_put_waiters
+            .entry(handle)
+            .or_default()
+            .push_back(waiter);
+    }
+
+    pub(super) fn cancel_mailbox_put(&mut self, pid: usize) {
+        let Some(handle) = self.mailbox_put_by_pid.remove(&pid) else {
+            return;
+        };
+        if let Some(waiters) = self.mailbox_put_waiters.get_mut(&handle) {
+            let waiter = waiters
+                .iter()
+                .position(|w| w.pid == pid)
+                .and_then(|i| waiters.remove(i));
+            if waiters.is_empty() {
+                self.mailbox_put_waiters.remove(&handle);
+            }
+            if let Some(waiter) = waiter {
+                self.discard_mailbox_pattern(&waiter.value);
+            }
+        }
+    }
+
+    pub(super) fn rebuild_mailbox_put_index(&mut self) {
+        self.mailbox_put_by_pid.clear();
+        for (&handle, waiters) in &self.mailbox_put_waiters {
+            for waiter in waiters {
+                self.mailbox_put_by_pid.insert(waiter.pid, handle);
+            }
+        }
+        // An older checkpoint may still contain a cancelled producer.
+        let cancelled: Vec<_> = self
+            .mailbox_put_by_pid
+            .keys()
+            .filter(|pid| self.killed_pids.contains(pid))
+            .copied()
+            .collect();
+        for pid in cancelled {
+            self.cancel_mailbox_put(pid);
+        }
+        // Legacy checkpoints can contain orphaned tokens. Once restored,
+        // normal delivery, cancellation and sweep release tokens directly.
+        if !self.mbx_patterns.is_empty() {
+            let live: HashSet<_> = self
+                .mailboxes
+                .values()
+                .flatten()
+                .chain(
+                    self.mailbox_put_waiters
+                        .values()
+                        .flatten()
+                        .map(|w| &w.value),
+                )
+                .filter_map(Self::mailbox_pattern_token)
+                .collect();
+            self.mbx_patterns.retain(|token, _| live.contains(token));
+        }
+    }
+
+    pub(super) fn release_mailbox_storage(&mut self, handle: usize) {
+        if let Some(messages) = self.mailboxes.remove(&handle) {
+            for value in messages {
+                self.discard_mailbox_pattern(&value);
+            }
+            self.mailbox_bound.remove(&handle);
+        }
+        if let Some(waiters) = self.mailbox_put_waiters.remove(&handle) {
+            for waiter in waiters {
+                self.mailbox_put_by_pid.remove(&waiter.pid);
+                self.discard_mailbox_pattern(&waiter.value);
+            }
+        }
+        self.mailbox_get_waiters.remove(&handle);
+    }
+
+    fn mailbox_pattern_token(value: &Value) -> Option<u64> {
+        if value.width == 64 && value.is_fill {
+            value.to_u64()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn discard_mailbox_pattern(&mut self, value: &Value) {
+        if let Some(token) = Self::mailbox_pattern_token(value) {
+            self.mbx_patterns.remove(&token);
+        }
+    }
+
     /// §15.4.1 — a slot just freed on a bounded mailbox: admit one parked `put`
     /// (store its value, resume the producer). No-op for an unbounded mailbox or
     /// when no producer is waiting.
@@ -106,6 +198,10 @@ impl Simulator {
             .get_mut(&handle)
             .and_then(|q| q.pop_front())
         {
+            self.mailbox_put_by_pid.remove(&w.pid);
+            if self.mailbox_put_waiters[&handle].is_empty() {
+                self.mailbox_put_waiters.remove(&handle);
+            }
             self.mailboxes.get_mut(&handle).unwrap().push_back(w.value);
             if w.cont.is_empty() {
                 self.child_finished(w.pid);
@@ -310,10 +406,7 @@ impl Simulator {
     /// the destination's type gives the pattern its context. `false` when `v`
     /// is not a pattern token.
     fn mbx_deliver_pattern(&mut self, lvalue: &Expression, v: &Value, consume: bool) -> bool {
-        if v.width != 64 || !v.is_fill {
-            return false;
-        }
-        let Some(tok) = v.to_u64() else {
+        let Some(tok) = Self::mailbox_pattern_token(v) else {
             return false;
         };
         let Some(items) = (if consume {
@@ -337,10 +430,9 @@ impl Simulator {
     /// Captured message syntax can be the only owner of a class handle.
     /// The token itself is not that handle (§8.7 / §15.4.3).
     pub(super) fn mbx_pattern_items(&self, value: &Value) -> Option<&[AssignmentPatternItem]> {
-        if value.width != 64 || !value.is_fill {
-            return None;
-        }
-        self.mbx_patterns.get(&value.to_u64()?).map(Vec::as_slice)
+        self.mbx_patterns
+            .get(&Self::mailbox_pattern_token(value)?)
+            .map(Vec::as_slice)
     }
 
     /// Write one delivered message into a parked waiter's lvalue, taking the

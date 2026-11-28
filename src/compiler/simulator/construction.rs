@@ -54,23 +54,26 @@ impl Simulator {
             });
         match fixed_tail.as_deref() {
             Some([d2]) => {
-                self.module.arrays.remove(scoped);
-                self.module
-                    .arrays_2d
-                    .insert(scoped.to_string(), ((0, 63), *d2, width));
+                class_metadata!(self.module.arrays, remove(scoped));
+                class_metadata!(
+                    self.module.arrays_2d,
+                    insert(scoped.to_string(), ((0, 63), *d2, width))
+                );
             }
             Some(dims) if dims.len() >= 2 => {
-                self.module.arrays.remove(scoped);
+                class_metadata!(self.module.arrays, remove(scoped));
                 let mut shape = vec![(0, 63)];
                 shape.extend_from_slice(dims);
-                self.module
-                    .arrays_nd
-                    .insert(scoped.to_string(), (shape, width));
+                class_metadata!(
+                    self.module.arrays_nd,
+                    insert(scoped.to_string(), (shape, width))
+                );
             }
             _ => {
-                self.module
-                    .arrays
-                    .insert(scoped.to_string(), (0, 63, width));
+                class_metadata!(
+                    self.module.arrays,
+                    insert(scoped.to_string(), (0, 63, width))
+                );
             }
         }
     }
@@ -197,18 +200,18 @@ impl Simulator {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
                 if cd.queue_property_names.contains(prop) {
-                    self.module.queue_vars.insert(n_name.clone());
+                    class_metadata!(self.module.queue_vars, insert(n_name.clone()));
                 }
-                self.module.dynamic_arrays.insert(n_name.clone());
+                class_metadata!(self.module.dynamic_arrays, insert(n_name.clone()));
                 if let Some(&t) = self.module.arrays_2d.get(&s_name) {
-                    self.module.arrays_2d.insert(n_name.clone(), t);
+                    class_metadata!(self.module.arrays_2d, insert(n_name.clone(), t));
                 } else if let Some(t) = self.module.arrays_nd.get(&s_name).cloned() {
-                    self.module.arrays_nd.insert(n_name.clone(), t);
+                    class_metadata!(self.module.arrays_nd, insert(n_name.clone(), t));
                 } else {
-                    self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                    class_metadata!(self.module.arrays, insert(n_name.clone(), (0, 63, w)));
                 }
                 if let Some(m) = max {
-                    self.module.queue_max_sizes.insert(n_name.clone(), m);
+                    class_metadata!(self.module.queue_max_sizes, insert(n_name.clone(), m));
                 }
                 let sz = self.get_queue_size(&s_name);
                 self.set_queue_size(&n_name, sz);
@@ -229,10 +232,10 @@ impl Simulator {
                         if let Some(row) = k.strip_suffix(".size") {
                             let nrow = format!("{}{}", n_name, &row[s_name.len()..]);
                             if self.module.dynamic_arrays.contains(row) {
-                                self.module.dynamic_arrays.insert(nrow.clone());
+                                class_metadata!(self.module.dynamic_arrays, insert(nrow.clone()));
                             }
                             if let Some(&t) = self.module.arrays.get(row) {
-                                self.module.arrays.insert(nrow, t);
+                                class_metadata!(self.module.arrays, insert(nrow, t));
                             }
                         }
                         self.signals.insert(nk, v);
@@ -242,12 +245,16 @@ impl Simulator {
             for (prop, &is_str) in &cd.assoc_properties {
                 let s_pre = format!("{}#{}[", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
-                self.module
-                    .associative_arrays
-                    .insert(n_name.clone(), is_str);
-                let widths = &mut self.module.assoc_index_widths;
-                if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
-                    widths.insert(n_name.clone(), kw);
+                class_metadata!(
+                    self.module.associative_arrays,
+                    insert(n_name.clone(), is_str)
+                );
+                if let Some(&kw) = self
+                    .module
+                    .assoc_index_widths
+                    .get(&s_pre[..s_pre.len() - 1])
+                {
+                    class_metadata!(self.module.assoc_index_widths, insert(n_name.clone(), kw));
                 }
                 // §7.4.5: a row that is a queue or dynamic array keeps its
                 // size (`<h>#m[k].size`) and its registration in the copy.
@@ -265,10 +272,10 @@ impl Simulator {
                     if let Some(row) = rest.strip_suffix(".size") {
                         let (srow, nrow) = (format!("{s_pre}{row}"), format!("{n_name}[{row}"));
                         if self.module.dynamic_arrays.contains(&srow) {
-                            self.module.dynamic_arrays.insert(nrow.clone());
+                            class_metadata!(self.module.dynamic_arrays, insert(nrow.clone()));
                         }
                         if let Some(&t) = self.module.arrays.get(&srow) {
-                            self.module.arrays.insert(nrow, t);
+                            class_metadata!(self.module.arrays, insert(nrow, t));
                         }
                     }
                     self.signals.insert(format!("{}[{}", n_name, rest), v);
@@ -286,13 +293,13 @@ impl Simulator {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
                 if let Some(&t) = self.module.arrays.get(&s_name) {
-                    self.module.arrays.insert(n_name.clone(), t);
+                    class_metadata!(self.module.arrays, insert(n_name.clone(), t));
                 }
                 if let Some(&t) = self.module.arrays_2d.get(&s_name) {
-                    self.module.arrays_2d.insert(n_name.clone(), t);
+                    class_metadata!(self.module.arrays_2d, insert(n_name.clone(), t));
                 }
                 if let Some(t) = self.module.arrays_nd.get(&s_name).cloned() {
-                    self.module.arrays_nd.insert(n_name.clone(), t);
+                    class_metadata!(self.module.arrays_nd, insert(n_name.clone(), t));
                 }
                 for k in self.signals.keys_with_elem_prefix(&format!("{}[", s_name)) {
                     let Some(v) = self.signals.get(&k).cloned() else {
@@ -3041,9 +3048,10 @@ impl Simulator {
                 if hidden_collections.contains(prop.as_str()) {
                     continue;
                 }
-                self.module
-                    .associative_arrays
-                    .insert(format!("{}#{}", handle, prop), is_str);
+                class_metadata!(
+                    self.module.associative_arrays,
+                    insert(format!("{}#{}", handle, prop), is_str)
+                );
             }
             // §8.25: a key sized by a class parameter takes this object's
             // specialization, not the default `assoc_index_props` holds.
@@ -3053,9 +3061,10 @@ impl Simulator {
                 }
                 if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
                     let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
-                    self.module
-                        .assoc_index_widths
-                        .insert(format!("{}#{}", handle, prop), (kw, signed));
+                    class_metadata!(
+                        self.module.assoc_index_widths,
+                        insert(format!("{}#{}", handle, prop), (kw, signed))
+                    );
                 }
             }
             // Per-instance queue / dynamic-array members. Register the instance-
@@ -3079,12 +3088,12 @@ impl Simulator {
                         DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
                     ) && super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
                 }) {
-                    self.signed_class_colls.insert(scoped.clone());
+                    class_metadata!(self.signed_class_colls, insert(scoped.clone()));
                 }
                 if cdef.queue_property_names.contains(prop) {
-                    self.module.queue_vars.insert(scoped.clone());
+                    class_metadata!(self.module.queue_vars, insert(scoped.clone()));
                 }
-                self.module.dynamic_arrays.insert(scoped.clone());
+                class_metadata!(self.module.dynamic_arrays, insert(scoped.clone()));
                 if cdef.dynamic_tail_properties.contains_key(prop) {
                     // The object is not on the heap yet: its value parameters
                     // are read from the instance being built.
@@ -3096,7 +3105,7 @@ impl Simulator {
                     }
                     self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
                 } else {
-                    self.module.arrays.insert(scoped.clone(), (0, 63, width));
+                    class_metadata!(self.module.arrays, insert(scoped.clone(), (0, 63, width)));
                 }
                 let capacity = cdef
                     .queue_property_bounds
@@ -3121,7 +3130,10 @@ impl Simulator {
                     })
                     .or(max);
                 if let Some(capacity) = capacity {
-                    self.module.queue_max_sizes.insert(scoped.clone(), capacity);
+                    class_metadata!(
+                        self.module.queue_max_sizes,
+                        insert(scoped.clone(), capacity)
+                    );
                 }
                 self.set_queue_size(&scoped, 0);
             }
@@ -3148,7 +3160,7 @@ impl Simulator {
                     Some(sh) if sh.len() == 1 => sh[0],
                     _ => (lo, hi),
                 };
-                self.module.arrays.insert(scoped.clone(), (lo, hi, width));
+                class_metadata!(self.module.arrays, insert(scoped.clone(), (lo, hi, width)));
                 self.note_member_decl_dims(cdef, prop, &scoped);
                 // §6.8, §7.4: each element starts at its type's default — x
                 // for a 4-state element; an unpacked-struct element as its
@@ -3218,13 +3230,15 @@ impl Simulator {
                 let shape = own_shape.as_ref().unwrap_or(shape);
                 self.note_member_decl_dims(cdef, prop, &scoped);
                 if shape.len() == 2 {
-                    self.module
-                        .arrays_2d
-                        .insert(scoped.clone(), (shape[0], shape[1], width));
+                    class_metadata!(
+                        self.module.arrays_2d,
+                        insert(scoped.clone(), (shape[0], shape[1], width))
+                    );
                 } else {
-                    self.module
-                        .arrays_nd
-                        .insert(scoped.clone(), (shape.clone(), width));
+                    class_metadata!(
+                        self.module.arrays_nd,
+                        insert(scoped.clone(), (shape.clone(), width))
+                    );
                 }
                 let total: i64 = shape.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
                 // §6.8, §7.4: x for a 4-state element type (see above).
@@ -3475,8 +3489,8 @@ impl Simulator {
                     .unwrap_or(sig.width)
                     .max(1);
                 let scoped = format!("{}#{}", handle, prop);
-                self.module.dynamic_arrays.insert(scoped.clone());
-                self.module.arrays.insert(scoped.clone(), (0, 63, w));
+                class_metadata!(self.module.dynamic_arrays, insert(scoped.clone()));
+                class_metadata!(self.module.arrays, insert(scoped.clone(), (0, 63, w)));
                 self.set_queue_size(&scoped, 0);
             }
         }
@@ -3895,6 +3909,10 @@ impl Simulator {
                     }
                     if let (Some(v), Some(arg)) = (&val, args.first()) {
                         self.mbx_assign_delivered(arg, v, method_name == "get");
+                    } else if method_name == "get"
+                        && let Some(v) = &val
+                    {
+                        self.discard_mailbox_pattern(v);
                     }
                     // A consuming `get` frees a slot — admit a parked producer.
                     if method_name == "get" {
@@ -3933,6 +3951,10 @@ impl Simulator {
                             self.admit_mailbox_put_waiter(handle);
                         }
                         return Value::from_u64(1, 32);
+                    } else if method_name == "try_get"
+                        && let Some(v) = &val
+                    {
+                        self.discard_mailbox_pattern(v);
                     }
                     return Value::zero(32);
                 }

@@ -1138,34 +1138,43 @@ impl Simulator {
                     self.signals.insert(n.clone(), wide);
                 }
             }
-            self.module.string_signals.insert(n.clone());
-            self.string_signals.insert(n.clone());
+            class_metadata!(self.module.string_signals, insert(n.clone()));
+            class_metadata!(self.string_signals, insert(n.clone()));
             names.push(n);
         }
-        self.module
-            .var_decl_types
-            .insert(base.to_string(), dt.clone());
+        class_metadata!(
+            self.module.var_decl_types,
+            insert(base.to_string(), dt.clone())
+        );
         match ty {
             DpiCType::Array { elem, dims } => {
                 let w = elem.leaf_width().max(1);
                 match dims.as_slice() {
                     [(l, r)] => {
-                        self.module
-                            .arrays
-                            .insert(base.to_string(), (*l.min(r), *l.max(r), w));
+                        class_metadata!(
+                            self.module.arrays,
+                            insert(base.to_string(), (*l.min(r), *l.max(r), w))
+                        );
                         if l > r {
-                            self.module.descending_arrays.insert(base.to_string());
+                            class_metadata!(
+                                self.module.descending_arrays,
+                                insert(base.to_string())
+                            );
                         }
                     }
                     [a, b] => {
-                        self.module.arrays_2d.insert(base.to_string(), (*a, *b, w));
-                        self.multi_dim_array_names.insert(base.to_string());
+                        class_metadata!(
+                            self.module.arrays_2d,
+                            insert(base.to_string(), (*a, *b, w))
+                        );
+                        class_metadata!(self.multi_dim_array_names, insert(base.to_string()));
                     }
                     _ => {
-                        self.module
-                            .arrays_nd
-                            .insert(base.to_string(), (dims.clone(), w));
-                        self.multi_dim_array_names.insert(base.to_string());
+                        class_metadata!(
+                            self.module.arrays_nd,
+                            insert(base.to_string(), (dims.clone(), w))
+                        );
+                        class_metadata!(self.multi_dim_array_names, insert(base.to_string()));
                     }
                 }
                 if matches!(**elem, DpiCType::Struct(_)) {
@@ -1182,15 +1191,15 @@ impl Simulator {
     fn dpi_export_unbind_aggregate(&mut self, base: &str, names: &[String]) {
         for n in names {
             self.signals.remove(n);
-            self.module.string_signals.remove(n);
-            self.string_signals.remove(n);
+            class_metadata!(self.module.string_signals, remove(n));
+            class_metadata!(self.string_signals, remove(n));
         }
-        self.module.var_decl_types.remove(base);
-        self.module.arrays.remove(base);
-        self.module.arrays_2d.remove(base);
-        self.module.arrays_nd.remove(base);
-        self.module.descending_arrays.remove(base);
-        self.multi_dim_array_names.remove(base);
+        class_metadata!(self.module.var_decl_types, remove(base));
+        class_metadata!(self.module.arrays, remove(base));
+        class_metadata!(self.module.arrays_2d, remove(base));
+        class_metadata!(self.module.arrays_nd, remove(base));
+        class_metadata!(self.module.descending_arrays, remove(base));
+        class_metadata!(self.multi_dim_array_names, remove(base));
     }
 }
 

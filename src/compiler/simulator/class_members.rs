@@ -290,7 +290,7 @@ impl Simulator {
     /// be clobbered by a nested `int m` (§6.21/§23.8). Outside any frame
     /// (process scope) it is a plain removal, as before.
     pub(super) fn forget_string_flag(&mut self, name: &str) {
-        if self.string_signals.remove(name) {
+        if class_metadata!(self.string_signals, remove(name)) {
             if let Some(log) = self.string_signals_removed.last_mut() {
                 log.push(name.to_string());
             }
@@ -2263,10 +2263,12 @@ impl Simulator {
     /// declaration records its own (§8.25: they name its specialization).
     pub(super) fn note_formal_type_args(&mut self, name: &str, type_args: &[Expression]) {
         if !type_args.is_empty() {
-            self.var_type_args
-                .insert(name.to_string(), type_args.to_vec());
+            class_metadata!(
+                self.var_type_args,
+                insert(name.to_string(), type_args.to_vec())
+            );
         } else if !self.var_type_args.is_empty() {
-            self.var_type_args.remove(name);
+            class_metadata!(self.var_type_args, remove(name));
         }
     }
 

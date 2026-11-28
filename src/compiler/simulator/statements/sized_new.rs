@@ -339,20 +339,25 @@ impl Simulator {
             &self.module.typedef_types,
         );
         if let Some(index) = index {
-            self.module
-                .assoc_index_widths
-                .insert(name.to_string(), index);
+            class_metadata!(
+                self.module.assoc_index_widths,
+                insert(name.to_string(), index)
+            );
         }
         if let Some(key_type) = key_type {
-            self.module
-                .assoc_key_type_names
-                .insert(name.to_string(), key_type);
+            class_metadata!(
+                self.module.assoc_key_type_names,
+                insert(name.to_string(), key_type)
+            );
         }
-        self.module
-            .var_decl_types
-            .insert(name.to_string(), dt.clone());
-        self.dynamic_assoc_dims
-            .insert(name.to_string(), tail.to_vec());
+        class_metadata!(
+            self.module.var_decl_types,
+            insert(name.to_string(), dt.clone())
+        );
+        class_metadata!(
+            self.dynamic_assoc_dims,
+            insert(name.to_string(), tail.to_vec())
+        );
     }
 
     /// Discard rows outside the retained prefix, including every nested key
@@ -370,6 +375,11 @@ impl Simulator {
                 .and_then(|i| i.parse::<u64>().ok())
                 .is_some_and(|i| i >= keep)
         };
+        use crate::compiler::simulator::heap_gc::{ClassMetadataField, StorageOwner};
+        if let Some(owner) = StorageOwner::of(root) {
+            self.release_owned_collection_rows(owner, discard);
+            return;
+        }
         for key in self.signals.keys_with_elem_prefix(&prefix) {
             if discard(&key) {
                 // AA leaves are created in the runtime map, never allocated
@@ -379,18 +389,27 @@ impl Simulator {
                 self.widths.remove(&key);
             }
         }
-        self.module
-            .associative_arrays
-            .retain(|key, _| !discard(key));
-        self.module
-            .assoc_index_widths
-            .retain(|key, _| !discard(key));
-        self.module
-            .assoc_key_type_names
-            .retain(|key, _| !discard(key));
-        self.module.assoc_elem_widths.retain(|key, _| !discard(key));
-        self.module.var_decl_types.retain(|key, _| !discard(key));
-        self.dynamic_assoc_dims.retain(|key, _| !discard(key));
+        let metadata = &mut self.class_metadata_keys;
+        macro_rules! discard_rows {
+            ($($kind:ident => $first:ident$(.$field:ident)*),* $(,)?) => {
+                $(self.$first$(.$field)*.retain(|key, _| {
+                    if discard(key) {
+                        metadata.forget(ClassMetadataField::$kind, key);
+                        false
+                    } else {
+                        true
+                    }
+                });)*
+            };
+        }
+        discard_rows!(
+            ModuleAssociativeArrays => module.associative_arrays,
+            ModuleAssocIndexWidths => module.assoc_index_widths,
+            ModuleAssocKeyTypeNames => module.assoc_key_type_names,
+            ModuleAssocElemWidths => module.assoc_elem_widths,
+            ModuleVarDeclTypes => module.var_decl_types,
+            DynamicAssocDims => dynamic_assoc_dims,
+        );
     }
 
     /// §7.5.1: size the dynamic array stored at `name` to `new[n_expr]`,
@@ -436,11 +455,14 @@ impl Simulator {
             _ => None,
         });
         if let Some((dt, tail)) = self.dynamic_assoc_decl(name) {
-            self.module
-                .var_decl_types
-                .insert(name.to_string(), dt.clone());
-            self.dynamic_assoc_dims
-                .insert(name.to_string(), tail.clone());
+            class_metadata!(
+                self.module.var_decl_types,
+                insert(name.to_string(), dt.clone())
+            );
+            class_metadata!(
+                self.dynamic_assoc_dims,
+                insert(name.to_string(), tail.clone())
+            );
             let keep = src
                 .as_deref()
                 .map_or(0, |sn| self.get_queue_size(sn).min(n));
@@ -474,8 +496,8 @@ impl Simulator {
             for i in if self_copy { keep } else { 0 }..n {
                 let row = format!("{}[{}]", name, i);
                 self.clear_dyn_row(&row);
-                self.module.dynamic_arrays.insert(row.clone());
-                self.module.arrays.insert(row.clone(), (0, 63, w));
+                class_metadata!(self.module.dynamic_arrays, insert(row.clone()));
+                class_metadata!(self.module.arrays, insert(row.clone(), (0, 63, w)));
                 self.set_queue_size(&row, 0);
             }
             // §7.5.1: each kept row of another array is copied with its size

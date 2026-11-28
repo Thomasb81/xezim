@@ -580,6 +580,27 @@ macro_rules! write_sig {
 // Continuous assignments lower nested packed concatenations as array elements.
 const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB088";
 
+// Register the actual names written to each table, including dynamically
+// created associative rows and metadata with no corresponding signal value.
+macro_rules! class_metadata {
+    ($sim:ident.$first:ident$(.$table:ident)*, $op:ident($key:expr $(, $arg:expr)* $(,)?)) => {{
+        const FIELD: crate::compiler::simulator::heap_gc::ClassMetadataField =
+            crate::compiler::simulator::heap_gc::ClassMetadataField::named(
+                concat!(stringify!($first) $(, ".", stringify!($table))*),
+            );
+        $sim.$first$(.$table)*.$op(class_metadata!(@key $sim, FIELD, $op, $key) $(, $arg)*)
+    }};
+    (@key $sim:ident, $field:ident, remove, $key:expr) => {
+        $sim.class_metadata_keys.forget($field, $key)
+    };
+    (@key $sim:ident, $field:ident, remove_entry, $key:expr) => {
+        $sim.class_metadata_keys.forget($field, $key)
+    };
+    (@key $sim:ident, $field:ident, $op:ident, $key:expr) => {
+        $sim.class_metadata_keys.record($field, $key)
+    };
+}
+
 mod aggregate_assignments;
 mod pattern_array_items;
 mod intra_pattern_shape;
@@ -1645,13 +1666,15 @@ pub struct Simulator {
     class_gc_live_signals: usize,
     class_gc_released: usize,
     class_gc_runs: usize,
+    #[serde(skip)]
+    class_metadata_keys: heap_gc::ClassMetadataKeys,
     /// LRM §25.8 virtual-interface bindings.
     /// Key: `(class_instance_handle, property_name)`.
     /// Value: `(bound_iface_inst_name, modport_opt)`. The modport is
     /// carried from the class property's declared type (e.g. `virtual
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
-    virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    virtual_iface_bindings: heap_gc::ClassSlotMap<(String, Option<String>)>,
     /// §25.9/§8.9: the interface instance a STATIC class property holding a
     /// virtual interface is bound to, keyed by the property's static storage
     /// key (`S::spv`, `G#virtual pif::one`) — one binding per class (per
@@ -1937,6 +1960,8 @@ pub struct Simulator {
     mailbox_bound: HashMap<usize, usize>,
     /// Producers parked on `put` to a full bounded mailbox (handle -> queue).
     mailbox_put_waiters: HashMap<usize, std::collections::VecDeque<MailboxPutWaiter>>,
+    #[serde(skip)]
+    mailbox_put_by_pid: HashMap<usize, usize>,
     /// §18.13 rand_mode: per-instance set of rand properties whose
     /// randomization is currently disabled. `obj.x.rand_mode(0)` adds "x".
     /// `obj.rand_mode(0)` disables ALL rand props.
@@ -1989,7 +2014,7 @@ pub struct Simulator {
     /// drawn in the current cycle. Each randomize call must pick a value
     /// not in this set; once every value in the prop's range has been
     /// drawn the set resets and a new cycle begins.
-    randc_used: HashMap<(usize, String), HashSet<u64>>,
+    randc_used: heap_gc::ClassSlotMap<HashSet<u64>>,
     /// §18.4 randc: values drawn TENTATIVELY by the randomize() call that is
     /// currently in flight, keyed like `randc_used`. The solver retries a
     /// failed solution up to 1000 times; without this each retry would burn
@@ -1999,7 +2024,7 @@ pub struct Simulator {
     /// retried or abandoned, so exactly ONE value leaves the cycle per
     /// SUCCESSFUL randomize(). `Some(prev)` records the pre-reset used-set of
     /// a pick that wrapped the cycle, so the rollback can restore it.
-    randc_pending: HashMap<(usize, String), (u64, Option<HashSet<u64>>)>,
+    randc_pending: heap_gc::ClassSlotMap<(u64, Option<HashSet<u64>>)>,
     /// §18.4.2 randc wider than 16 bits (to 32): the cycle is a keyed
     /// bijection over `[0, 2^w)` walked by a counter, so it needs no set of
     /// drawn values. Per (instance, prop): (key, next index, width).
@@ -2010,7 +2035,7 @@ pub struct Simulator {
     /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
     /// one (weight signature, item schedule, next slot) per weight set. See
     /// `pick_dist_value`.
-    dist_decks: HashMap<(usize, String), Vec<(u64, Vec<usize>, usize)>>,
+    dist_decks: heap_gc::ClassSlotMap<Vec<(u64, Vec<usize>, usize)>>,
     /// Built-in semaphores (handle -> current count)
     semaphores: HashMap<usize, i64>,
     /// Covergroup instance heap (index 0 is null).
@@ -2624,7 +2649,7 @@ pub struct Simulator {
     /// field)` holds once an assignment (`ev = other_ev`) re-bound it, as an
     /// id shared by every slot holding the same event. A slot absent here
     /// holds its own event. `event_obj_slots` is the reverse index.
-    event_obj_ids: HashMap<(usize, String), u64>,
+    event_obj_ids: heap_gc::ClassSlotMap<u64>,
     event_obj_slots: HashMap<u64, Vec<(usize, String)>>,
     next_event_obj_id: u64,
     /// The modport names the design declares (`modport_member_dirs`), built
