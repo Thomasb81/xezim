@@ -2016,7 +2016,7 @@ impl Simulator {
             // must land the target INSIDE its declared range, not just satisfy
             // the one item they are looking at (§18.5.12 — the constraint set is
             // solved as a whole).
-            self.rand_ranges = prop_allowed_ranges.clone();
+            self.replace_rand_ranges(prop_allowed_ranges.clone());
 
             // Second pass: identify equality "assignments"
             let mut assignments: HashMap<String, Expression> = HashMap::default();
@@ -4327,7 +4327,7 @@ impl Simulator {
                 }
                 let (lo, hi) = self.inst_fixed_bounds(cdef, handle, prop, (lo, hi));
                 let scoped = format!("{}#{}", handle, prop);
-                self.module.arrays.insert(scoped.clone(), (lo, hi, w));
+                class_metadata!(self.module.arrays, insert(scoped.clone(), (lo, hi, w)));
                 // §6.8: x for a 4-state element type.
                 let fill = self.class_bound_array_fill(cdef, handle, prop, w);
                 let su = self

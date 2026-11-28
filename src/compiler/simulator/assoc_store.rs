@@ -838,7 +838,7 @@ impl Simulator {
                 .assoc_tables
                 .get(parent)
                 .is_none_or(|t| t.entries.is_empty());
-            let table = self.assoc_tables.entry(parent.to_string()).or_default();
+            let table = class_metadata!(self.assoc_tables, entry(parent.to_string())).or_default();
             table
                 .entries
                 .entry(pkey)
@@ -856,7 +856,7 @@ impl Simulator {
             .assoc_tables
             .get(name)
             .is_none_or(|t| t.entries.is_empty());
-        let table = self.assoc_tables.entry(name.to_string()).or_default();
+        let table = class_metadata!(self.assoc_tables, entry(name.to_string())).or_default();
         let changed = table.entries.get(&key) != Some(&AssocEntry::Scalar(val.clone()));
         table.entries.insert(key, AssocEntry::Scalar(val));
         if was_empty && (self.assoc_elem_colls.contains(name) || name.contains("].")) {
@@ -874,7 +874,7 @@ impl Simulator {
             .assoc_tables
             .get(name)
             .is_none_or(|t| t.entries.is_empty());
-        let table = self.assoc_tables.entry(name.to_string()).or_default();
+        let table = class_metadata!(self.assoc_tables, entry(name.to_string())).or_default();
         table
             .entries
             .entry(key)
@@ -885,14 +885,34 @@ impl Simulator {
     }
 
     fn assoc_delete_compound_prefix(&mut self, prefix: &str) {
-        self.signals.remove(prefix);
         let dot = Self::name_with_suffix(prefix, ".");
         let brk = Self::name_with_suffix(prefix, "[");
+        if !self.queue_elem_ids.is_empty() {
+            let affected: Vec<String> = self
+                .queue_elem_ids
+                .keys()
+                .filter(|k| *k == prefix || k.starts_with(&brk) || k.starts_with(&dot))
+                .cloned()
+                .collect();
+            for q in affected {
+                self.detach_all_qrefs(&q);
+            }
+        }
+        if let Some(owner) = super::heap_gc::StorageOwner::of(prefix) {
+            self.release_owned_collection_rows(owner, |k| {
+                k == prefix || k.starts_with(&brk) || k.starts_with(&dot)
+            });
+            return;
+        }
+        self.signals.remove(prefix);
+        self.widths.remove(prefix);
         for k in self.signals.keys_with_prefix(&dot) {
             self.signals.remove(&k);
+            self.widths.remove(&k);
         }
         for k in self.signals.keys_with_elem_prefix(&brk) {
             self.signals.remove(&k);
+            self.widths.remove(&k);
         }
         let sz = Self::name_with_suffix(prefix, ".size");
         self.signals.remove(&sz);
@@ -916,9 +936,6 @@ impl Simulator {
         self.module
             .queue_max_sizes
             .retain(|k, _| !k.starts_with(&brk) && !k.starts_with(&dot));
-        if self.queue_elem_ids.contains_key(prefix) {
-            self.detach_all_qrefs(prefix);
-        }
     }
 
     /// Delete one key from associative array `name`. Returns `true` if removed.
@@ -929,21 +946,25 @@ impl Simulator {
             .and_then(|t| t.entries.remove(key));
         let canon = key.to_canon_string();
         let legacy_key = Self::name_with_key(name, &canon);
-        let had_legacy = self.signals.remove(&legacy_key).is_some()
-            || self.module.dynamic_arrays.contains(&legacy_key)
-            || self.assoc_tables.contains_key(&legacy_key)
-            || self
-                .signals
-                .any_key_with_prefix(&Self::name_with_suffix(&legacy_key, "."))
-            || self
-                .signals
-                .any_key_with_prefix(&Self::name_with_suffix(&legacy_key, "["));
+        let dot = Self::name_with_suffix(&legacy_key, ".");
+        let brk = Self::name_with_suffix(&legacy_key, "[");
         if let Some(AssocEntry::Compound(prefix)) = &removed {
             self.assoc_delete_compound_prefix(prefix);
-        } else if had_legacy {
+            return true;
+        }
+        let had_signal = self.signals.remove(&legacy_key).is_some();
+        if had_signal {
+            self.widths.remove(&legacy_key);
+        }
+        let had_nested = self.module.dynamic_arrays.contains(&legacy_key)
+            || self.module.associative_arrays.contains_key(&legacy_key)
+            || self.assoc_tables.contains_key(&legacy_key)
+            || self.signals.any_key_with_prefix(&dot)
+            || self.signals.any_key_with_prefix(&brk);
+        if had_nested || (removed.is_none() && super::heap_gc::StorageOwner::of(name).is_some()) {
             self.assoc_delete_compound_prefix(&legacy_key);
         }
-        removed.is_some() || had_legacy
+        removed.is_some() || had_signal || had_nested
     }
 
     /// Clear all entries of associative array `name`.
@@ -951,32 +972,7 @@ impl Simulator {
     /// also clears `evaluated_default`, `module.assoc_defaults`, and `class_assoc_defaults`.
     /// When `clear_default` is `false` (`aa.delete()`), keeps `evaluated_default` per SV semantics.
     pub(super) fn assoc_clear(&mut self, name: &str, clear_default: bool) {
-        if let Some(table) = self.assoc_tables.get_mut(name) {
-            let old = std::mem::take(&mut table.entries);
-            if clear_default {
-                table.evaluated_default = None;
-            }
-            for (_, entry) in old {
-                if let AssocEntry::Compound(prefix) = entry {
-                    self.assoc_delete_compound_prefix(&prefix);
-                }
-            }
-        }
-        if clear_default {
-            self.module.assoc_defaults.remove(name);
-            self.class_assoc_defaults.remove(name);
-        }
         let prefix = Self::name_with_suffix(name, "[");
-        for k in self.signals.keys_with_elem_prefix(&prefix) {
-            self.signals.remove(&k);
-        }
-        self.module.dynamic_arrays.retain(|k| !k.starts_with(&prefix));
-        self.module.queue_vars.retain(|k| !k.starts_with(&prefix));
-        self.module.queue_max_sizes.retain(|k, _| !k.starts_with(&prefix));
-        self.module
-            .associative_arrays
-            .retain(|k, _| !k.starts_with(&prefix));
-        self.assoc_tables.retain(|k, _| !k.starts_with(&prefix));
         if !self.queue_elem_ids.is_empty() {
             let affected: Vec<String> = self
                 .queue_elem_ids
@@ -988,6 +984,47 @@ impl Simulator {
                 self.detach_all_qrefs(&q);
             }
         }
+        let compound_prefixes: Vec<String> = if let Some(table) = self.assoc_tables.get_mut(name) {
+            let old = std::mem::take(&mut table.entries);
+            if clear_default {
+                table.evaluated_default = None;
+            }
+            old.into_values()
+                .filter_map(|e| match e {
+                    AssocEntry::Compound(p) => Some(p),
+                    AssocEntry::Scalar(_) => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if clear_default {
+            class_metadata!(self.module.assoc_defaults, remove(name));
+            class_metadata!(self.class_assoc_defaults, remove(name));
+        }
+        if let Some(owner) = super::heap_gc::StorageOwner::of(name) {
+            self.release_owned_collection_rows(owner, |k| k.starts_with(&prefix));
+            for p in compound_prefixes {
+                if !p.starts_with(&prefix) {
+                    self.assoc_delete_compound_prefix(&p);
+                }
+            }
+            return;
+        }
+        for p in compound_prefixes {
+            self.assoc_delete_compound_prefix(&p);
+        }
+        for k in self.signals.keys_with_elem_prefix(&prefix) {
+            self.signals.remove(&k);
+            self.widths.remove(&k);
+        }
+        self.module.dynamic_arrays.retain(|k| !k.starts_with(&prefix));
+        self.module.queue_vars.retain(|k| !k.starts_with(&prefix));
+        self.module.queue_max_sizes.retain(|k, _| !k.starts_with(&prefix));
+        self.module
+            .associative_arrays
+            .retain(|k, _| !k.starts_with(&prefix));
+        self.assoc_tables.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Number of populated top-level keys in associative array `name` (`O(1)` via `BTreeMap`).
@@ -1029,8 +1066,7 @@ impl Simulator {
             && let Some(v) = self.class_assoc_defaults.get(name).cloned()
         {
             let fitted = self.fit_assoc_elem_val(name, v);
-            self.assoc_tables
-                .entry(name.to_string())
+            class_metadata!(self.assoc_tables, entry(name.to_string()))
                 .or_default()
                 .evaluated_default = Some(fitted.clone());
             return Some(fitted);
@@ -1041,8 +1077,7 @@ impl Simulator {
                 _ => self.eval_expr(&def_expr),
             };
             let fitted = self.fit_assoc_elem_val(name, v);
-            self.assoc_tables
-                .entry(name.to_string())
+            class_metadata!(self.assoc_tables, entry(name.to_string()))
                 .or_default()
                 .evaluated_default = Some(fitted.clone());
             return Some(fitted);
@@ -1175,7 +1210,7 @@ impl Simulator {
         let mut string_leaves = HashSet::default();
         self.collect_struct_string_leaves(elem_prefix, su, &mut string_leaves);
         for sk in &string_leaves {
-            self.string_signals.insert(sk.clone());
+            class_metadata!(self.string_signals, insert(sk.clone()));
         }
         if !already_exists {
             let seeds = self.struct_return_leaf_seeds(elem_prefix, su);
@@ -1241,9 +1276,7 @@ impl Simulator {
 
     /// Lazily allocate unique per-element IDs for queue `qname` when binding a `ref` formal (§7.10.3).
     pub(super) fn ensure_queue_elem_ids(&mut self, qname: &str, size: usize) -> &mut VecDeque<u64> {
-        let ids = self
-            .queue_elem_ids
-            .entry(qname.to_string())
+        let ids = class_metadata!(self.queue_elem_ids, entry(qname.to_string()))
             .or_insert_with(VecDeque::new);
         while ids.len() < size {
             let id = self.next_qref_id;
@@ -1292,7 +1325,7 @@ impl Simulator {
     }
 
     pub(super) fn detach_all_qrefs(&mut self, qname: &str) {
-        let Some(ids) = self.queue_elem_ids.remove(qname) else {
+        let Some(ids) = class_metadata!(self.queue_elem_ids, remove(qname)) else {
             return;
         };
         for (i, id) in ids.into_iter().enumerate() {

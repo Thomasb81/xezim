@@ -433,10 +433,10 @@ impl Simulator {
                 )
                 .filter(|f| !f.is_empty())
                 {
-                    self.module.packed_struct_fields.insert(v.clone(), fields);
+                    class_metadata!(self.module.packed_struct_fields, insert(v.clone(), fields));
                 }
             }
-            self.var_typedef_types.insert(v.clone(), kt);
+            class_metadata!(self.var_typedef_types, insert(v.clone(), kt));
             // The loop var is a FRESH declaration (§12.7.3) — its type
             // binding shadows class properties and stale flat-map
             // entries for the loop's duration (see fe_trusted_types).

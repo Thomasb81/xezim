@@ -3186,7 +3186,10 @@ impl Simulator {
                             if dyn_rows {
                                 for i in old.min(n)..n {
                                     let row = format!("{key}[{i}]");
-                                    self.module.dynamic_arrays.insert(row.clone());
+                                    class_metadata!(
+                                        self.module.dynamic_arrays,
+                                        insert(row.clone())
+                                    );
                                     self.set_queue_size(&row, 0);
                                 }
                             }

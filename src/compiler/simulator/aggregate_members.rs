@@ -231,7 +231,7 @@ impl Simulator {
             }
         })();
         let Some((decl, su)) = su else {
-            self.static_struct_holders.insert(key, usize::MAX);
+            class_metadata!(self.static_struct_holders, insert(key, usize::MAX));
             return None;
         };
         // §8.25: a specialization's holder (`P#int::one`) remembers its
@@ -249,7 +249,7 @@ impl Simulator {
             creation_scope: String::new(),
         })));
         self.seed_class_struct_cells(h, prop, &su);
-        self.static_struct_holders.insert(key, h);
+        class_metadata!(self.static_struct_holders, insert(key, h));
         Some(h)
     }
 
@@ -282,7 +282,7 @@ impl Simulator {
             if !is_struct {
                 continue;
             }
-            self.static_struct_names.insert(prop.clone());
+            class_metadata!(self.static_struct_names, insert(prop.clone()));
             if !self.class_is_parameterized(&cls) {
                 let _ = self.static_struct_holder(&cls, &prop);
             }
@@ -3776,9 +3776,10 @@ impl Simulator {
                     )
                     .and_then(Self::bounded_queue_capacity)
                     {
-                        self.module
-                            .queue_max_sizes
-                            .insert(name.to_string(), capacity);
+                        class_metadata!(
+                            self.module.queue_max_sizes,
+                            insert(name.to_string(), capacity)
+                        );
                     }
                 }
                 Some(crate::ast::types::UnpackedDimension::Associative { data_type, .. }) => {
@@ -3789,9 +3790,10 @@ impl Simulator {
                         &self.module.typedef_types,
                     );
                     if let Some(index) = index {
-                        self.module
-                            .assoc_index_widths
-                            .insert(name.to_string(), index);
+                        class_metadata!(
+                            self.module.assoc_index_widths,
+                            insert(name.to_string(), index)
+                        );
                     }
                 }
                 _ => {}
@@ -3803,7 +3805,7 @@ impl Simulator {
             self.register_packed_leaf_layout(name, &dt);
         }
         if self.owner_is_assoc_elem(name) {
-            self.assoc_elem_colls.insert(name.to_string());
+            class_metadata!(self.assoc_elem_colls, insert(name.to_string()));
         }
         true
     }
@@ -4095,13 +4097,13 @@ impl Simulator {
         }
         match kind {
             StructCollKind::Dynamic | StructCollKind::Queue => {
-                self.module.arrays.insert(name.clone(), (0, -1, elem_w));
-                self.module.dynamic_arrays.insert(name.clone());
+                class_metadata!(self.module.arrays, insert(name.clone(), (0, -1, elem_w)));
+                class_metadata!(self.module.dynamic_arrays, insert(name.clone()));
                 if kind == StructCollKind::Queue {
-                    self.module.queue_vars.insert(name.clone());
+                    class_metadata!(self.module.queue_vars, insert(name.clone()));
                 }
                 if elem_w > 0 {
-                    self.module.assoc_elem_widths.insert(name.clone(), elem_w);
+                    class_metadata!(self.module.assoc_elem_widths, insert(name.clone(), elem_w));
                 }
                 if self
                     .get_signal_value_by_name(&Self::name_with_suffix(&name, ".size"))
@@ -4111,11 +4113,12 @@ impl Simulator {
                 }
             }
             StructCollKind::Assoc => {
-                self.module
-                    .associative_arrays
-                    .insert(name.clone(), string_key);
+                class_metadata!(
+                    self.module.associative_arrays,
+                    insert(name.clone(), string_key)
+                );
                 if elem_w > 0 {
-                    self.module.assoc_elem_widths.insert(name, elem_w);
+                    class_metadata!(self.module.assoc_elem_widths, insert(name, elem_w));
                 }
             }
         }

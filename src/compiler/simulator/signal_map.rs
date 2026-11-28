@@ -1,6 +1,8 @@
 //! The signal map, element runs, waveform variable kinds, forces and name-table helpers.
 
+use super::heap_gc::{ClassStorageKeys, StorageOwner};
 use super::*;
+use std::ops::Bound::{Included, Unbounded};
 
 /// `h` without its last segment. The derived `Clone` copies the resolution
 /// caches, which belong to the full path; left in place, the prefix resolved
@@ -226,29 +228,11 @@ impl VcdVarKind {
     }
 }
 
-/// Name-keyed overflow signal store with a maintained ELEMENT INDEX:
-/// every key containing `[` is also recorded under its base name (the text
-/// before the first bracket), so collection machinery (queue/dynamic/assoc
-/// locals stored as `name[i]` entries) can enumerate a name's elements
-/// without scanning the whole map. The `starts_with` full-map scans in the
-/// queue-frame save/restore were 25%+ of a UVM AVIP run.
-///
-/// The elements `name[i]` of a queue or dynamic array (a name with a
-/// `name.size` entry) are held in one dense run per name (`ElemRun`) instead
-/// of one map entry each, so removing or inserting an element at the front
-/// moves no other element (§7.10.2). The run is an implementation detail of
-/// the map: every accessor below serves `name[i]` from it exactly as if the
-/// key were a map entry.
-///
-/// There is no `Deref` to the inner map: every read and every mutation goes
-/// through the inherent methods below, which keep the index and the runs
-/// exact.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// Sparse elements are grouped by outermost collection. Each bucket owns the
+/// values and supplies the element index, including nested rows and members.
+/// Contiguous positional elements live in `ElemRun` (§7.5, §7.10).
 pub struct SignalMap {
-    map: HashMap<String, Value>,
-    /// The map-held keys containing `[`, by base name. Run-held elements are
-    /// not listed here.
-    elems: HashMap<String, std::collections::HashSet<String>>,
+    map: SparseSignals,
     /// Per base name, a stamp that changes whenever an element key is added
     /// to or removed from the base (absent = no element keys), so a derived
     /// view of a base's key set can be cached until it changes.
@@ -262,6 +246,313 @@ pub struct SignalMap {
     /// The names in `runs` that contain `[` themselves, by base name: the
     /// runs whose keys the element index files under another name.
     nested_runs: HashMap<String, Vec<String>>,
+    /// Derived from the map and runs. Restores rebuild it on first use,
+    /// keeping the checkpoint representation unchanged.
+    class_keys: Option<(ClassStorageKeys, ClassStorageKeys)>,
+}
+
+// A complete canonical decimal selector fits in an i64 or u64. Reserve
+// i128::MIN for the second component of a one-dimensional key.
+type NumericSelectors = (i128, i128);
+
+fn decimal_selector(suffix: &str) -> Option<(i128, &str)> {
+    let bytes = suffix.as_bytes().strip_prefix(b"[")?;
+    let negative = bytes.first() == Some(&b'-');
+    let start = usize::from(negative);
+    let digits = &bytes[start..];
+    let mut magnitude = 0u64;
+    for (i, &byte) in digits.iter().enumerate() {
+        if byte == b']' {
+            if i == 0 || (digits[0] == b'0' && (i > 1 || negative)) {
+                return None;
+            }
+            let value = i128::from(magnitude);
+            return Some((
+                if negative { -value } else { value },
+                &suffix[2 + start + i..],
+            ));
+        }
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        magnitude = magnitude.checked_mul(10)?.checked_add(u64::from(digit))?;
+    }
+    None
+}
+
+fn numeric_selectors(suffix: &str) -> Option<NumericSelectors> {
+    let (first, rest) = decimal_selector(suffix)?;
+    if rest.is_empty() {
+        return Some((first, i128::MIN));
+    }
+    let (second, rest) = decimal_selector(rest)?;
+    rest.is_empty().then_some((first, second))
+}
+
+#[derive(Default)]
+struct SparseElements {
+    numeric: BTreeMap<NumericSelectors, (String, Value)>,
+    named: BTreeMap<String, Value>,
+}
+
+impl SparseElements {
+    fn len(&self) -> usize {
+        self.numeric.len() + self.named.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.numeric
+            .values()
+            .map(|(k, v)| (k, v))
+            .chain(self.named.iter())
+    }
+
+    fn keys_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        base_len: usize,
+    ) -> impl Iterator<Item = &'a String> {
+        let suffix = &prefix[base_len..];
+        let numeric_range = match decimal_selector(suffix) {
+            Some((first, tail)) => match decimal_selector(tail) {
+                Some((second, _)) => Some(((first, second), (first, second))),
+                None => Some(((first, i128::MIN), (first, i128::MAX))),
+            },
+            // A complete noncanonical selector belongs to the named tree.
+            None if suffix.contains(']') => None,
+            None => Some(((i128::MIN, i128::MIN), (i128::MAX, i128::MAX))),
+        };
+        numeric_range
+            .into_iter()
+            .flat_map(|(first, last)| self.numeric.range(first..=last))
+            .map(|(_, (key, _))| key)
+            .filter(move |key| key.starts_with(prefix))
+            .chain(
+                self.named
+                    .range::<str, _>((Included(prefix), Unbounded))
+                    .map(|(key, _)| key)
+                    .take_while(move |key| key.starts_with(prefix)),
+            )
+    }
+}
+
+#[derive(Default)]
+struct SparseSignals {
+    plain: HashMap<String, Value>,
+    indexed: HashMap<String, SparseElements>,
+    indexed_len: usize,
+}
+
+impl SparseSignals {
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        if self.indexed.is_empty() {
+            return self.plain.get(key);
+        }
+        match SignalMap::base_of(key) {
+            Some(base) => {
+                let entries = self.indexed.get(base)?;
+                match numeric_selectors(&key[base.len()..]) {
+                    Some(index) => entries.numeric.get(&index).map(|(_, value)| value),
+                    None => entries.named.get(key),
+                }
+            }
+            None => self.plain.get(key),
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        match SignalMap::base_of(key) {
+            Some(base) => {
+                let entries = self.indexed.get_mut(base)?;
+                match numeric_selectors(&key[base.len()..]) {
+                    Some(index) => entries.numeric.get_mut(&index).map(|(_, value)| value),
+                    None => entries.named.get_mut(key),
+                }
+            }
+            None => self.plain.get_mut(key),
+        }
+    }
+
+    fn insert(&mut self, key: String, value: Value, on_new: impl FnOnce(&str)) -> Option<Value> {
+        use std::collections::{btree_map, hash_map};
+
+        let Some(base) = SignalMap::base_of(&key) else {
+            return match self.plain.entry(key) {
+                hash_map::Entry::Occupied(mut entry) => Some(entry.insert(value)),
+                hash_map::Entry::Vacant(entry) => {
+                    on_new(entry.key());
+                    entry.insert(value);
+                    None
+                }
+            };
+        };
+        let entries = match self.indexed.get_mut(base) {
+            Some(entries) => entries,
+            None => self.indexed.entry(base.to_owned()).or_default(),
+        };
+        match numeric_selectors(&key[base.len()..]) {
+            Some(index) => match entries.numeric.entry(index) {
+                btree_map::Entry::Occupied(mut entry) => {
+                    return Some(std::mem::replace(&mut entry.get_mut().1, value));
+                }
+                btree_map::Entry::Vacant(entry) => {
+                    on_new(&key);
+                    entry.insert((key, value));
+                }
+            },
+            None => match entries.named.entry(key) {
+                btree_map::Entry::Occupied(mut entry) => return Some(entry.insert(value)),
+                btree_map::Entry::Vacant(entry) => {
+                    on_new(entry.key());
+                    entry.insert(value);
+                }
+            },
+        }
+        self.indexed_len += 1;
+        None
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Value> {
+        let Some(base) = SignalMap::base_of(key) else {
+            return self.plain.remove(key);
+        };
+        let entries = self.indexed.get_mut(base)?;
+        let value = match numeric_selectors(&key[base.len()..]) {
+            Some(index) => entries.numeric.remove(&index).map(|(_, value)| value),
+            None => entries.named.remove(key),
+        }?;
+        self.indexed_len -= 1;
+        if entries.len() == 0 {
+            self.indexed.remove(base);
+        }
+        Some(value)
+    }
+
+    fn len(&self) -> usize {
+        self.plain.len() + self.indexed_len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.plain
+            .iter()
+            .chain(self.indexed.values().flat_map(SparseElements::iter))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.iter().map(|(key, _)| key)
+    }
+
+    fn keys_under(&self, base: &str) -> impl Iterator<Item = &String> {
+        self.indexed
+            .get(base)
+            .into_iter()
+            .flat_map(|entries| entries.iter().map(|(key, _)| key))
+    }
+
+    fn keys_with_prefix<'a>(
+        &'a self,
+        base: &str,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = &'a String> {
+        let base_len = base.len();
+        self.indexed
+            .get(base)
+            .into_iter()
+            .flat_map(move |entries| entries.keys_with_prefix(prefix, base_len))
+    }
+}
+
+// Keep the checkpoint layout used before buckets held both values and keys.
+// The redundant index is emitted on save for compatibility with older readers.
+impl serde::Serialize for SparseSignals {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (key, value) in self.iter() {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+struct CheckpointElementIndex<'a>(&'a SparseSignals);
+
+impl serde::Serialize for CheckpointElementIndex<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct Keys<'a>(&'a SparseElements);
+
+        impl serde::Serialize for Keys<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for (key, _) in self.0.iter() {
+                    seq.serialize_element(key)?;
+                }
+                seq.end()
+            }
+        }
+
+        let mut map = serializer.serialize_map(Some(self.0.indexed.len()))?;
+        for (base, entries) in &self.0.indexed {
+            map.serialize_entry(base, &Keys(entries))?;
+        }
+        map.end()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename = "SignalMap")]
+struct SignalMapCheckpoint<M, E, G, R, N> {
+    map: M,
+    elems: E,
+    elem_gens: G,
+    elem_gen_counter: u64,
+    runs: R,
+    run_keys: usize,
+    nested_runs: N,
+}
+
+impl serde::Serialize for SignalMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SignalMapCheckpoint {
+            map: &self.map,
+            elems: CheckpointElementIndex(&self.map),
+            elem_gens: &self.elem_gens,
+            elem_gen_counter: self.elem_gen_counter,
+            runs: &self.runs,
+            run_keys: self.run_keys,
+            nested_runs: &self.nested_runs,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SignalMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let stored: SignalMapCheckpoint<
+            HashMap<String, Value>,
+            HashMap<String, std::collections::HashSet<String>>,
+            _,
+            _,
+            _,
+        > = serde::Deserialize::deserialize(deserializer)?;
+        let mut map = SparseSignals::default();
+        for (key, value) in stored.map {
+            map.insert(key, value, |_| {});
+        }
+        Ok(Self {
+            map,
+            elem_gens: stored.elem_gens,
+            elem_gen_counter: stored.elem_gen_counter,
+            runs: stored.runs,
+            run_keys: stored.run_keys,
+            nested_runs: stored.nested_runs,
+            class_keys: None,
+        })
+    }
 }
 
 /// The elements `name[start]`, `name[start + 1]`, ... of one collection.
@@ -320,13 +611,13 @@ pub(super) fn split_elem_key(k: &str) -> Option<(&str, u64)> {
 impl SignalMap {
     pub fn new() -> Self {
         SignalMap {
-            map: HashMap::default(),
-            elems: HashMap::default(),
+            map: SparseSignals::default(),
             elem_gens: HashMap::default(),
             elem_gen_counter: 0,
             runs: HashMap::default(),
             run_keys: 0,
             nested_runs: HashMap::default(),
+            class_keys: Some(Default::default()),
         }
     }
 
@@ -396,6 +687,79 @@ impl SignalMap {
             .map(|(name, run)| (name.as_str(), run.start, &run.items))
     }
 
+    pub(super) fn owner_storage(
+        &self,
+        owner: StorageOwner,
+    ) -> (
+        impl Iterator<Item = (&str, &Value)>,
+        impl Iterator<Item = (&str, &VecDeque<Value>)>,
+    ) {
+        let (names, runs) = self.class_keys.as_ref().expect("runtime owner index");
+        (
+            names
+                .names(owner)
+                .filter_map(|name| self.map.get(name).map(|v| (name, v))),
+            runs.names(owner)
+                .filter_map(|name| self.runs.get(name).map(|r| (name, &r.items))),
+        )
+    }
+
+    pub(super) fn rebuild_owner_index(&mut self) {
+        if self.class_keys.is_none() {
+            let mut keys = (ClassStorageKeys::default(), ClassStorageKeys::default());
+            for name in self.map.keys() {
+                keys.0.insert(name);
+            }
+            for name in self.runs.keys() {
+                keys.1.insert(name);
+            }
+            self.class_keys = Some(keys);
+        }
+    }
+
+    pub(super) fn release_storage_owner(&mut self, owner: StorageOwner) {
+        self.rebuild_owner_index();
+        let (map_keys, run_names) = self.class_keys.as_mut().unwrap();
+        // Save both lists before editing the element index. Removing
+        // '.size' or a stray may also drop a run.
+        let keys = map_keys.take(owner);
+        let runs = run_names.take(owner);
+        if let Some(runs) = &runs {
+            // Every nested run under an owned base has the same owner.
+            // Drop that list once instead of filtering it per row.
+            for name in runs {
+                self.nested_runs.remove(Self::outer_of(name));
+            }
+        }
+        for name in keys.into_iter().flatten() {
+            self.remove(&name);
+        }
+        for name in runs.into_iter().flatten() {
+            self.truncate_elem_run(&name, 0);
+            self.drop_idle_run(&name);
+        }
+    }
+
+    /// Release a group of runtime rows belonging to an owned collection.
+    /// Deleting a row drops a dense run without materializing element names.
+    pub(super) fn release_matching_storage(
+        &mut self,
+        owner: StorageOwner,
+        discard: &impl Fn(&str) -> bool,
+    ) {
+        self.rebuild_owner_index();
+        let (entries, runs) = self.class_keys.as_mut().unwrap();
+        let entries = entries.take_matching(owner, discard);
+        let runs = runs.take_matching(owner, discard);
+        for name in entries {
+            self.remove(&name);
+        }
+        for name in runs {
+            self.truncate_elem_run(&name, 0);
+            self.drop_idle_run(&name);
+        }
+    }
+
     /// Discard the dense suffix starting at `keep` without spelling its keys.
     pub(super) fn truncate_elem_run(&mut self, name: &str, keep: u64) {
         let Some(run) = self.runs.get_mut(name) else {
@@ -426,10 +790,8 @@ impl SignalMap {
         };
         let outer = Self::outer_of(name);
         let keys: Vec<_> = self
-            .elems
-            .get(outer)
-            .into_iter()
-            .flatten()
+            .map
+            .keys_under(outer)
             .filter(|key| outside(key))
             .cloned()
             .collect();
@@ -457,17 +819,20 @@ impl SignalMap {
     /// A key was added under or removed from base `outer`: move its stamp,
     /// or drop it with the base's last key.
     fn stamp_base(&mut self, outer: &str) {
-        if self.elems.contains_key(outer) || self.base_has_run_keys(outer) {
-            self.elem_gen_counter += 1;
-            match self.elem_gens.get_mut(outer) {
-                Some(g) => *g = self.elem_gen_counter,
-                None => {
-                    self.elem_gens
-                        .insert(outer.to_string(), self.elem_gen_counter);
-                }
-            }
+        if self.map.indexed.contains_key(outer) || self.base_has_run_keys(outer) {
+            Self::advance_stamp(&mut self.elem_gens, &mut self.elem_gen_counter, outer);
         } else {
             self.elem_gens.remove(outer);
+        }
+    }
+
+    fn advance_stamp(gens: &mut HashMap<String, u64>, counter: &mut u64, outer: &str) {
+        *counter += 1;
+        match gens.get_mut(outer) {
+            Some(generation) => *generation = *counter,
+            None => {
+                gens.insert(outer.to_owned(), *counter);
+            }
         }
     }
 
@@ -480,40 +845,24 @@ impl SignalMap {
             })
     }
 
-    /// File map-held key `k` in the element index.
-    fn index_key(&mut self, k: &str) {
-        if let Some(b) = Self::base_of(k) {
-            match self.elems.get_mut(b) {
-                Some(set) => {
-                    set.insert(k.to_string());
-                }
-                None => {
-                    self.elems
-                        .entry(b.to_string())
-                        .or_default()
-                        .insert(k.to_string());
-                }
-            }
-            self.stamp_base(b);
-        }
-    }
-
-    /// Drop map-held key `k` from the element index.
     fn unindex_key(&mut self, k: &str) {
-        if let Some(b) = Self::base_of(k) {
-            self.unlist_key(k, b);
-            self.stamp_base(b);
+        if let Some((keys, _)) = &mut self.class_keys {
+            keys.remove(k);
+        }
+        if let Some(base) = Self::base_of(k) {
+            self.stamp_base(base);
         }
     }
 
-    /// Take map-held key `k` off base `b`'s list, leaving the stamp alone.
-    fn unlist_key(&mut self, k: &str, b: &str) {
-        if let Some(set) = self.elems.get_mut(b) {
-            set.remove(k);
-            if set.is_empty() {
-                self.elems.remove(b);
+    fn insert_sparse(&mut self, key: String, value: Value) -> Option<Value> {
+        self.map.insert(key, value, |key| {
+            if let Some((keys, _)) = &mut self.class_keys {
+                keys.insert(key);
             }
-        }
+            if let Some(base) = Self::base_of(key) {
+                Self::advance_stamp(&mut self.elem_gens, &mut self.elem_gen_counter, base);
+            }
+        })
     }
 
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
@@ -526,7 +875,7 @@ impl SignalMap {
                 return Some(std::mem::replace(&mut run.items[s], v));
             }
             // A key the map already holds stays there.
-            if run.strays == 0 || !self.map.contains_key(&k) {
+            if run.strays == 0 || self.map.get(&k).is_none() {
                 let adopted = if run.items.is_empty() {
                     run.start = i;
                     run.items.push_back(v);
@@ -554,23 +903,21 @@ impl SignalMap {
                     }
                     Some(v) => {
                         run.strays += 1;
-                        self.index_key(&k);
-                        return self.map.insert(k, v);
+                        return self.insert_sparse(k, v);
                     }
                 }
             }
-            return self.map.insert(k, v);
+            return self.insert_sparse(k, v);
         }
-        if !self.map.contains_key(&k) {
-            self.index_key(&k);
-            if let Some(name) = k.strip_suffix(".size") {
-                let name = name.to_string();
-                let prev = self.map.insert(k, v);
+        if let Some(name) = k.strip_suffix(".size") {
+            let name = name.to_owned();
+            let previous = self.insert_sparse(k, v);
+            if previous.is_none() {
                 self.register_element_run(&name, true);
-                return prev;
             }
+            return previous;
         }
-        self.map.insert(k, v)
+        self.insert_sparse(k, v)
     }
 
     /// Store contiguous elements in a run. Only a queue or dynamic array
@@ -581,17 +928,15 @@ impl SignalMap {
             return;
         }
         let outer = Self::outer_of(name);
-        let mut held: Vec<u64> = match self.elems.get(outer) {
-            Some(set) => set
-                .iter()
-                .filter_map(|k| {
-                    split_elem_key(k)
-                        .filter(|(n, _)| *n == name)
-                        .map(|(_, i)| i)
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+        let mut held: Vec<u64> = self
+            .map
+            .keys_under(outer)
+            .filter_map(|key| {
+                split_elem_key(key)
+                    .filter(|(n, _)| *n == name)
+                    .map(|(_, i)| i)
+            })
+            .collect();
         held.sort_unstable();
         let mut run = ElemRun {
             sized,
@@ -606,6 +951,9 @@ impl SignalMap {
                 .entry(outer.to_string())
                 .or_default()
                 .push(name.to_string());
+        }
+        if let Some((_, runs)) = &mut self.class_keys {
+            runs.insert(name);
         }
         self.runs.insert(name.to_string(), run);
         if !held.is_empty() {
@@ -636,7 +984,9 @@ impl SignalMap {
                 let key = format!("{}[{}]", name, i);
                 if let Some(v) = self.map.remove(&key) {
                     // The key stays stored: the base's stamp does not move.
-                    self.unlist_key(&key, Self::outer_of(name));
+                    if let Some((keys, _)) = &mut self.class_keys {
+                        keys.remove(&key);
+                    }
                     let run = self.runs.get_mut(name).unwrap();
                     if back {
                         if run.items.is_empty() {
@@ -666,6 +1016,9 @@ impl SignalMap {
             .is_some_and(|r| r.items.is_empty() && !r.sized && r.strays == 0)
         {
             self.runs.remove(name);
+            if let Some((_, runs)) = &mut self.class_keys {
+                runs.remove(name);
+            }
             let outer = Self::outer_of(name);
             if outer.len() != name.len()
                 && let Some(names) = self.nested_runs.get_mut(outer)
@@ -705,8 +1058,7 @@ impl SignalMap {
                     self.run_keys -= moved.len();
                     for (j, mv) in moved.into_iter().enumerate() {
                         let key = format!("{}[{}]", name, lo + j as u64);
-                        self.index_key(&key);
-                        self.map.insert(key, mv);
+                        self.insert_sparse(key, mv);
                     }
                     v
                 };
@@ -787,11 +1139,7 @@ impl SignalMap {
     /// Keys of every `base[...]` element currently stored, unordered (a
     /// run's keys highest index first, see `keys_with_elem_prefix`).
     pub fn elem_keys(&self, base: &str) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .elems
-            .get(base)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
+        let mut keys: Vec<String> = self.map.keys_under(base).cloned().collect();
         // The index files nothing under a name with a bracket in it.
         if !base.contains('[') {
             for (name, run) in self.runs_under(base) {
@@ -813,12 +1161,9 @@ impl SignalMap {
     ) -> impl Iterator<Item = std::borrow::Cow<'a, str>> + 'a {
         let base = &prefix[..prefix.len().saturating_sub(1)];
         let outer = Self::base_of(base).unwrap_or(base);
-        self.elems
-            .get(outer)
-            .into_iter()
-            .flat_map(|set| set.iter().map(|k| k.as_str()))
-            .filter(move |k| k.starts_with(prefix))
-            .map(std::borrow::Cow::Borrowed)
+        self.map
+            .keys_with_prefix(outer, prefix)
+            .map(|key| std::borrow::Cow::Borrowed(key.as_str()))
             .chain(
                 self.runs_under(outer)
                     .filter(move |(name, _)| Self::run_under_prefix(name, prefix))
@@ -850,9 +1195,7 @@ impl SignalMap {
                     .iter()
                     .any(|(name, run)| !run.items.is_empty() && name.starts_with(prefix));
         };
-        self.elems
-            .get(outer)
-            .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+        self.map.keys_with_prefix(outer, prefix).next().is_some()
             || self
                 .runs_under(outer)
                 .any(|(name, run)| Self::run_has_key_with_prefix(name, run, prefix))
@@ -879,10 +1222,9 @@ impl SignalMap {
             return out;
         };
         let mut out: Vec<String> = self
-            .elems
-            .get(outer)
-            .into_iter()
-            .flat_map(|set| set.iter().filter(|k| k.starts_with(prefix)).cloned())
+            .map
+            .keys_with_prefix(outer, prefix)
+            .cloned()
             .collect();
         for (name, run) in self.runs_under(outer) {
             if Self::run_has_key_with_prefix(name, run, prefix) {
@@ -930,10 +1272,15 @@ impl SignalMap {
         let below = |k: &str| {
             k.len() > name.len() && k.as_bytes()[name.len()] == b'[' && k.starts_with(name)
         };
-        !self
-            .elems
-            .get(outer)
-            .is_some_and(|set| set.iter().any(|k| below(k)))
+        let has_sparse = if name == outer {
+            self.map.indexed.contains_key(outer)
+        } else {
+            self.map
+                .keys_with_prefix(outer, &format!("{name}["))
+                .next()
+                .is_some()
+        };
+        !has_sparse
             && !self
                 .nested_runs
                 .get(outer)

@@ -627,11 +627,11 @@ impl Simulator {
             arr.elems.clone(),
         );
         let scoped = format!("{}#{}", handle, leaf);
-        self.module.arrays.insert(scoped.clone(), (lo, hi, width));
+        class_metadata!(self.module.arrays, insert(scoped.clone(), (lo, hi, width)));
         if descending {
-            self.module.descending_arrays.insert(scoped.clone());
+            class_metadata!(self.module.descending_arrays, insert(scoped.clone()));
         } else {
-            self.module.descending_arrays.remove(&scoped);
+            class_metadata!(self.module.descending_arrays, remove(&scoped));
         }
         self.widths.insert(scoped.clone(), width);
         for (offset, value) in elems.into_iter().enumerate() {

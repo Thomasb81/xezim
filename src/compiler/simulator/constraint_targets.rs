@@ -1288,7 +1288,7 @@ impl Simulator {
             } else {
                 self.resize_coll(&c.scoped, n);
             }
-            self.module.dynamic_arrays.insert(c.scoped.clone());
+            class_metadata!(self.module.dynamic_arrays, insert(c.scoped.clone()));
             if c.nested {
                 for i in 0..n {
                     let row = format!("{}[{}]", c.scoped, i);
@@ -1299,7 +1299,7 @@ impl Simulator {
                         PickedSize::Impossible => return false,
                     };
                     self.resize_coll(&row, m);
-                    self.module.dynamic_arrays.insert(row);
+                    class_metadata!(self.module.dynamic_arrays, insert(row));
                 }
             }
         }
@@ -1355,8 +1355,8 @@ impl Simulator {
         if c.row_tail == Some(RowTail::Dyn) {
             for i in old.min(n)..n {
                 let row = format!("{}[{}]", c.scoped, i);
-                self.module.dynamic_arrays.insert(row.clone());
-                self.module.arrays.insert(row.clone(), (0, 63, c.width));
+                class_metadata!(self.module.dynamic_arrays, insert(row.clone()));
+                class_metadata!(self.module.arrays, insert(row.clone(), (0, 63, c.width)));
                 self.set_queue_size(&row, 0);
             }
         }

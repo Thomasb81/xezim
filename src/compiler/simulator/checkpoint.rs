@@ -1012,6 +1012,9 @@ impl Simulator {
             }
             Ok(())
         })?;
+        self.signals.rebuild_owner_index();
+        self.rebuild_class_metadata_keys();
+        self.rebuild_mailbox_put_index();
         self.reopen_files(file.files)?;
         self.unresolved_force_count = self.active_force_exprs.iter()
             .filter(|entry| entry.has_unresolved_reads).count();

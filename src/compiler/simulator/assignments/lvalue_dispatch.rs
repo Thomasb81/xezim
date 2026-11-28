@@ -2533,7 +2533,7 @@ impl Simulator {
                                 )
                             });
                         let mut resized = if is_string {
-                            self.string_signals.insert(target.clone());
+                            class_metadata!(self.string_signals, insert(target.clone()));
                             val.clone()
                         } else if is_real && !val.is_real {
                             Value::from_f64(val.to_f64())

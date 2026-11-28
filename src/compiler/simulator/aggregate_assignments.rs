@@ -501,9 +501,8 @@ impl Simulator {
                             &self.module.typedef_types,
                         );
                     }
-                    self.class_assoc_defaults.insert(scoped.to_string(), v.clone());
-                    self.assoc_tables
-                        .entry(scoped.to_string())
+                    class_metadata!(self.class_assoc_defaults, insert(scoped.to_string(), v.clone()));
+                    class_metadata!(self.assoc_tables, entry(scoped.to_string()))
                         .or_default()
                         .evaluated_default = Some(v);
                 }
@@ -798,8 +797,7 @@ impl Simulator {
                                 self.eval_expr(d)
                             };
                             let fitted = self.fit_assoc_elem_val(name, v);
-                            self.assoc_tables
-                                .entry(name.to_string())
+                            class_metadata!(self.assoc_tables, entry(name.to_string()))
                                 .or_default()
                                 .evaluated_default = Some(fitted);
                             continue;
@@ -1019,9 +1017,10 @@ impl Simulator {
         let snap = Self::RET_ASSOC_SNAP;
         if src != snap {
             let is_str = self.is_string_keyed_array(src);
-            self.module
-                .associative_arrays
-                .insert(snap.to_string(), is_str);
+            class_metadata!(
+                self.module.associative_arrays,
+                insert(snap.to_string(), is_str)
+            );
             self.copy_assoc_entries(snap, src);
         }
         self.pending_ret_collection = Some(snap.to_string());
@@ -1056,44 +1055,52 @@ impl Simulator {
         if !self.module.associative_arrays.contains_key(dst)
             && let Some(&is_str) = self.module.associative_arrays.get(src)
         {
-            self.module
-                .associative_arrays
-                .insert(dst.to_string(), is_str);
+            class_metadata!(
+                self.module.associative_arrays,
+                insert(dst.to_string(), is_str)
+            );
         }
         if !self.module.assoc_index_widths.contains_key(dst)
             && let Some(&iw) = self.module.assoc_index_widths.get(src)
         {
-            self.module.assoc_index_widths.insert(dst.to_string(), iw);
+            class_metadata!(
+                self.module.assoc_index_widths,
+                insert(dst.to_string(), iw)
+            );
         }
         if !self.module.assoc_elem_widths.contains_key(dst)
             && let Some(&ew) = self.module.assoc_elem_widths.get(src)
         {
-            self.module.assoc_elem_widths.insert(dst.to_string(), ew);
+            class_metadata!(self.module.assoc_elem_widths, insert(dst.to_string(), ew));
         }
         if !self.module.assoc_key_type_names.contains_key(dst)
             && let Some(kt) = self.module.assoc_key_type_names.get(src).cloned()
         {
-            self.module.assoc_key_type_names.insert(dst.to_string(), kt);
+            class_metadata!(
+                self.module.assoc_key_type_names,
+                insert(dst.to_string(), kt)
+            );
         }
         if self.module.wildcard_assoc_arrays.contains(src) {
-            self.module.wildcard_assoc_arrays.insert(dst.to_string());
+            class_metadata!(self.module.wildcard_assoc_arrays, insert(dst.to_string()));
         }
         if !self.module.assoc_key_struct_types.contains_key(dst)
             && let Some(ks) = self.module.assoc_key_struct_types.get(src).cloned()
         {
-            self.module
-                .assoc_key_struct_types
-                .insert(dst.to_string(), ks);
+            class_metadata!(
+                self.module.assoc_key_struct_types,
+                insert(dst.to_string(), ks)
+            );
         }
         if !self.module.two_state_signals.contains(dst)
             && self.module.two_state_signals.contains(src)
         {
-            self.module.two_state_signals.insert(dst.to_string());
+            class_metadata!(self.module.two_state_signals, insert(dst.to_string()));
         }
         if !self.module.var_decl_types.contains_key(dst)
             && let Some(dt) = self.module.var_decl_types.get(src).cloned()
         {
-            self.module.var_decl_types.insert(dst.to_string(), dt);
+            class_metadata!(self.module.var_decl_types, insert(dst.to_string(), dt));
         }
         // §7.9.9: every element, including the member leaves of an
         // unpacked-struct element (`src[k].x`), which do not end in `]`.
@@ -1121,10 +1128,10 @@ impl Simulator {
             self.signals.insert(k, v);
         }
         if let Some(d) = self.module.assoc_defaults.get(src).cloned() {
-            self.module.assoc_defaults.insert(dst.to_string(), d);
+            class_metadata!(self.module.assoc_defaults, insert(dst.to_string(), d));
         }
         if let Some(d) = self.class_assoc_defaults.get(src).cloned() {
-            self.class_assoc_defaults.insert(dst.to_string(), d);
+            class_metadata!(self.class_assoc_defaults, insert(dst.to_string(), d));
         }
         let mut table_any = false;
         if let Some(src_table) = self.assoc_tables.get(src).cloned() {
@@ -1144,20 +1151,26 @@ impl Simulator {
                     }
                 }
             }
-            self.assoc_tables.insert(
-                dst.to_string(),
-                super::assoc_store::AssocTable {
-                    entries: dst_entries,
-                    evaluated_default: src_table.evaluated_default,
-                },
+            class_metadata!(
+                self.assoc_tables,
+                insert(
+                    dst.to_string(),
+                    super::assoc_store::AssocTable {
+                        entries: dst_entries,
+                        evaluated_default: src_table.evaluated_default,
+                    },
+                )
             );
         } else if let Some(ev_def) = self.assoc_default_val(src) {
-            self.assoc_tables.insert(
-                dst.to_string(),
-                super::assoc_store::AssocTable {
-                    entries: Default::default(),
-                    evaluated_default: Some(ev_def),
-                },
+            class_metadata!(
+                self.assoc_tables,
+                insert(
+                    dst.to_string(),
+                    super::assoc_store::AssocTable {
+                        entries: Default::default(),
+                        evaluated_default: Some(ev_def),
+                    },
+                )
             );
         }
         let nested_prefix = format!("{src}[");
@@ -1175,7 +1188,7 @@ impl Simulator {
                     *cp = format!("{dst}{}", &cp[src.len()..]);
                 }
             }
-            self.assoc_tables.insert(dk, tbl);
+            class_metadata!(self.assoc_tables, insert(dk, tbl));
         }
         let nested_assoc: Vec<(String, bool)> = self
             .module
@@ -1185,7 +1198,7 @@ impl Simulator {
             .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
             .collect();
         for (dk, v) in nested_assoc {
-            self.module.associative_arrays.insert(dk, v);
+            class_metadata!(self.module.associative_arrays, insert(dk, v));
         }
         let nested_iw: Vec<(String, (u32, bool))> = self
             .module
@@ -1195,7 +1208,7 @@ impl Simulator {
             .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
             .collect();
         for (dk, v) in nested_iw {
-            self.module.assoc_index_widths.insert(dk, v);
+            class_metadata!(self.module.assoc_index_widths, insert(dk, v));
         }
         let nested_ew: Vec<(String, u32)> = self
             .module
@@ -1205,7 +1218,7 @@ impl Simulator {
             .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
             .collect();
         for (dk, v) in nested_ew {
-            self.module.assoc_elem_widths.insert(dk, v);
+            class_metadata!(self.module.assoc_elem_widths, insert(dk, v));
         }
         let nested_dyn: Vec<String> = self
             .module
@@ -1215,7 +1228,7 @@ impl Simulator {
             .map(|k| format!("{dst}{}", &k[src.len()..]))
             .collect();
         for dk in nested_dyn {
-            self.module.dynamic_arrays.insert(dk);
+            class_metadata!(self.module.dynamic_arrays, insert(dk));
         }
         let nested_q: Vec<String> = self
             .module
@@ -1225,7 +1238,7 @@ impl Simulator {
             .map(|k| format!("{dst}{}", &k[src.len()..]))
             .collect();
         for dk in nested_q {
-            self.module.queue_vars.insert(dk);
+            class_metadata!(self.module.queue_vars, insert(dk));
         }
         let nested_qmax: Vec<(String, u32)> = self
             .module
@@ -1235,7 +1248,7 @@ impl Simulator {
             .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
             .collect();
         for (dk, v) in nested_qmax {
-            self.module.queue_max_sizes.insert(dk, v);
+            class_metadata!(self.module.queue_max_sizes, insert(dk, v));
         }
         let nested_arr: Vec<(String, (i64, i64, u32))> = self
             .module
@@ -1245,7 +1258,7 @@ impl Simulator {
             .map(|(k, &v)| (format!("{dst}{}", &k[src.len()..]), v))
             .collect();
         for (dk, v) in nested_arr {
-            self.module.arrays.insert(dk, v);
+            class_metadata!(self.module.arrays, insert(dk, v));
         }
         if sig_any || table_any {
             self.mark_struct_coll_owner_present(dst);
@@ -2120,7 +2133,7 @@ impl Simulator {
             // members default to 0 as well (§7.2.1, §7.4) — seeded per
             // element leaf (`arr[1].a`), never on the container name.
             if self.packed_type_is_mixed(&dt) {
-                self.mixed_packed_vars.insert(vname.clone());
+                class_metadata!(self.mixed_packed_vars, insert(vname.clone()));
             }
             let fixed_1d = self.module.arrays.get(&vname).copied();
             let fixed_2d = self.module.arrays_2d.get(&vname).copied();
@@ -2330,10 +2343,12 @@ impl Simulator {
         if let DataType::Struct(su) = self.resolve_dt_in_ctx(dt) {
             let mut ts = HashSet::default();
             self.collect_two_state_leaves(&su, "", &mut ts);
-            self.mixed_local_two_state
-                .insert(name.to_string(), std::sync::Arc::new(ts));
+            class_metadata!(
+                self.mixed_local_two_state,
+                insert(name.to_string(), std::sync::Arc::new(ts))
+            );
         } else {
-            self.mixed_local_two_state.remove(name);
+            class_metadata!(self.mixed_local_two_state, remove(name));
         }
     }
 
@@ -2616,7 +2631,7 @@ impl Simulator {
                                 self.widths.insert(leaf.clone(), v.width);
                             }
                             if signed && !is_real {
-                                self.signed_signals.insert(leaf.clone());
+                                class_metadata!(self.signed_signals, insert(leaf.clone()));
                             }
                         }
                         self.set_signal_value_by_name(&leaf, v);
@@ -3153,7 +3168,7 @@ impl Simulator {
                         continue;
                     }
                     if !self.ensure_struct_member_coll(&d) {
-                        self.module.dynamic_arrays.insert(d.clone());
+                        class_metadata!(self.module.dynamic_arrays, insert(d.clone()));
                     }
                     let n = self.get_queue_size(&sname);
                     for j in 0..n {
@@ -3375,11 +3390,12 @@ impl Simulator {
     /// exactly the entries of associative array `src`.
     pub(super) fn store_assoc_elem(&mut self, elem: &str, src: &str) {
         let is_str = self.is_string_keyed_array(src);
-        self.module
-            .associative_arrays
-            .insert(elem.to_string(), is_str);
+        class_metadata!(
+            self.module.associative_arrays,
+            insert(elem.to_string(), is_str)
+        );
         if let Some(w) = self.module.assoc_elem_widths.get(src).copied() {
-            self.module.assoc_elem_widths.insert(elem.to_string(), w);
+            class_metadata!(self.module.assoc_elem_widths, insert(elem.to_string(), w));
         }
         self.copy_assoc_entries(elem, src);
     }
@@ -4252,11 +4268,11 @@ impl Simulator {
     /// Register `row` as an empty dynamic row shaped like `like`.
     pub(super) fn register_dyn_row_like(&mut self, row: &str, like: &str) {
         self.clear_dyn_row(row);
-        self.module.dynamic_arrays.insert(row.to_string());
+        class_metadata!(self.module.dynamic_arrays, insert(row.to_string()));
         let shape = self.module.arrays.get(like).copied().unwrap_or((0, 63, 32));
-        self.module.arrays.insert(row.to_string(), shape);
+        class_metadata!(self.module.arrays, insert(row.to_string(), shape));
         if self.module.queue_vars.contains(like) {
-            self.module.queue_vars.insert(row.to_string());
+            class_metadata!(self.module.queue_vars, insert(row.to_string()));
         }
         self.set_queue_size(row, 0);
     }
@@ -4775,9 +4791,9 @@ impl Simulator {
             self.set_signal_value_by_name(&format!("{RET_SNAP}[{pos}]"), v.clone());
         }
         self.set_queue_size(RET_SNAP, row.len() as u64);
-        self.module.arrays.insert(RET_SNAP.to_string(), (0, -1, w));
-        self.module.dynamic_arrays.insert(RET_SNAP.to_string());
-        self.module.var_decl_types.insert(RET_SNAP.to_string(), dt);
+        class_metadata!(self.module.arrays, insert(RET_SNAP.to_string(), (0, -1, w)));
+        class_metadata!(self.module.dynamic_arrays, insert(RET_SNAP.to_string()));
+        class_metadata!(self.module.var_decl_types, insert(RET_SNAP.to_string(), dt));
         Some(RET_SNAP.to_string())
     }
 
@@ -6296,8 +6312,7 @@ impl Simulator {
                         _ => self.eval_expr(e),
                     };
                     let fitted = self.fit_assoc_elem_val(base, v);
-                    self.assoc_tables
-                        .entry(base.to_string())
+                    class_metadata!(self.assoc_tables, entry(base.to_string()))
                         .or_default()
                         .evaluated_default = Some(fitted);
                     wrote = true;
@@ -6378,7 +6393,7 @@ impl Simulator {
                 let pet = self.p_elem_type(base);
                 pet.is_some()
             } {
-                self.module.dynamic_arrays.insert(base.to_string());
+                class_metadata!(self.module.dynamic_arrays, insert(base.to_string()));
                 let exprs = self.pattern_ordered(items);
                 if exprs.is_empty() {
                     return false;

@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Reclaim metadata and dense storage under deleted associative rows, and
+  trace class associative keys using the instantiated key type
+  (§7.8.5, §7.9.2, §8.7, #1667).
+
 - Return typed defaults for invalid multidimensional array reads, report
   truncation from associative traversal, and preserve X/Z, full width, and
   nested row iterators in array reductions (§7.4.6, §7.9.8, §7.12.3).
@@ -259,6 +263,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the extends clause (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
+
+- Store sparse collection elements in ordered per-collection buckets. Prefix
+  lookups visit matching rows directly, and checkpoint files retain their
+  existing layout (§7.8, #1667).
+
+- Trace class-owned collections only when their owners are reachable. Exclude
+  declared scalar keys and values and scheduler identifiers from class roots
+  (§7.8, §8.7, #1667).
+
+- Reclaim class and automatic collection storage by owner, including
+  metadata-only rows and solver records. Discard mailbox patterns with their
+  messages or cancelled producers (§6.21, §8.7, §15.4, #1667).
 
 - Trace dense collections without treating positional indices as class handles,
   and release dead objects' dense storage without formatting element keys

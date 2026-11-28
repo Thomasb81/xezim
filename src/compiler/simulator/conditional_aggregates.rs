@@ -515,8 +515,10 @@ impl Simulator {
         let handle = value.to_u64().unwrap_or(0) as usize;
         let name = format!("__xz_cond_receiver_{handle}__");
         if let Some(instance) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-            self.var_class_types
-                .insert(name.clone(), instance.class_name.clone());
+            class_metadata!(
+                self.var_class_types,
+                insert(name.clone(), instance.class_name.clone())
+            );
         }
         self.signals.insert(name.clone(), value);
         Self::hier_ident_expr(
@@ -570,7 +572,7 @@ impl Simulator {
             // Unpacked struct functions use the existing packed transport.
             if let Some(su) = self.unpacked_struct_of(&dt) {
                 let name = "__xz_cond_struct_call__";
-                self.module.var_decl_types.insert(name.into(), dt.clone());
+                class_metadata!(self.module.var_decl_types, insert(name.into(), dt.clone()));
                 self.spread_into_unpacked_struct(name, &su, &value);
                 let ident = Self::hier_ident_expr(
                     vec![crate::ast::expr::HierPathSegment {
@@ -1065,15 +1067,15 @@ impl Simulator {
 
     /// Remove what `store_conditional_aggregate` stored for `value`.
     fn release_conditional_aggregate(&mut self, name: &str, value: &AggregateValue) {
-        self.module.var_decl_types.remove(name);
-        self.module.arrays.remove(name);
-        self.module.arrays_2d.remove(name);
-        self.module.arrays_nd.remove(name);
-        self.module.dynamic_arrays.remove(name);
-        self.module.unpacked_decl_dims.remove(name);
-        self.module.descending_arrays.remove(name);
-        self.module.associative_arrays.remove(name);
-        self.module.assoc_defaults.remove(name);
+        class_metadata!(self.module.var_decl_types, remove(name));
+        class_metadata!(self.module.arrays, remove(name));
+        class_metadata!(self.module.arrays_2d, remove(name));
+        class_metadata!(self.module.arrays_nd, remove(name));
+        class_metadata!(self.module.dynamic_arrays, remove(name));
+        class_metadata!(self.module.unpacked_decl_dims, remove(name));
+        class_metadata!(self.module.descending_arrays, remove(name));
+        class_metadata!(self.module.associative_arrays, remove(name));
+        class_metadata!(self.module.assoc_defaults, remove(name));
         match &value.kind {
             AggregateKind::Scalar { .. } => {
                 self.signals.remove(name);
@@ -1104,15 +1106,16 @@ impl Simulator {
     }
 
     fn store_conditional_aggregate(&mut self, name: &str, value: &AggregateValue) {
-        self.module
-            .var_decl_types
-            .insert(name.into(), value.data_type.clone());
-        self.module.arrays.remove(name);
-        self.module.arrays_2d.remove(name);
-        self.module.arrays_nd.remove(name);
-        self.module.dynamic_arrays.remove(name);
-        self.module.unpacked_decl_dims.remove(name);
-        self.module.descending_arrays.remove(name);
+        class_metadata!(
+            self.module.var_decl_types,
+            insert(name.into(), value.data_type.clone())
+        );
+        class_metadata!(self.module.arrays, remove(name));
+        class_metadata!(self.module.arrays_2d, remove(name));
+        class_metadata!(self.module.arrays_nd, remove(name));
+        class_metadata!(self.module.dynamic_arrays, remove(name));
+        class_metadata!(self.module.unpacked_decl_dims, remove(name));
+        class_metadata!(self.module.descending_arrays, remove(name));
         match &value.kind {
             AggregateKind::Scalar { value, .. } => {
                 // §10.10: storing an element must update its live member cells,
@@ -1136,16 +1139,18 @@ impl Simulator {
                 string_keyed,
                 default,
             } => {
-                self.module
-                    .associative_arrays
-                    .insert(name.into(), *string_keyed);
+                class_metadata!(
+                    self.module.associative_arrays,
+                    insert(name.into(), *string_keyed)
+                );
                 self.assoc_clear(name, true);
                 if let Some(default) = default {
                     let fitted = self.fit_assoc_elem_val(name, default.clone());
-                    self.assoc_tables
-                        .entry(name.to_string())
+                    class_metadata!(self.assoc_tables, entry(name.to_string()))
                         .or_default()
                         .evaluated_default = Some(fitted);
+                } else {
+                    class_metadata!(self.module.assoc_defaults, remove(name));
                 }
                 for (key, child) in entries {
                     let elem = format!("{name}[{key}]");
@@ -1191,28 +1196,33 @@ impl Simulator {
                     ));
                     child = values.first();
                 }
-                self.module
-                    .unpacked_decl_dims
-                    .insert(name.to_string(), shape.clone());
+                class_metadata!(
+                    self.module.unpacked_decl_dims,
+                    insert(name.to_string(), shape.clone())
+                );
                 if shape[0].0 > shape[0].1 {
-                    self.module.descending_arrays.insert(name.into());
+                    class_metadata!(self.module.descending_arrays, insert(name.into()));
                 }
                 let bounds = |(l, r): (i64, i64)| (l.min(r), l.max(r));
                 if *dynamic || shape.len() == 1 {
                     let (lo, hi) = bounds(shape[0]);
-                    self.module.arrays.insert(name.into(), (lo, hi, width));
+                    class_metadata!(self.module.arrays, insert(name.into(), (lo, hi, width)));
                 } else if shape.len() == 2 {
-                    self.module
-                        .arrays_2d
-                        .insert(name.into(), (bounds(shape[0]), bounds(shape[1]), width));
+                    class_metadata!(
+                        self.module.arrays_2d,
+                        insert(name.into(), (bounds(shape[0]), bounds(shape[1]), width))
+                    );
                 } else {
-                    self.module.arrays_nd.insert(
-                        name.into(),
-                        (shape.iter().copied().map(bounds).collect(), width),
+                    class_metadata!(
+                        self.module.arrays_nd,
+                        insert(
+                            name.into(),
+                            (shape.iter().copied().map(bounds).collect(), width),
+                        )
                     );
                 }
                 if *dynamic {
-                    self.module.dynamic_arrays.insert(name.into());
+                    class_metadata!(self.module.dynamic_arrays, insert(name.into()));
                     self.set_queue_size(name, values.len() as u64);
                 }
                 for (i, child) in indices.iter().zip(values) {

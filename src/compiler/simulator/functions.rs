@@ -215,18 +215,21 @@ impl Simulator {
             );
             if let Some(ew) = self.ast_decl_elem_width(&port.data_type) {
                 if ew > 0 && w > ew && w % ew == 0 {
-                    self.module
-                        .packed_signal_elem_widths
-                        .insert(port.name.name.clone(), ew);
+                    class_metadata!(
+                        self.module.packed_signal_elem_widths,
+                        insert(port.name.name.clone(), ew)
+                    );
                 } else {
-                    self.module
-                        .packed_signal_elem_widths
-                        .remove(&port.name.name);
+                    class_metadata!(
+                        self.module.packed_signal_elem_widths,
+                        remove(&port.name.name)
+                    );
                 }
             } else {
-                self.module
-                    .packed_signal_elem_widths
-                    .remove(&port.name.name);
+                class_metadata!(
+                    self.module.packed_signal_elem_widths,
+                    remove(&port.name.name)
+                );
             }
         }
         {
@@ -238,14 +241,15 @@ impl Simulator {
             let rname = &fd.name.name.name;
             if let Some(ew) = self.ast_decl_elem_width(&fd.return_type) {
                 if ew > 0 && rw > ew && rw % ew == 0 {
-                    self.module
-                        .packed_signal_elem_widths
-                        .insert(rname.clone(), ew);
+                    class_metadata!(
+                        self.module.packed_signal_elem_widths,
+                        insert(rname.clone(), ew)
+                    );
                 } else {
-                    self.module.packed_signal_elem_widths.remove(rname);
+                    class_metadata!(self.module.packed_signal_elem_widths, remove(rname));
                 }
             } else {
-                self.module.packed_signal_elem_widths.remove(rname);
+                class_metadata!(self.module.packed_signal_elem_widths, remove(rname));
             }
         }
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
@@ -509,8 +513,10 @@ impl Simulator {
                     frame_types
                         .0
                         .insert(port.name.name.clone(), type_name.clone());
-                    self.var_class_types
-                        .insert(port.name.name.clone(), type_name);
+                    class_metadata!(
+                        self.var_class_types,
+                        insert(port.name.name.clone(), type_name)
+                    );
                     self.note_formal_type_args(&port.name.name, type_args);
                 } else if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
@@ -518,8 +524,10 @@ impl Simulator {
                     frame_types
                         .1
                         .insert(port.name.name.clone(), type_name.clone());
-                    self.var_typedef_types
-                        .insert(port.name.name.clone(), type_name);
+                    class_metadata!(
+                        self.var_typedef_types,
+                        insert(port.name.name.clone(), type_name)
+                    );
                 } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                     // The formal is typed with a class TYPE PARAMETER
                     // (`IMP imp` inside a parameterized class, e.g. the
@@ -545,8 +553,10 @@ impl Simulator {
                         frame_types
                             .0
                             .insert(port.name.name.clone(), concrete.clone());
-                        self.var_class_types
-                            .insert(port.name.name.clone(), concrete);
+                        class_metadata!(
+                            self.var_class_types,
+                            insert(port.name.name.clone(), concrete)
+                        );
                     }
                 }
             }
@@ -601,9 +611,9 @@ impl Simulator {
             ),
         };
         if ret_signed {
-            self.signed_signals.insert(ret_name.clone());
+            class_metadata!(self.signed_signals, insert(ret_name.clone()));
         } else {
-            self.signed_signals.remove(&ret_name);
+            class_metadata!(self.signed_signals, remove(&ret_name));
         }
         // §13.4.1: the return variable is a VARIABLE of the return type — its
         // initial value is the type default: x for a 4-state type, 0 for a
@@ -657,12 +667,12 @@ impl Simulator {
             // also key the typedef width table).
             if self.module.classes.contains_key(&type_name) {
                 frame_types.0.insert(ret_name.clone(), type_name.clone());
-                self.var_class_types.insert(ret_name.clone(), type_name);
+                class_metadata!(self.var_class_types, insert(ret_name.clone(), type_name));
             } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
                 frame_types.1.insert(ret_name.clone(), type_name.clone());
-                self.var_typedef_types.insert(ret_name.clone(), type_name);
+                class_metadata!(self.var_typedef_types, insert(ret_name.clone(), type_name));
             }
         }
         // Mark string-typed return var / params for character indexing.
@@ -690,13 +700,13 @@ impl Simulator {
             }
         }
         if Self::is_string_data_type(&fd.return_type) {
-            if self.string_signals.insert(ret_name.clone()) {
+            if class_metadata!(self.string_signals, insert(ret_name.clone())) {
                 frame_string_signals.push(ret_name.clone());
             }
         }
         for port in fd.ports.iter() {
             if Self::is_string_data_type(&port.data_type) {
-                if self.string_signals.insert(port.name.name.clone()) {
+                if class_metadata!(self.string_signals, insert(port.name.name.clone())) {
                     frame_string_signals.push(port.name.name.clone());
                 }
             }
@@ -911,11 +921,11 @@ impl Simulator {
         // at entry), so this frame's non-string locals can't leak a `remove`.
         self.close_decl_shadow_frame();
         for n in &frame_string_signals {
-            self.string_signals.remove(n);
+            class_metadata!(self.string_signals, remove(n));
         }
         if let Some(removed) = self.string_signals_removed.pop() {
             for n in removed {
-                self.string_signals.insert(n);
+                class_metadata!(self.string_signals, insert(n));
             }
         }
         for (name, _) in output_bindings.iter().chain(&default_output_bindings) {
@@ -1088,10 +1098,10 @@ impl Simulator {
                 // `module.associative_arrays` entry wrong).
                 match prior {
                     Some(v) => {
-                        self.module.associative_arrays.insert(param.clone(), v);
+                        class_metadata!(self.module.associative_arrays, insert(param.clone(), v));
                     }
                     None => {
-                        self.module.associative_arrays.remove(&param);
+                        class_metadata!(self.module.associative_arrays, remove(&param));
                     }
                 }
                 continue;
@@ -1335,10 +1345,10 @@ impl Simulator {
                 continue; // identity binding — the keys ARE the caller's
             }
             self.assoc_clear(&param_name, true);
-            self.assoc_tables.remove(&param_name);
-            self.module.associative_arrays.remove(&param_name);
+            class_metadata!(self.assoc_tables, remove(&param_name));
+            class_metadata!(self.module.associative_arrays, remove(&param_name));
             if !self.module.assoc_defaults.is_empty() {
-                self.module.assoc_defaults.remove(&param_name);
+                class_metadata!(self.module.assoc_defaults, remove(&param_name));
             }
         }
         self.writeback_array_args(&staged_arrays);
@@ -1779,25 +1789,33 @@ impl Simulator {
 
     pub(super) fn clear_formal_metadata(&mut self, name: &str) {
         self.meta_note(name);
-        self.module.var_decl_types.remove(name);
-        self.module.packed_struct_fields.remove(name);
+        class_metadata!(self.module.var_decl_types, remove(name));
+        class_metadata!(self.module.packed_struct_fields, remove(name));
         self.clear_formal_elem_widths(name);
-        self.module.packed_full_dims.remove(name);
-        self.var_class_types.remove(name);
-        self.var_typedef_types.remove(name);
-        self.mixed_packed_vars.remove(name);
-        self.mixed_local_two_state.remove(name);
+        class_metadata!(self.module.packed_full_dims, remove(name));
+        class_metadata!(self.var_class_types, remove(name));
+        class_metadata!(self.var_typedef_types, remove(name));
+        class_metadata!(self.mixed_packed_vars, remove(name));
+        class_metadata!(self.mixed_local_two_state, remove(name));
     }
 
     /// The `packed_signal_elem_widths` part of `clear_formal_metadata`.
     pub(super) fn clear_formal_elem_widths(&mut self, name: &str) {
         self.meta_note(name);
         if self.elem_base_has_dotted(name) {
+            let metadata = &mut self.class_metadata_keys;
             self.module.packed_signal_elem_widths.retain(|key, _| {
-                key.as_str() != name
+                let keep = key.as_str() != name
                     && !key
                         .strip_prefix(name)
-                        .is_some_and(|rest| rest.starts_with('.'))
+                        .is_some_and(|rest| rest.starts_with('.'));
+                if !keep {
+                    metadata.forget(
+                        super::heap_gc::ClassMetadataField::ModulePackedSignalElemWidths,
+                        key,
+                    );
+                }
+                keep
             });
             // Every `name.…` key is gone; later calls for this base take the
             // fast path again. (Deeper stale prefixes like `name.sub` may
@@ -1806,7 +1824,7 @@ impl Simulator {
                 set.remove(name);
             }
         } else {
-            self.module.packed_signal_elem_widths.remove(name);
+            class_metadata!(self.module.packed_signal_elem_widths, remove(name));
         }
     }
 
@@ -1948,30 +1966,26 @@ impl Simulator {
         let packed_element_widths = if self.elem_base_has_dotted(name) {
             let snap = self.snapshot_formal_parts(name).packed_element_widths;
             for (k, _) in &snap {
-                self.module.packed_signal_elem_widths.remove(k);
+                class_metadata!(self.module.packed_signal_elem_widths, remove(k));
             }
             snap
         } else {
-            self.module
-                .packed_signal_elem_widths
-                .remove_entry(name)
+            class_metadata!(self.module.packed_signal_elem_widths, remove_entry(name))
                 .into_iter()
                 .collect()
         };
         FormalMetadataSnapshot {
             name: name.to_string(),
             parts: FormalMetaParts {
-                declared_type: self.module.var_decl_types.remove(name),
-                packed_fields: self
-                    .module
-                    .packed_struct_fields
-                    .remove(name)
+                declared_type: class_metadata!(self.module.var_decl_types, remove(name)),
+                packed_fields: class_metadata!(self.module.packed_struct_fields, remove(name))
                     .map(|f| f.to_vec()),
                 packed_element_widths,
-                packed_dimensions: self.module.packed_full_dims.remove(name).map(|d| d.to_vec()),
-                class_type: self.var_class_types.remove(name),
-                typedef_type: self.var_typedef_types.remove(name),
-                mixed_packed: self.mixed_packed_vars.remove(name),
+                packed_dimensions: class_metadata!(self.module.packed_full_dims, remove(name))
+                    .map(|d| d.to_vec()),
+                class_type: class_metadata!(self.var_class_types, remove(name)),
+                typedef_type: class_metadata!(self.var_typedef_types, remove(name)),
+                mixed_packed: class_metadata!(self.mixed_packed_vars, remove(name)),
             },
         }
     }
@@ -1999,7 +2013,7 @@ impl Simulator {
             return;
         }
         for n in &frame.fresh_strings {
-            self.string_signals.remove(n);
+            class_metadata!(self.string_signals, remove(n));
         }
         for n in &frame.fresh_names {
             self.drop_fresh_local_geometry(n);
@@ -2032,11 +2046,11 @@ impl Simulator {
         }
         drop(self.take_formal_metadata(name));
         self.widths.remove(name);
-        self.signed_signals.remove(name);
-        self.real_signals.remove(name);
-        self.string_signals.remove(name);
-        self.mixed_packed_vars.remove(name);
-        self.mixed_local_two_state.remove(name);
+        class_metadata!(self.signed_signals, remove(name));
+        class_metadata!(self.real_signals, remove(name));
+        class_metadata!(self.string_signals, remove(name));
+        class_metadata!(self.mixed_packed_vars, remove(name));
+        class_metadata!(self.mixed_local_two_state, remove(name));
     }
 
     /// A declared type whose registration is only its width and signedness:
@@ -2067,19 +2081,19 @@ impl Simulator {
                 }
             }
             if d.signed {
-                self.signed_signals.insert(name.clone());
+                class_metadata!(self.signed_signals, insert(name.clone()));
             } else {
-                self.signed_signals.remove(&name);
+                class_metadata!(self.signed_signals, remove(&name));
             }
             if d.real {
-                self.real_signals.insert(name.clone());
+                class_metadata!(self.real_signals, insert(name.clone()));
             } else {
-                self.real_signals.remove(&name);
+                class_metadata!(self.real_signals, remove(&name));
             }
             if d.string {
-                self.string_signals.insert(name);
+                class_metadata!(self.string_signals, insert(name));
             } else {
-                self.string_signals.remove(&name);
+                class_metadata!(self.string_signals, remove(&name));
             }
             self.restore_formal_metadata(d.meta);
         }
@@ -2095,48 +2109,45 @@ impl Simulator {
         self.meta_note(name);
         // Each table ends up holding exactly the snapshot's entry for the
         // name: overwritten in place or removed, without the clear pass.
-        fn put<V>(map: &mut HashMap<String, V>, name: &str, v: Option<V>) {
-            match v {
-                Some(v) => match map.get_mut(name) {
-                    Some(slot) => *slot = v,
+        macro_rules! put {
+            ($field:ident, $saved:expr) => {
+                match $saved {
+                    Some(value) => match self.$field.get_mut(name) {
+                        Some(slot) => *slot = value,
+                        None => {
+                            class_metadata!(self.$field, insert(name.to_owned(), value));
+                        }
+                    },
                     None => {
-                        map.insert(name.to_string(), v);
+                        class_metadata!(self.$field, remove(name));
                     }
-                },
-                None => {
-                    map.remove(name);
                 }
-            }
+            };
         }
         match saved.declared_type {
             Some(ty) => {
-                self.module
-                    .var_decl_types
-                    .insert_shared(name.to_string(), ty);
+                class_metadata!(
+                    self.module.var_decl_types,
+                    insert_shared(name.to_string(), ty)
+                );
             }
             None => {
-                self.module.var_decl_types.remove(name);
+                class_metadata!(self.module.var_decl_types, remove(name));
             }
         }
-        fn put_shared<T: Eq + std::hash::Hash>(
-            map: &mut xezim_core::shared_names::SharedSliceMap<T>,
-            name: &str,
-            v: Option<Vec<T>>,
-        ) {
-            match v {
-                Some(v) => {
-                    map.insert(name.to_string(), v);
+        macro_rules! put_shared {
+            ($field:ident, $saved:expr) => {
+                match $saved {
+                    Some(value) => {
+                        class_metadata!(self.module.$field, insert(name.to_owned(), value));
+                    }
+                    None => {
+                        class_metadata!(self.module.$field, remove(name));
+                    }
                 }
-                None => {
-                    map.remove(name);
-                }
-            }
+            };
         }
-        put_shared(
-            &mut self.module.packed_struct_fields,
-            name,
-            saved.packed_fields,
-        );
+        put_shared!(packed_struct_fields, saved.packed_fields);
         let mut elem_widths = saved.packed_element_widths;
         if elem_widths.iter().all(|(key, _)| key == name) && !self.elem_base_has_dotted(name) {
             // Only the exact key can be involved: overwrite or remove it.
@@ -2144,33 +2155,29 @@ impl Simulator {
                 Some((key, width)) => match self.module.packed_signal_elem_widths.get_mut(name) {
                     Some(slot) => *slot = width,
                     None => {
-                        self.module.packed_signal_elem_widths.insert(key, width);
+                        class_metadata!(self.module.packed_signal_elem_widths, insert(key, width));
                     }
                 },
                 None => {
-                    self.module.packed_signal_elem_widths.remove(name);
+                    class_metadata!(self.module.packed_signal_elem_widths, remove(name));
                 }
             }
         } else {
             self.clear_formal_elem_widths(name);
             for (key, width) in elem_widths {
                 self.note_elem_width_key(&key);
-                self.module.packed_signal_elem_widths.insert(key, width);
+                class_metadata!(self.module.packed_signal_elem_widths, insert(key, width));
             }
         }
-        put_shared(
-            &mut self.module.packed_full_dims,
-            name,
-            saved.packed_dimensions,
-        );
-        put(&mut self.var_class_types, name, saved.class_type);
-        put(&mut self.var_typedef_types, name, saved.typedef_type);
+        put_shared!(packed_full_dims, saved.packed_dimensions);
+        put!(var_class_types, saved.class_type);
+        put!(var_typedef_types, saved.typedef_type);
         if saved.mixed_packed {
-            self.mixed_packed_vars.insert(name.to_string());
+            class_metadata!(self.mixed_packed_vars, insert(name.to_string()));
             self.refresh_mixed_local_two_state(name);
         } else {
-            self.mixed_packed_vars.remove(name);
-            self.mixed_local_two_state.remove(name);
+            class_metadata!(self.mixed_packed_vars, remove(name));
+            class_metadata!(self.mixed_local_two_state, remove(name));
         }
     }
 
@@ -2192,11 +2199,11 @@ impl Simulator {
         match dims {
             Some(d) if self.module.packed_full_dims.get(name).map(|x| x.as_slice()) != Some(d.as_slice()) => {
                 self.meta_note(name);
-                self.module.packed_full_dims.insert(name.to_string(), d);
+                class_metadata!(self.module.packed_full_dims, insert(name.to_string(), d));
             }
             None if self.module.packed_full_dims.contains_key(name) => {
                 self.meta_note(name);
-                self.module.packed_full_dims.remove(name);
+                class_metadata!(self.module.packed_full_dims, remove(name));
             }
             _ => {}
         }
@@ -2210,9 +2217,10 @@ impl Simulator {
     ) {
         // `clear_formal_metadata` notes `name` before any write.
         self.clear_formal_metadata(name);
-        self.module
-            .var_decl_types
-            .insert(name.to_string(), dt.clone());
+        class_metadata!(
+            self.module.var_decl_types,
+            insert(name.to_string(), dt.clone())
+        );
         if let DataType::TypeReference {
             name: type_name,
             type_args,
@@ -2224,12 +2232,12 @@ impl Simulator {
             // WIDTH table, which misfiled class-typed formals into the
             // typedef maps (`class_of_var` missed them).
             if self.module.classes.contains_key(&type_name) {
-                self.var_class_types.insert(name.to_string(), type_name);
+                class_metadata!(self.var_class_types, insert(name.to_string(), type_name));
                 self.note_formal_type_args(name, type_args);
             } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
-                self.var_typedef_types.insert(name.to_string(), type_name);
+                class_metadata!(self.var_typedef_types, insert(name.to_string(), type_name));
             }
         }
         if !no_unpacked_dims {
@@ -2242,11 +2250,12 @@ impl Simulator {
             )
             .filter(|dims| dims.len() > 1)
             {
-                self.module.packed_full_dims.insert(name.to_string(), dims);
+                class_metadata!(self.module.packed_full_dims, insert(name.to_string(), dims));
                 if let Some(width) = self.ast_decl_elem_width(dt) {
-                    self.module
-                        .packed_signal_elem_widths
-                        .insert(name.to_string(), width);
+                    class_metadata!(
+                        self.module.packed_signal_elem_widths,
+                        insert(name.to_string(), width)
+                    );
                 }
             }
             return;
@@ -2257,7 +2266,10 @@ impl Simulator {
         if Self::type_is_plain_scalar(dt) || self.plain_class_ref(dt).is_some() {
             if let Some(fdims) = super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
             {
-                self.module.packed_full_dims.insert(name.to_string(), fdims);
+                class_metadata!(
+                    self.module.packed_full_dims,
+                    insert(name.to_string(), fdims)
+                );
             }
             return;
         }
@@ -2274,9 +2286,10 @@ impl Simulator {
                 &self.module.typedefs,
             )
         }) {
-            self.module
-                .packed_signal_elem_widths
-                .insert(name.to_string(), ew);
+            class_metadata!(
+                self.module.packed_signal_elem_widths,
+                insert(name.to_string(), ew)
+            );
         }
         if let Some(fdims) = super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
             .or_else(|| super::elaborate::packed_full_dims_of(&dt1, &self.module.parameters))
@@ -2289,7 +2302,10 @@ impl Simulator {
             })
             .or_else(|| self.struct_array_full_dims(dt))
         {
-            self.module.packed_full_dims.insert(name.to_string(), fdims);
+            class_metadata!(
+                self.module.packed_full_dims,
+                insert(name.to_string(), fdims)
+            );
         }
         if let DataType::Struct(su) = self.resolve_dt_in_ctx(dt) {
             for m in &su.members {
@@ -2303,15 +2319,16 @@ impl Simulator {
                     let key = format!("{}.{}", name, mdecl.name.name);
                     if let Some(ew) = ew {
                         self.note_elem_width_key(&key);
-                        self.module
-                            .packed_signal_elem_widths
-                            .insert(key.clone(), ew);
+                        class_metadata!(
+                            self.module.packed_signal_elem_widths,
+                            insert(key.clone(), ew)
+                        );
                     }
                     // §7.4.1: every dimension, so `a.f0[i][j][k]` of a
                     // typedef-element member selects an element at each index.
                     if let Some(fd) = &fd {
                         self.meta_note(&key);
-                        self.module.packed_full_dims.insert(key, fd.clone());
+                        class_metadata!(self.module.packed_full_dims, insert(key, fd.clone()));
                     }
                 }
             }
@@ -2324,15 +2341,16 @@ impl Simulator {
                 .get(name)
                 .is_none_or(|cur| cur.as_slice() != fields.as_slice())
         {
-            self.module
-                .packed_struct_fields
-                .insert(name.to_string(), fields);
+            class_metadata!(
+                self.module.packed_struct_fields,
+                insert(name.to_string(), fields)
+            );
         }
         if self.packed_type_is_mixed(dt) {
-            self.mixed_packed_vars.insert(name.to_string());
+            class_metadata!(self.mixed_packed_vars, insert(name.to_string()));
             self.set_mixed_local_two_state(name, dt);
         } else {
-            self.mixed_local_two_state.remove(name);
+            class_metadata!(self.mixed_local_two_state, remove(name));
         }
     }
 
@@ -2888,8 +2906,10 @@ impl Simulator {
                 let base = b.split('#').next().unwrap_or(b);
                 if self.module.classes.contains_key(base) {
                     frame_types.0.insert(port.name.name.clone(), b.to_string());
-                    self.var_class_types
-                        .insert(port.name.name.clone(), b.to_string());
+                    class_metadata!(
+                        self.var_class_types,
+                        insert(port.name.name.clone(), b.to_string())
+                    );
                 } else if self.module.enum_members.contains_key(b)
                     || self.module.typedefs.contains_key(b)
                 {

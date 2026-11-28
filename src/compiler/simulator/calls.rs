@@ -1352,8 +1352,9 @@ impl Simulator {
                         if matches!(mname, "push_back" | "push_front" | "insert")
                             && !self.is_declared_row(&cn)
                         {
-                            self.module.dynamic_arrays.insert(cn.clone());
-                            self.module.arrays.entry(cn.clone()).or_insert((0, 63, 32));
+                            class_metadata!(self.module.dynamic_arrays, insert(cn.clone()));
+                            class_metadata!(self.module.arrays, entry(cn.clone()))
+                                .or_insert((0, 63, 32));
                         }
                         if let Some(res) = self.eval_builtin_method(&cn, mname, args) {
                             return res;
@@ -1371,7 +1372,7 @@ impl Simulator {
                             && (self.module.dynamic_arrays.contains(&cn)
                                 || self.signals.contains_key(&format!("{}.size", cn)))
                         {
-                            self.module.dynamic_arrays.insert(cn.clone());
+                            class_metadata!(self.module.dynamic_arrays, insert(cn.clone()));
                             if let Some(res) = self.eval_builtin_method(&cn, mname, args) {
                                 return res;
                             }
@@ -1567,6 +1568,8 @@ impl Simulator {
                             .unwrap();
                         if let Some(arg) = args.first() {
                             self.mbx_assign_delivered(arg, &val, true);
+                        } else {
+                            self.discard_mailbox_pattern(&val);
                         }
                         self.admit_mailbox_put_waiter(handle);
                         return Value::zero(32);
@@ -1607,10 +1610,13 @@ impl Simulator {
                 // must fall through to normal method dispatch.
                 if self.mailboxes.contains_key(&handle) {
                     let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
-                    if let (Some(v), Some(arg)) = (val, args.first()) {
-                        self.mbx_assign_delivered(arg, &v, true);
-                        self.admit_mailbox_put_waiter(handle);
-                        return Value::from_u64(1, 32);
+                    if let Some(v) = val {
+                        if let Some(arg) = args.first() {
+                            self.mbx_assign_delivered(arg, &v, true);
+                            self.admit_mailbox_put_waiter(handle);
+                            return Value::from_u64(1, 32);
+                        }
+                        self.discard_mailbox_pattern(&v);
                     }
                     return Value::zero(32);
                 }

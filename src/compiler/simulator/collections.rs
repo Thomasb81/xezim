@@ -884,7 +884,7 @@ impl Simulator {
 
     /// The number of `[..]` selects `rest` consists of, or `None` when
     /// anything else follows one (`[1].a[2]`, a member of an element).
-    fn select_count(rest: &str) -> Option<usize> {
+    pub(super) fn select_count(rest: &str) -> Option<usize> {
         let (mut open, mut n) = (0usize, 0);
         for b in rest.bytes() {
             match b {
@@ -1031,7 +1031,7 @@ impl Simulator {
             // left behind (`q.delete(); q[0][7] = 2` holds only key 7).
             if fresh {
                 self.assoc_clear(row, true);
-                self.assoc_tables.remove(row);
+                class_metadata!(self.assoc_tables, remove(row));
                 for key in self.signals.keys_with_elem_prefix(&format!("{row}[")) {
                     self.signals.remove(&key);
                     self.widths.remove(&key);
@@ -1039,16 +1039,14 @@ impl Simulator {
             }
             match dims.get(level) {
                 Some(Dim::Queue | Dim::Dyn) => {
-                    self.module.dynamic_arrays.insert(row.to_string());
+                    class_metadata!(self.module.dynamic_arrays, insert(row.to_string()));
                     if matches!(dims.get(level), Some(Dim::Queue)) {
-                        self.module.queue_vars.insert(row.to_string());
+                        class_metadata!(self.module.queue_vars, insert(row.to_string()));
                     }
                     if let Some(&(_, max)) = queue_bounds.iter().find(|&&(d, _)| d == level) {
-                        self.module.queue_max_sizes.insert(row.to_string(), max);
+                        class_metadata!(self.module.queue_max_sizes, insert(row.to_string(), max));
                     }
-                    self.module
-                        .arrays
-                        .entry(row.to_string())
+                    class_metadata!(self.module.arrays, entry(row.to_string()))
                         .or_insert((0, -1, w));
                     // An unregistered row that already has a size (a copied
                     // object's) keeps it.
@@ -1062,9 +1060,10 @@ impl Simulator {
                 }
                 Some(Dim::Assoc(k)) => {
                     let is_str = *k == KeyKind::String;
-                    self.module
-                        .associative_arrays
-                        .insert(row.to_string(), is_str);
+                    class_metadata!(
+                        self.module.associative_arrays,
+                        insert(row.to_string(), is_str)
+                    );
                 }
                 _ => {}
             }
@@ -3981,7 +3980,7 @@ impl Simulator {
     /// restored. The draws that follow are then a function of that stream
     /// state alone, and a reseed or `set_randstate` repeats them.
     fn restart_dist_schedules(&mut self, handle: usize) {
-        self.dist_decks.retain(|(h, _), _| *h != handle);
+        self.dist_decks.remove_owner(handle, |_, _| {});
     }
 
     /// §18.14 `srandom` / `get_randstate` / `set_randstate` on a *process*
@@ -4301,7 +4300,7 @@ impl Simulator {
             .as_ref()
             .filter(|_| ty.is_none())
             .map(|v| v.name.clone())
-            .filter(|n| self.string_signals.insert(n.clone()));
+            .filter(|n| class_metadata!(self.string_signals, insert(n.clone())));
         let mut live = true;
         for key in keys {
             if self.finished {
@@ -4340,7 +4339,7 @@ impl Simulator {
             }
         }
         if let Some(n) = str_var {
-            self.string_signals.remove(&n);
+            class_metadata!(self.string_signals, remove(&n));
         }
         live
     }
@@ -4396,12 +4395,12 @@ impl Simulator {
             .as_ref()
             .filter(|_| is_str)
             .map(|v| v.name.clone())
-            .filter(|n| self.string_signals.insert(n.clone()));
+            .filter(|n| class_metadata!(self.string_signals, insert(n.clone())));
         let done = self.foreach_assoc_level_keys(
             root, prefix, keys, vars, level, body, iterations, is_str, kw, ksign,
         );
         if let Some(n) = str_var {
-            self.string_signals.remove(&n);
+            class_metadata!(self.string_signals, remove(&n));
         }
         done
     }
@@ -4550,10 +4549,10 @@ impl Simulator {
             self.meta_note(n);
             match prior_td {
                 Some(t) => {
-                    self.var_typedef_types.insert(n.clone(), t.clone());
+                    class_metadata!(self.var_typedef_types, insert(n.clone(), t.clone()));
                 }
                 None => {
-                    self.var_typedef_types.remove(n);
+                    class_metadata!(self.var_typedef_types, remove(n));
                 }
             }
             if *was_trusted {
@@ -4566,12 +4565,13 @@ impl Simulator {
             {
                 match prior_ps {
                     Some(f) => {
-                        self.module
-                            .packed_struct_fields
-                            .insert(n.clone(), f.clone());
+                        class_metadata!(
+                            self.module.packed_struct_fields,
+                            insert(n.clone(), f.clone())
+                        );
                     }
                     None => {
-                        self.module.packed_struct_fields.remove(n);
+                        class_metadata!(self.module.packed_struct_fields, remove(n));
                     }
                 }
             }
@@ -4586,9 +4586,9 @@ impl Simulator {
                 }
             }
             if *signed {
-                self.signed_signals.insert(n.clone());
+                class_metadata!(self.signed_signals, insert(n.clone()));
             } else {
-                self.signed_signals.remove(n);
+                class_metadata!(self.signed_signals, remove(n));
             }
         }
         for (n, cur, had_frame, _, _, _, _, prior_vif) in saved {
@@ -4974,12 +4974,9 @@ impl Simulator {
         self.local_coll_rows_live |= Self::has_queue_rows(&shape);
         self.has_coll_rows = true;
         if name.starts_with('@') {
-            self.local_coll_shapes.insert(name.to_string(), shape);
+            class_metadata!(self.local_coll_shapes, insert(name.to_string(), shape));
         } else {
-            self.module
-                .coll_shapes
-                .entry(name.to_string())
-                .or_insert(shape);
+            class_metadata!(self.module.coll_shapes, entry(name.to_string())).or_insert(shape);
         }
     }
 
@@ -5065,10 +5062,13 @@ impl Simulator {
         if let Some((fields, name, prev)) = self.local_elem_layout.take()
             && name == bare
         {
-            self.module.packed_struct_fields.insert(key.clone(), fields);
+            class_metadata!(
+                self.module.packed_struct_fields,
+                insert(key.clone(), fields)
+            );
             match prev {
-                Some(p) => self.module.packed_struct_fields.insert(name, p),
-                None => self.module.packed_struct_fields.remove(&name),
+                Some(p) => class_metadata!(self.module.packed_struct_fields, insert(name, p)),
+                None => class_metadata!(self.module.packed_struct_fields, remove(&name)),
             };
         }
         // §7.4.1: a private array keeps its element's packed geometry.
@@ -5081,14 +5081,18 @@ impl Simulator {
             .filter(|d| d.len() > 1)
             .cloned()
         {
-            self.module.packed_full_dims.insert(key.clone(), dimensions);
+            class_metadata!(
+                self.module.packed_full_dims,
+                insert(key.clone(), dimensions)
+            );
             if let Some(width) = self.module.packed_signal_elem_widths.get(bare).copied() {
-                self.module
-                    .packed_signal_elem_widths
-                    .insert(key.clone(), width);
+                class_metadata!(
+                    self.module.packed_signal_elem_widths,
+                    insert(key.clone(), width)
+                );
             }
             if let Some(dt) = self.module.var_decl_types.get(bare).cloned() {
-                self.module.var_decl_types.insert(key.clone(), dt);
+                class_metadata!(self.module.var_decl_types, insert(key.clone(), dt));
             }
         }
         key
@@ -5138,6 +5142,12 @@ impl Simulator {
             self.deferred_collection_cleanup.insert(key.to_string());
             return;
         }
+        if let Some(owner) = super::heap_gc::StorageOwner::of(key) {
+            self.signals.release_storage_owner(owner);
+            self.widths.release_storage_owner(owner);
+            self.release_owned_metadata(owner);
+            return;
+        }
         let mut size_key = std::mem::take(&mut self.dyn_key_scratch);
         size_key.clear();
         size_key.push_str(key);
@@ -5149,10 +5159,10 @@ impl Simulator {
         for k in stale {
             self.signals.remove(&k);
             self.widths.remove(&k);
-            self.signed_signals.remove(&k);
-            self.real_signals.remove(&k);
-            self.module.two_state_signals.remove(&k);
-            self.active_union_tag.remove(&k);
+            class_metadata!(self.signed_signals, remove(&k));
+            class_metadata!(self.real_signals, remove(&k));
+            class_metadata!(self.module.two_state_signals, remove(&k));
+            class_metadata!(self.active_union_tag, remove(&k));
         }
         if has_size {
             self.signals.remove(&size_key);
@@ -5161,7 +5171,7 @@ impl Simulator {
         if self.dynamic_assoc_dims.contains_key(key) {
             self.clear_dynamic_assoc_rows(key, 0);
         }
-        if let Some(elems) = self.local_coll_elems.remove(key) {
+        if let Some(elems) = class_metadata!(self.local_coll_elems, remove(key)) {
             for en in elems {
                 self.signals.truncate_sequence(&en, 0);
                 let row_size = Self::name_with_suffix(&en, ".size");
@@ -5176,37 +5186,42 @@ impl Simulator {
 
     /// Drop the metadata anchored at a private local collection or row.
     fn remove_local_collection_metadata(&mut self, key: &str) {
-        self.module.dynamic_arrays.remove(key);
-        self.module.arrays.remove(key);
-        self.module.arrays_2d.remove(key);
-        self.module.arrays_nd.remove(key);
-        self.module.associative_arrays.remove(key);
-        self.local_coll_shapes.remove(key);
-        self.module.assoc_index_widths.remove(key);
-        self.module.assoc_elem_widths.remove(key);
-        self.module.assoc_key_type_names.remove(key);
-        self.module.assoc_defaults.remove(key);
-        self.class_assoc_defaults.remove(key);
-        self.assoc_tables.remove(key);
-        self.module.queue_max_sizes.remove(key);
-        self.module.queue_vars.remove(key);
-        self.module.unpacked_decl_dims.remove(key);
-        self.module.descending_arrays.remove(key);
-        self.module.var_decl_types.remove(key);
-        self.module.packed_full_dims.remove(key);
-        self.module.packed_signal_elem_widths.remove(key);
-        self.module.packed_struct_fields.remove(key);
-        self.module.array_elem_class.remove(key);
-        self.module.struct_members.remove(key);
-        self.dynamic_assoc_dims.remove(key);
-        self.assoc_elem_colls.remove(key);
-        self.active_union_tag.remove(key);
+        class_metadata!(self.module.dynamic_arrays, remove(key));
+        class_metadata!(self.module.arrays, remove(key));
+        class_metadata!(self.module.arrays_2d, remove(key));
+        class_metadata!(self.module.arrays_nd, remove(key));
+        class_metadata!(self.module.associative_arrays, remove(key));
+        class_metadata!(self.local_coll_shapes, remove(key));
+        class_metadata!(self.module.assoc_index_widths, remove(key));
+        class_metadata!(self.module.assoc_elem_widths, remove(key));
+        class_metadata!(self.module.assoc_key_struct_types, remove(key));
+        class_metadata!(self.module.assoc_key_type_names, remove(key));
+        class_metadata!(self.module.assoc_defaults, remove(key));
+        class_metadata!(self.class_assoc_defaults, remove(key));
+        class_metadata!(self.module.wildcard_assoc_arrays, remove(key));
+        class_metadata!(self.assoc_tables, remove(key));
+        class_metadata!(self.queue_elem_ids, remove(key));
+        class_metadata!(self.module.queue_max_sizes, remove(key));
+        class_metadata!(self.module.queue_vars, remove(key));
+        class_metadata!(self.module.unpacked_decl_dims, remove(key));
+        class_metadata!(self.module.descending_arrays, remove(key));
+        class_metadata!(self.module.var_decl_types, remove(key));
+        class_metadata!(self.module.packed_full_dims, remove(key));
+        class_metadata!(self.module.packed_signal_elem_widths, remove(key));
+        class_metadata!(self.module.packed_struct_fields, remove(key));
+        class_metadata!(self.module.array_elem_class, remove(key));
+        class_metadata!(self.module.struct_members, remove(key));
+        class_metadata!(self.dynamic_assoc_dims, remove(key));
+        class_metadata!(self.assoc_elem_colls, remove(key));
+        class_metadata!(self.active_union_tag, remove(key));
+        class_metadata!(self.tagged_union_strings, remove(key));
+        class_metadata!(self.mixed_local_two_state, remove(key));
         self.widths.remove(key);
-        self.string_signals.remove(key);
-        self.signed_signals.remove(key);
-        self.real_signals.remove(key);
-        self.module.string_signals.remove(key);
-        self.module.two_state_signals.remove(key);
+        class_metadata!(self.string_signals, remove(key));
+        class_metadata!(self.signed_signals, remove(key));
+        class_metadata!(self.real_signals, remove(key));
+        class_metadata!(self.module.string_signals, remove(key));
+        class_metadata!(self.module.two_state_signals, remove(key));
     }
 
     /// Caller-frame state for a queue/dynamic-array LOCAL that a nested call
@@ -5266,13 +5281,13 @@ impl Simulator {
         let save = if take {
             QueueLocalSave {
                 signals,
-                arrays_entry: self.module.arrays.remove(name),
-                was_dynamic: self.module.dynamic_arrays.remove(name),
-                was_descending: self.module.descending_arrays.remove(name),
-                queue_max: self.module.queue_max_sizes.remove(name),
+                arrays_entry: class_metadata!(self.module.arrays, remove(name)),
+                was_dynamic: class_metadata!(self.module.dynamic_arrays, remove(name)),
+                was_descending: class_metadata!(self.module.descending_arrays, remove(name)),
+                queue_max: class_metadata!(self.module.queue_max_sizes, remove(name)),
                 width: self.widths.get(name).copied(),
-                assoc_entry: self.module.associative_arrays.remove(name),
-                assoc_table: self.assoc_tables.remove(name),
+                assoc_entry: class_metadata!(self.module.associative_arrays, remove(name)),
+                assoc_table: class_metadata!(self.assoc_tables, remove(name)),
             }
         } else {
             QueueLocalSave {
@@ -5311,13 +5326,13 @@ impl Simulator {
         // subroutine returns (queue locals are global-by-bare-name; see
         // `queue_frame_saves`).
         if !self.save_queue_local(name, true) {
-            self.module.dynamic_arrays.remove(name);
-            self.module.arrays.remove(name);
-            self.module.descending_arrays.remove(name);
-            self.module.queue_max_sizes.remove(name);
+            class_metadata!(self.module.dynamic_arrays, remove(name));
+            class_metadata!(self.module.arrays, remove(name));
+            class_metadata!(self.module.descending_arrays, remove(name));
+            class_metadata!(self.module.queue_max_sizes, remove(name));
         }
-        self.module.associative_arrays.remove(name);
-        self.module.packed_signal_elem_widths.remove(name);
+        class_metadata!(self.module.associative_arrays, remove(name));
+        class_metadata!(self.module.packed_signal_elem_widths, remove(name));
         let mut size_key = std::mem::take(&mut self.queue_key_scratch);
         size_key.clear();
         size_key.push_str(name);
@@ -5407,28 +5422,28 @@ impl Simulator {
             }
             match arrays_entry {
                 Some(entry) => {
-                    self.module.arrays.insert(name.clone(), entry);
+                    class_metadata!(self.module.arrays, insert(name.clone(), entry));
                 }
                 None => {
-                    self.module.arrays.remove(&name);
+                    class_metadata!(self.module.arrays, remove(&name));
                 }
             }
             if was_dynamic {
-                self.module.dynamic_arrays.insert(name.clone());
+                class_metadata!(self.module.dynamic_arrays, insert(name.clone()));
             } else {
-                self.module.dynamic_arrays.remove(&name);
+                class_metadata!(self.module.dynamic_arrays, remove(&name));
             }
             if was_descending {
-                self.module.descending_arrays.insert(name.clone());
+                class_metadata!(self.module.descending_arrays, insert(name.clone()));
             } else {
-                self.module.descending_arrays.remove(&name);
+                class_metadata!(self.module.descending_arrays, remove(&name));
             }
             match queue_max {
                 Some(m) => {
-                    self.module.queue_max_sizes.insert(name.clone(), m);
+                    class_metadata!(self.module.queue_max_sizes, insert(name.clone(), m));
                 }
                 None => {
-                    self.module.queue_max_sizes.remove(&name);
+                    class_metadata!(self.module.queue_max_sizes, remove(&name));
                 }
             }
             match width {
@@ -5444,18 +5459,18 @@ impl Simulator {
             }
             match assoc_entry {
                 Some(k) => {
-                    self.module.associative_arrays.insert(name.clone(), k);
+                    class_metadata!(self.module.associative_arrays, insert(name.clone(), k));
                 }
                 None => {
-                    self.module.associative_arrays.remove(&name);
+                    class_metadata!(self.module.associative_arrays, remove(&name));
                 }
             }
             match assoc_table {
                 Some(t) => {
-                    self.assoc_tables.insert(name.clone(), t);
+                    class_metadata!(self.assoc_tables, insert(name.clone(), t));
                 }
                 None => {
-                    self.assoc_tables.remove(&name);
+                    class_metadata!(self.assoc_tables, remove(&name));
                 }
             }
             if self.queue_name_pool.len() < 64 {

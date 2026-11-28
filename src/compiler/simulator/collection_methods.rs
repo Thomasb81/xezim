@@ -2579,7 +2579,7 @@ impl Simulator {
                 }
             }
             if !rows.is_empty() {
-                self.local_coll_elems.insert(tmp.clone(), rows);
+                class_metadata!(self.local_coll_elems, insert(tmp.clone(), rows));
             }
         }
         tmp
@@ -2719,6 +2719,28 @@ impl Simulator {
         let leaf = arr.rsplit('.').next().unwrap_or(arr);
         let leaf = leaf.split('[').next().unwrap_or(leaf);
         self.collection_element_class_named(leaf)
+    }
+
+    /// §7.9.2: deleting an entry drops its aggregate rows as well as any
+    /// marker cell. Runtime row registrations have the same lifetime.
+    fn delete_assoc_rows(&mut self, array: &str, selected: Option<&str>) {
+        let prefix = Self::name_with_suffix(array, "[");
+        let discard = |key: &str| match selected {
+            Some(row) => key
+                .strip_prefix(row)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['.', '['])),
+            None => key.starts_with(&prefix),
+        };
+        if let Some(owner) = super::heap_gc::StorageOwner::of(array) {
+            self.release_owned_collection_rows(owner, discard);
+        } else {
+            for key in self.signals.keys_with_elem_prefix(&prefix) {
+                if discard(&key) {
+                    self.signals.remove(&key);
+                    self.widths.remove(&key);
+                }
+            }
+        }
     }
 
     /// The named key type of associative array `arr` in scope: a local's
@@ -3464,9 +3486,10 @@ impl Simulator {
         // unpacked struct writes member leaves (and the writeback copies them
         // back) — without it a `ref rec_t items[$]` came back with the right
         // SIZE and every member blank.
-        self.module
-            .var_decl_types
-            .insert(pname.to_string(), queue_data_type.clone());
+        class_metadata!(
+            self.module.var_decl_types,
+            insert(pname.to_string(), queue_data_type.clone())
+        );
         let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
         if let crate::ast::types::DataType::Struct(su) = resolved_dt {
             if !su.packed {
@@ -3474,8 +3497,10 @@ impl Simulator {
                 // recover per-field `is_real` (real fields) via struct_field_layout.
                 if let crate::ast::types::DataType::TypeReference { name: tn, .. } = queue_data_type
                 {
-                    self.var_typedef_types
-                        .insert(pname.to_string(), tn.name.name.clone());
+                    class_metadata!(
+                        self.var_typedef_types,
+                        insert(pname.to_string(), tn.name.name.clone())
+                    );
                 }
                 // Collect struct fields with cumulative offsets. SV packs
                 // struct members with the LAST member at the LSB.
@@ -3492,9 +3517,10 @@ impl Simulator {
                         offset += fw;
                     }
                 }
-                self.module
-                    .packed_struct_fields
-                    .insert(pname.to_string(), fields);
+                class_metadata!(
+                    self.module.packed_struct_fields,
+                    insert(pname.to_string(), fields)
+                );
             }
         }
         if let Some(parts) = literal_elems {
@@ -3502,8 +3528,8 @@ impl Simulator {
             let width = self
                 .declared_collection_elem_width(queue_data_type)
                 .unwrap_or(32);
-            self.module.arrays.insert(key.clone(), (0, -1, width));
-            self.module.dynamic_arrays.insert(key.clone());
+            class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, width)));
+            class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
             // §10.10: a queue or array operand of `{..}` contributes all of
             // its elements (`{jal}`, `{q, X}`).
             if matches!(arg.kind, ExprKind::Concatenation(_))
@@ -3545,8 +3571,8 @@ impl Simulator {
             let w = self
                 .declared_collection_elem_width(queue_data_type)
                 .unwrap_or(w);
-            self.module.arrays.insert(key.clone(), (0, -1, w));
-            self.module.dynamic_arrays.insert(key.clone());
+            class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, w)));
+            class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
             let n = vals.len() as u64;
             for (j, v) in vals.into_iter().enumerate() {
                 self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
@@ -3569,8 +3595,8 @@ impl Simulator {
         {
             let key = self.formal_dyn_key(pname, queue_data_type);
             self.register_formal_shape(&key, dims);
-            self.module.arrays.insert(key.clone(), (0, -1, 32));
-            self.module.dynamic_arrays.insert(key.clone());
+            class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, 32)));
+            class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
             self.vif_tokens_stored = true;
             for (j, inst) in insts.iter().enumerate() {
                 self.set_signal_value_by_name(
@@ -3636,8 +3662,8 @@ impl Simulator {
                 })
                 .collect()
         };
-        self.module.arrays.insert(key.clone(), (0, -1, w));
-        self.module.dynamic_arrays.insert(key.clone());
+        class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, w)));
+        class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
         if let Some(su) = &elem_struct {
             for j in 0..size {
                 let cidx = caller_elem_idx(j);
@@ -3711,7 +3737,7 @@ impl Simulator {
                 | DataType::Enum(_)
         );
         if !plain {
-            self.module.var_decl_types.insert(key.clone(), dt.clone());
+            class_metadata!(self.module.var_decl_types, insert(key.clone(), dt.clone()));
         }
         if let Some(dims) = super::elaborate::packed_full_dims_chained(
             dt,
@@ -3720,18 +3746,20 @@ impl Simulator {
         )
         .filter(|dims| dims.len() > 1)
         {
-            self.module.packed_full_dims.insert(key.clone(), dims);
+            class_metadata!(self.module.packed_full_dims, insert(key.clone(), dims));
             if let Some(width) = self.ast_decl_elem_width(dt) {
-                self.module
-                    .packed_signal_elem_widths
-                    .insert(key.clone(), width);
+                class_metadata!(
+                    self.module.packed_signal_elem_widths,
+                    insert(key.clone(), width)
+                );
             }
         }
         if let crate::ast::types::DataType::TypeReference { name: tn, .. } = dt {
             if self.module.classes.contains_key(&tn.name.name) {
-                self.module
-                    .array_elem_class
-                    .insert(key.clone(), tn.name.name.clone());
+                class_metadata!(
+                    self.module.array_elem_class,
+                    insert(key.clone(), tn.name.name.clone())
+                );
             }
         }
         key
@@ -4040,13 +4068,13 @@ impl Simulator {
         // The size may live in the compact table rather than `signals`.
         let sz = self.get_queue_size(param);
         if let Some(e) = self.module.arrays.get(param).copied() {
-            self.module.arrays.insert(tmp.clone(), e);
+            class_metadata!(self.module.arrays, insert(tmp.clone(), e));
         }
         if self.module.dynamic_arrays.contains(param) {
-            self.module.dynamic_arrays.insert(tmp.clone());
+            class_metadata!(self.module.dynamic_arrays, insert(tmp.clone()));
         }
         if let Some(dt) = self.module.var_decl_types.get(param).cloned() {
-            self.module.var_decl_types.insert(tmp.clone(), dt);
+            class_metadata!(self.module.var_decl_types, insert(tmp.clone(), dt));
         }
         for j in 0..sz {
             let (d, s2) = (format!("{}[{}]", tmp, j), format!("{}[{}]", param, j));
@@ -4063,18 +4091,7 @@ impl Simulator {
 
     /// Drop a staged queue temp created by `stage_queue_param`.
     pub(super) fn drop_staged_queue(&mut self, tmp: &str) {
-        let sz_key = format!("{}.size", tmp);
-        let pre = format!("{}[", tmp);
-        let mut keys: Vec<String> = self.signals.keys_with_elem_prefix(&pre);
-        if self.signals.contains_key(&sz_key) {
-            keys.push(sz_key.clone());
-        }
-        for k in keys {
-            self.signals.remove(&k);
-        }
-        self.module.arrays.remove(tmp);
-        self.module.dynamic_arrays.remove(tmp);
-        self.module.var_decl_types.remove(tmp);
+        self.cleanup_dyn_storage(tmp);
     }
 
     /// Copy a queue param's contents back to the caller's queue on return
@@ -4131,8 +4148,8 @@ impl Simulator {
         for k in stale {
             self.signals.remove(&k);
         }
-        self.module.arrays.insert(caller.to_string(), (0, -1, w));
-        self.module.dynamic_arrays.insert(caller.to_string());
+        class_metadata!(self.module.arrays, insert(caller.to_string(), (0, -1, w)));
+        class_metadata!(self.module.dynamic_arrays, insert(caller.to_string()));
         // §7.2: an element of an UNPACKED-struct queue is a set of member
         // leaves, not one value — copying `q[j]` alone moved nothing, so a
         // `ref pkt_t q[$]` came back with the right SIZE and every member
