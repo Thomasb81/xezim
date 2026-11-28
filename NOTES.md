@@ -10,6 +10,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Reclaim metadata and dense storage under deleted associative rows, and
+  trace class associative keys using the instantiated key type
+  (§7.8.5, §7.9.2, §8.7, #1667).
+
+- Return typed defaults for invalid multidimensional array reads, report
+  truncation from associative traversal, and preserve X/Z, full width, and
+  nested row iterators in array reductions (§7.4.6, §7.9.8, §7.12.3).
+
+- Release discarded queue and dynamic-array elements, expression-local array
+  locator results, and private collection metadata when their lifetime ends
+  (§6.21, §7.5.1, §7.10.2, §7.12.1, §8.7, #1667).
+
+- Keep named process-block locals distinct across eagerly elaborated generate
+  scopes, and preserve `foreach` indices across timing controls
+  (§6.21, §12.7.3, §27.4, #1651).
+
 - Copy dynamic rows passed to a fixed-array input and preserve suspension in
   `foreach` over a selected row (§7.4.5, §12.7.3, §13.5.1, #1646).
 
@@ -248,8 +264,28 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
-- Compile dotted collection method calls using the owning object's handle
+- Store sparse collection elements in ordered per-collection buckets. Prefix
+  lookups visit matching rows directly, and checkpoint files retain their
+  existing layout (§7.8, #1667).
+
+- Trace class-owned collections only when their owners are reachable. Exclude
+  declared scalar keys and values and scheduler identifiers from class roots
+  (§7.8, §8.7, #1667).
+
+- Reclaim class and automatic collection storage by owner, including
+  metadata-only rows and solver records. Discard mailbox patterns with their
+  messages or cancelled producers (§6.21, §8.7, §15.4, #1667).
+
+- Trace dense collections without treating positional indices as class handles,
+  and release dead objects' dense storage without formatting element keys
+  (§8.7, #1667).
+
+- Compile dotted collection method calls using the owning object's handle,
+  including through another object's property or a method argument
   (§7.10, §8.10, #1666).
+- Skip unchanged scalar assertion clocks and avoid evaluating read-only
+  `disable iff` guards while there are no assertion attempts to cancel
+  (§16.12, #1654).
 
 - Dispatch lowered clocked blocks through the two-state arena after native
   dispatch, and update the live event-waiter index as signals enter or leave it.

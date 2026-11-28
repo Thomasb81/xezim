@@ -904,7 +904,7 @@ impl Simulator {
         for (&i, v) in order.iter().zip(values) {
             self.signals.insert(format!("{param}[{i}]"), v);
         }
-        self.module.arrays.insert(param.clone(), (lo, hi, src.ew));
+        class_metadata!(self.module.arrays, insert(param.clone(), (lo, hi, src.ew)));
         let copies_back = !matches!(port.direction, crate::ast::types::PortDirection::Input);
         let caller = if copies_back {
             self.slice_arg_seq += 1;

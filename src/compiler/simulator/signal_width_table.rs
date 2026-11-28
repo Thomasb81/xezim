@@ -1,13 +1,15 @@
 //! Widths for name-keyed signal storage. A fixed class member's declared
 //! width covers every indexed cell; only individual changes need storage.
 
+use super::heap_gc::{ClassStorageKeys, StorageOwner};
 use super::{HashMap, split_elem_key};
 use std::borrow::Cow;
 
-#[derive(Default)]
 pub struct SignalWidths {
     named: HashMap<String, u32>,
     ranges: HashMap<String, WidthRange>,
+    class_named: Option<ClassStorageKeys>,
+    class_ranges: ClassStorageKeys,
 }
 
 struct WidthRange {
@@ -37,6 +39,17 @@ impl WidthRange {
         match self.changes.get(&i) {
             Some(explicit) => explicit.as_ref(),
             None => Some(&self.width),
+        }
+    }
+}
+
+impl Default for SignalWidths {
+    fn default() -> Self {
+        Self {
+            named: HashMap::default(),
+            ranges: HashMap::default(),
+            class_named: Some(ClassStorageKeys::default()),
+            class_ranges: ClassStorageKeys::default(),
         }
     }
 }
@@ -92,7 +105,16 @@ impl SignalWidths {
             }
             return prev;
         }
-        self.named.insert(key, width)
+        match self.named.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => Some(entry.insert(width)),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if let Some(keys) = &mut self.class_named {
+                    keys.insert(entry.key());
+                }
+                entry.insert(width);
+                None
+            }
+        }
     }
 
     pub fn remove(&mut self, key: &str) -> Option<u32> {
@@ -101,7 +123,13 @@ impl SignalWidths {
             r.changes.insert(i, None);
             return prev;
         }
-        self.named.remove(key)
+        let old = self.named.remove(key);
+        if old.is_some()
+            && let Some(keys) = &mut self.class_named
+        {
+            keys.remove(key);
+        }
+        old
     }
 
     pub fn len(&self) -> usize {
@@ -162,14 +190,24 @@ impl SignalWidths {
         // inspect only its keys; for a large range, inspect the smaller map.
         if self.named.len() as u64 > last - first + 1 {
             for i in first..=last {
-                self.named.remove(&format!("{name}[{i}]"));
+                let key = format!("{name}[{i}]");
+                if self.named.remove(&key).is_some()
+                    && let Some(keys) = &mut self.class_named
+                {
+                    keys.remove(&key);
+                }
             }
         } else {
             self.named.retain(|key, _| {
-                !matches!(split_elem_key(key),
-                Some((base, i)) if name == base && (first..=last).contains(&i))
+                let replaced = matches!(split_elem_key(key),
+                    Some((base, i)) if name == base && (first..=last).contains(&i));
+                if replaced && let Some(keys) = &mut self.class_named {
+                    keys.remove(key);
+                }
+                !replaced
             });
         }
+        self.class_ranges.insert(name);
         self.ranges
             .insert(name.to_owned(), WidthRange::new(first, last, width));
     }
@@ -182,11 +220,40 @@ impl SignalWidths {
         true
     }
 
-    /// Class GC tests ownership by the prefix preceding the first '#'.
-    /// Every indexed name in a range belongs to the same owner.
-    pub(super) fn remove_dead_owners(&mut self, dead: impl Fn(&str) -> bool) {
-        self.named.retain(|name, _| !dead(name));
-        self.ranges.retain(|name, _| !dead(name));
+    fn rebuild_named_owner_index(&mut self) -> &mut ClassStorageKeys {
+        self.class_named.get_or_insert_with(|| {
+            let mut keys = ClassStorageKeys::default();
+            for name in self.named.keys() {
+                keys.insert(name);
+            }
+            keys
+        })
+    }
+
+    pub(super) fn release_matching_storage(
+        &mut self,
+        owner: StorageOwner,
+        discard: &impl Fn(&str) -> bool,
+    ) {
+        for name in self
+            .rebuild_named_owner_index()
+            .take_matching(owner, discard)
+        {
+            self.named.remove(&name);
+        }
+        for name in self.class_ranges.take_matching(owner, discard) {
+            self.ranges.remove(&name);
+        }
+    }
+
+    pub(super) fn release_storage_owner(&mut self, owner: StorageOwner) {
+        let keys = self.rebuild_named_owner_index();
+        for name in keys.take(owner).into_iter().flatten() {
+            self.named.remove(&name);
+        }
+        for name in self.class_ranges.take(owner).into_iter().flatten() {
+            self.ranges.remove(&name);
+        }
     }
 }
 
@@ -224,7 +291,8 @@ impl<'de> serde::Deserialize<'de> for SignalWidths {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(Self {
             named: HashMap::deserialize(d)?,
-            ranges: HashMap::default(),
+            class_named: None,
+            ..Self::default()
         })
     }
 }
@@ -241,11 +309,13 @@ impl super::Simulator {
             let last = first + values.len() as u64 - 1;
             let mut range = WidthRange::new(first, last, width);
             for i in first..=last {
-                let stored = self.widths.named.remove(&format!("{name}[{i}]"));
+                let key = format!("{name}[{i}]");
+                let stored = self.widths.remove(&key);
                 if stored != Some(width) {
                     range.changes.insert(i, stored);
                 }
             }
+            self.widths.class_ranges.insert(name);
             self.widths.ranges.insert(name.to_owned(), range);
         }
         if !self.widths.ranges.is_empty() {
@@ -320,7 +390,7 @@ mod tests {
             assert_eq!(restored.get(k), Some(w));
         }
 
-        table.remove_dead_owners(|name| name.starts_with("17#"));
+        table.release_storage_owner(StorageOwner::Class(17));
         assert_eq!(table.storage_counts(), (1, 1));
         assert_eq!(table.len(), 7);
         assert_eq!(table.get("17#data[5]"), None);

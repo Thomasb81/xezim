@@ -1378,14 +1378,14 @@ impl Simulator {
                 }
             }
             if let Some(r) = string_ret {
-                if self.string_signals.insert(r.to_string()) {
+                if class_metadata!(self.string_signals, insert(r.to_string())) {
                     signals.push(r.to_string());
                 }
             }
         }
         for port in ports.iter() {
             if port_is_string(self, &port.data_type) {
-                if self.string_signals.insert(port.name.name.clone()) {
+                if class_metadata!(self.string_signals, insert(port.name.name.clone())) {
                     signals.push(port.name.name.clone());
                 }
             }
@@ -1395,7 +1395,7 @@ impl Simulator {
         let mut prop_more: Vec<usize> = Vec::new();
         for (i, sp) in props.iter().enumerate() {
             if !self.string_signals.contains(sp) {
-                self.string_signals.insert(sp.clone());
+                class_metadata!(self.string_signals, insert(sp.clone()));
                 if i < 64 {
                     prop_mask |= 1u64 << i;
                 } else {
@@ -1414,20 +1414,20 @@ impl Simulator {
     /// Undo `method_string_frame_begin`.
     pub(super) fn method_string_frame_end(&mut self, f: MethodStringFrame) {
         for n in &f.signals {
-            self.string_signals.remove(n);
+            class_metadata!(self.string_signals, remove(n));
         }
         let mut mask = f.prop_mask;
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            self.string_signals.remove(&f.props[i]);
+            class_metadata!(self.string_signals, remove(&f.props[i]));
         }
         for &i in &f.prop_more {
-            self.string_signals.remove(&f.props[i]);
+            class_metadata!(self.string_signals, remove(&f.props[i]));
         }
         if let Some(removed) = self.string_signals_removed.pop() {
             for n in removed {
-                self.string_signals.insert(n);
+                class_metadata!(self.string_signals, insert(n));
             }
         }
     }
@@ -2257,8 +2257,10 @@ impl Simulator {
                             if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
                             {
                                 self.meta_note(&port.name.name);
-                                self.var_class_types
-                                    .insert(port.name.name.clone(), type_name.clone());
+                                class_metadata!(
+                                    self.var_class_types,
+                                    insert(port.name.name.clone(), type_name.clone())
+                                );
                             }
                             // A forward-declared placeholder keeps its typedef
                             // alias so width/layout lookups still resolve it the
@@ -2284,8 +2286,10 @@ impl Simulator {
                                 != Some(&type_name)
                             {
                                 self.meta_note(&port.name.name);
-                                self.var_typedef_types
-                                    .insert(port.name.name.clone(), type_name);
+                                class_metadata!(
+                                    self.var_typedef_types,
+                                    insert(port.name.name.clone(), type_name)
+                                );
                             }
                         } else if let Some(concrete) = self
                             .heap
@@ -2325,8 +2329,10 @@ impl Simulator {
                                     != Some(&concrete)
                                 {
                                     self.meta_note(&port.name.name);
-                                    self.var_class_types
-                                        .insert(port.name.name.clone(), concrete);
+                                    class_metadata!(
+                                        self.var_class_types,
+                                        insert(port.name.name.clone(), concrete)
+                                    );
                                 }
                             }
                         }
@@ -2406,10 +2412,10 @@ impl Simulator {
                             }
                             if rp.signed {
                                 if !self.signed_signals.contains(rn) {
-                                    self.signed_signals.insert(rn.to_string());
+                                    class_metadata!(self.signed_signals, insert(rn.to_string()));
                                 }
                             } else {
-                                self.signed_signals.remove(rn);
+                                class_metadata!(self.signed_signals, remove(rn));
                             }
                             // §13.4.1: type default — x for 4-state (see
                             // the module-function twin above).
@@ -2452,7 +2458,10 @@ impl Simulator {
                         frame_types.0.insert(rn.to_string(), cn.to_string());
                         if self.var_class_types.get(rn).map(String::as_str) != Some(cn) {
                             self.meta_note(rn);
-                            self.var_class_types.insert(rn.to_string(), cn.to_string());
+                            class_metadata!(
+                                self.var_class_types,
+                                insert(rn.to_string(), cn.to_string())
+                            );
                         }
                     }
                 }
@@ -3174,10 +3183,13 @@ impl Simulator {
                         // clobbered).
                         match prior {
                             Some(v) => {
-                                self.module.associative_arrays.insert(param.clone(), v);
+                                class_metadata!(
+                                    self.module.associative_arrays,
+                                    insert(param.clone(), v)
+                                );
                             }
                             None => {
-                                self.module.associative_arrays.remove(&param);
+                                class_metadata!(self.module.associative_arrays, remove(&param));
                             }
                         }
                         continue;

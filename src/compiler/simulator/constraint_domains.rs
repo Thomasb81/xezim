@@ -5329,6 +5329,10 @@ impl Simulator {
         props: &[String],
         constraints: &[ClassConstraint],
     ) {
+        for name in self.rand_elem_ranges.keys() {
+            self.class_metadata_keys
+                .forget(super::heap_gc::ClassMetadataField::RandElemRanges, name);
+        }
         self.rand_elem_ranges.clear();
         for p in props {
             let mut out = Vec::new();
@@ -5338,7 +5342,7 @@ impl Simulator {
                 }
             }
             if !out.is_empty() {
-                self.rand_elem_ranges.insert(p.clone(), out);
+                class_metadata!(self.rand_elem_ranges, insert(p.clone(), out));
             }
         }
     }

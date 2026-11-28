@@ -91,6 +91,8 @@ fn heap_graph_keeps_hidden_roots_and_drops_unreferenced_churn() {
     );
 }
 
+/// §8.7: sweeping an object releases its signal values and metadata, even
+/// for collections that have a declaration but no stored elements.
 #[test]
 fn class_sweep_removes_owned_storage_and_preserves_other_instances() {
     let mut sim = crate::simulate(
@@ -100,6 +102,7 @@ fn class_sweep_removes_owned_storage_and_preserves_other_instances() {
           bit [127:0] fixed_data[4];
           int queue_data[$];
           int assoc_data[int];
+          int empty_assoc[string];
           function new(int n);
             id = n;
             fixed_data[0] = 128'h123456789abcdef0123456789abcdef0;
@@ -135,6 +138,18 @@ fn class_sweep_removes_owned_storage_and_preserves_other_instances() {
     let dead = owner(43);
     let dead_array = format!("{dead}#fixed_data");
     let live_array = format!("{live}#fixed_data");
+    let dead_assoc = format!("{dead}#empty_assoc");
+    let live_assoc = format!("{live}#empty_assoc");
+    assert!(sim.module.associative_arrays.contains_key(&dead_assoc));
+    assert!(sim.signals.elem_keys(&dead_assoc).is_empty());
+    assert!(sim.class_metadata_keys_are_current());
+
+    let live_slot = (live, "event".to_owned());
+    let dead_slot = (dead, "event".to_owned());
+    sim.event_obj_ids.insert(live_slot.clone(), 101);
+    sim.event_obj_ids.insert(dead_slot.clone(), 101);
+    sim.event_obj_slots
+        .insert(101, vec![live_slot.clone(), dead_slot.clone()]);
     assert!(!sim.signals.elem_keys(&dead_array).is_empty());
     let saved = sim
         .signals
@@ -150,6 +165,12 @@ fn class_sweep_removes_owned_storage_and_preserves_other_instances() {
     assert_eq!(sim.heap.len(), slots);
     assert!(sim.signals.elem_keys(&dead_array).is_empty());
     assert!(!sim.module.arrays.contains_key(&dead_array));
+    assert!(!sim.module.associative_arrays.contains_key(&dead_assoc));
+    assert!(sim.module.associative_arrays.contains_key(&live_assoc));
+    assert!(!sim.event_obj_ids.contains_key(&dead_slot));
+    assert_eq!(sim.event_obj_ids.get(&live_slot), Some(&101));
+    assert_eq!(sim.event_obj_slots[&101], [live_slot]);
+    assert!(sim.class_metadata_keys_are_current());
     assert!(
         !sim.signals
             .keys()
@@ -412,4 +433,370 @@ fn incremental_collection_tracks_survivors_across_runs() {
         .filter(|&id| id < 1000)
         .collect();
     assert_eq!(ids, vec![1, 8], "node 7 must be reclaimed, 1 and 8 kept");
+}
+
+/// §7.5.1, §7.10.2, §7.12.1, §8.7 (#1667): removed elements and
+/// locator temporaries no longer keep their class handles reachable.
+#[test]
+fn sequence_shrinks_and_locator_temps_release_handles() {
+    let source = r#"
+class Item;
+  int id = 9917;
+endclass
+module top;
+  Item h, keep;
+  Item pop_q[$], del_q[$], locator_q[$], da[];
+  initial begin
+    da = new[256];
+    for (int i = 0; i < 256; i++) begin
+      h = new;
+      pop_q.push_back(h);
+      del_q.push_back(h);
+      locator_q.push_back(h);
+      da[i] = h;
+    end
+    keep = h; h = null;
+    if (locator_q.unique().size() != 256) $fatal(1, "locator size");
+    $display("locator: %p", locator_q.find_first with (item != null));
+    repeat (256) begin
+      h = pop_q.pop_back(); h = null;
+      h = locator_q.pop_front(); h = null;
+    end
+    del_q.delete();
+    da = new[0](da);
+    if (keep.id != 9917 || pop_q.size() != 0 || del_q.size() != 0 ||
+        locator_q.size() != 0 || da.size() != 0) $fatal(1, "live handle or size");
+    $finish;
+  end
+endmodule
+"#;
+    let sim = crate::simulate(source, 100).expect("collection fixture");
+    assert_eq!(sim.error_count, 0);
+    for name in ["pop_q", "del_q", "locator_q", "da"] {
+        assert!(
+            sim.signals.elem_keys(name).is_empty(),
+            "stale {name} values"
+        );
+    }
+    assert!(
+        !sim.signals
+            .keys()
+            .any(|key| key.starts_with("@locator") || key.starts_with("__xz_locator"))
+    );
+    let marked = sim.class_heap_reachability_probe().expect("trace roots");
+    let keep = sim.get_signal("keep").unwrap().to_u64().unwrap() as usize;
+    assert!(marked[keep], "live handle was not traced");
+    let reachable = marked.iter().filter(|&&mark| mark).count();
+    assert!(reachable < 32, "{reachable} surviving handles");
+}
+
+/// §7.10, §8.7 (#1667): integer queue positions are not object references.
+#[test]
+fn dense_integer_queue_positions_do_not_keep_class_objects() {
+    let source = r#"
+class Item;
+endclass
+module top;
+  int q[$];
+  Item h;
+  initial begin
+    repeat (256) begin
+      h = new;
+      q.push_back(0);
+    end
+    h = null;
+    if (q.size() != 256) $fatal(1, "queue size");
+    $finish;
+  end
+endmodule
+"#;
+    let sim = crate::simulate(source, 100).expect("index fixture");
+    assert_eq!(sim.error_count, 0);
+    let marked = sim.class_heap_reachability_probe().expect("trace roots");
+    let reachable = marked.iter().filter(|&&mark| mark).count();
+    assert!(
+        reachable < 32,
+        "{reachable} handles retained by queue positions"
+    );
+}
+
+/// §6.21, §7.8 (#1667): associative metadata has the local array's lifetime.
+#[test]
+fn local_collection_metadata_is_reclaimed_with_the_frame() {
+    let source = r#"
+module top;
+  task automatic churn();
+    int a[int] = '{default: 17};
+    int rows[][int];
+    a[3] = 4;
+    rows = new[2];
+    rows[1][3] = 4;
+    if (a[0] != 17 || rows[1][3] != 4) $fatal(1, "local collection");
+  endtask
+  initial begin
+    repeat (32) churn();
+    $finish;
+  end
+endmodule
+"#;
+    let sim = crate::simulate(source, 100).expect("metadata fixture");
+    assert_eq!(sim.error_count, 0);
+    assert!(
+        !sim.module
+            .assoc_elem_widths
+            .keys()
+            .any(|k| k.starts_with('@'))
+    );
+    assert!(!sim.module.assoc_defaults.keys().any(|k| k.starts_with('@')));
+}
+
+/// §9.7, §15.4.1: killing a blocked bounded-mailbox producer releases
+/// its captured pattern and keeps FIFO delivery for the surviving items.
+#[test]
+fn killed_producer_releases_its_parked_mailbox_pattern() {
+    let mut sim = crate::simulate(
+        r#"
+typedef struct { int a; int b; } pair_t;
+module top;
+ mailbox #(pair_t) box = new(1);
+ process producer;
+ initial begin
+   pair_t received;
+   box.put('{a:11,b:22});
+   fork
+     begin producer=process::self(); box.put('{a:33,b:44}); end
+     begin #10; end
+   join_none
+   #1;
+   producer.kill();
+   #1;
+   box.get(received);
+   if (received.a != 11 || box.num() != 0) $fatal(1, "cancelled put delivered");
+   $finish;
+ end
+endmodule
+"#,
+        1,
+    )
+    .expect("cancelled producer fixture");
+    assert_eq!(sim.error_count, 0);
+    assert!(sim.mailbox_put_waiters.is_empty());
+    assert!(sim.mailbox_put_by_pid.is_empty());
+    assert_eq!(sim.mbx_patterns.len(), 1);
+    sim.max_time = 10;
+    sim.event_loop(false);
+    assert!(sim.finished);
+    assert_eq!(sim.error_count, 0);
+    assert!(sim.mbx_patterns.is_empty());
+}
+
+/// §6.21, §7.8: registrations with no element value share the lifetime of
+/// the automatic declaration, including nested row and member metadata.
+#[test]
+fn private_collection_owner_drops_metadata_only_rows() {
+    let mut sim = crate::simulate("module top; endmodule", 1).expect("fixture");
+    let root = "@rows#10";
+    let row = "@rows#10[4]";
+    let member = "@rows#10[4].a";
+    let other = "@rows#11[4]";
+    class_metadata!(
+        sim.module.assoc_key_type_names,
+        insert(row.into(), "int".into())
+    );
+    class_metadata!(sim.module.associative_arrays, insert(member.into(), false));
+    class_metadata!(sim.real_signals, insert(member.into()));
+    class_metadata!(sim.module.associative_arrays, insert(other.into(), false));
+    sim.widths.insert(member.into(), 64);
+    sim.signals
+        .insert(format!("{row}.size"), super::Value::from_u64(2, 32));
+    sim.signals
+        .insert(format!("{row}[0]"), super::Value::from_u64(5, 32));
+    sim.cleanup_dyn_storage(root);
+    assert!(!sim.module.assoc_key_type_names.contains_key(row));
+    assert!(!sim.module.associative_arrays.contains_key(member));
+    assert!(!sim.real_signals.contains(member));
+    assert!(!sim.widths.contains_key(member));
+    assert!(sim.signals.elem_keys(root).is_empty());
+    assert!(sim.module.associative_arrays.contains_key(other));
+    assert!(sim.class_metadata_keys_are_current());
+}
+
+/// §7.8.4–§7.8.5, §8.7: an integral key and value do not pin an
+/// unrelated object. A live class key keeps its object reachable.
+#[test]
+fn heap_mark_distinguishes_integral_and_class_associative_keys() {
+    let mut sim = crate::simulate(
+        r#"
+class Item;
+endclass
+module top;
+  Item h;
+  int integral_keys[int];
+  int class_keys[Item];
+  int count;
+  Item queue[$];
+  initial begin
+    repeat (700) h = new;
+    h = null;
+    $finish;
+  end
+endmodule
+"#,
+        10,
+    )
+    .expect("associative root fixture");
+    assert_eq!(sim.error_count, 0);
+    assert!(sim.heap[573].is_some());
+    sim.signals
+        .insert("integral_keys[573]".into(), super::Value::from_u64(574, 32));
+    sim.signals
+        .insert("class_keys[575]".into(), super::Value::zero(32));
+    let count = *sim.signal_name_to_id.get("count").expect("count signal");
+    sim.signal_table[count] = super::Value::from_u64(576, 32);
+    sim.prev_val[count] = 577;
+    sim.set_queue_size("queue", 578);
+    // The outer selector remains integral even when a nested field's
+    // selector has no available type metadata.
+    sim.signals.insert(
+        "integral_keys[579].member[580]".into(),
+        super::Value::zero(32),
+    );
+    let marked = sim.class_heap_reachability_probe().expect("trace keys");
+    assert!(
+        !marked[573],
+        "integral key retained an unrelated class object"
+    );
+    assert!(
+        !marked[574],
+        "integral element retained an unrelated class object"
+    );
+    assert!(marked[575], "a class key lost its object");
+    assert!(!marked[579], "an outer integral key retained an object");
+    assert!(marked[580], "an unresolved nested key lost its candidate");
+    assert!(
+        !marked[578],
+        "queue length retained an unrelated class object"
+    );
+    assert!(
+        !marked[576] && !marked[577],
+        "current or previous integer signal retained an unrelated class object"
+    );
+}
+
+/// §7.9.2, §8.7: deleting an associative entry drops its runtime rows,
+/// including metadata-only rows that would otherwise retain handles.
+#[test]
+fn associative_delete_releases_owned_rows_without_touching_siblings() {
+    use crate::ast::{
+        Span,
+        expr::{ExprKind, Expression, NumberBase, NumberLiteral},
+    };
+
+    let mut sim = crate::simulate("module top; endmodule", 1).expect("fixture");
+    let array = "@rows#40";
+    let deleted = "@rows#40[1]";
+    let retained = "@rows#40[10]";
+    class_metadata!(sim.module.associative_arrays, insert(array.into(), false));
+    for row in [deleted, retained] {
+        class_metadata!(sim.module.dynamic_arrays, insert(row.into()));
+        class_metadata!(
+            sim.class_assoc_defaults,
+            insert(format!("{row}[3]"), super::Value::from_u64(17, 32))
+        );
+        sim.widths.insert(format!("{row}[9]"), 32);
+        sim.signals
+            .insert(format!("{row}.size"), super::Value::from_u64(1, 32));
+        sim.signals
+            .insert(format!("{row}[0]"), super::Value::from_u64(11, 32));
+    }
+    let index = Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: Some(32),
+            signed: false,
+            base: NumberBase::Decimal,
+            value: "1".into(),
+            cached_val: Default::default(),
+        }),
+        Span::dummy(),
+    );
+    assert!(sim.eval_builtin_method(array, "delete", &[index]).is_some());
+    assert!(!sim.module.dynamic_arrays.contains(deleted));
+    assert!(
+        !sim.class_assoc_defaults
+            .contains_key(&format!("{deleted}[3]"))
+    );
+    assert!(!sim.widths.contains_key(&format!("{deleted}[9]")));
+    assert!(!sim.signals.contains_key(&format!("{deleted}[0]")));
+    assert!(sim.module.dynamic_arrays.contains(retained));
+    assert!(sim.signals.contains_key(&format!("{retained}[0]")));
+    assert!(sim.eval_builtin_method(array, "delete", &[]).is_some());
+    assert!(!sim.module.dynamic_arrays.contains(retained));
+    assert!(sim.signals.elem_keys(array).is_empty());
+    assert!(sim.module.associative_arrays.contains_key(array));
+    assert!(sim.class_metadata_keys_are_current());
+}
+
+/// §7.8.4–§7.8.5, §8.25: the concrete key type of a parameterized class
+/// determines whether the stored decimal key is an object edge.
+#[test]
+fn gc_uses_the_specialized_type_of_class_associative_keys() {
+    let mut sim = crate::simulate(
+        r#"
+class Item; endclass
+class Holder #(type Key = int);
+  int entries[Key];
+  Key values[$];
+endclass
+class Derived #(type Key = int) extends Holder #(Item);
+endclass
+module top;
+  Holder #(int) integers;
+  Derived #(int) handles;
+  Item h;
+  initial begin
+    integers = new;
+    handles = new;
+    repeat (700) h = new;
+    h = null;
+    $finish;
+  end
+endmodule
+"#,
+        10,
+    )
+    .expect("specialized key fixture");
+    assert_eq!(sim.error_count, 0);
+    let owner = |name| sim.get_signal(name).unwrap().to_u64().unwrap();
+    let integers = owner("integers");
+    let handles = owner("handles");
+    sim.signals
+        .insert(format!("{integers}#entries[573]"), super::Value::zero(32));
+    sim.signals
+        .insert(format!("{handles}#entries[574]"), super::Value::zero(32));
+    sim.set_queue_size(&format!("{integers}#values"), 1);
+    sim.set_queue_size(&format!("{handles}#values"), 1);
+    sim.signals.insert(
+        format!("{integers}#values[0]"),
+        super::Value::from_u64(575, 32),
+    );
+    sim.signals.insert(
+        format!("{handles}#values[0]"),
+        super::Value::from_u64(576, 64),
+    );
+    let marked = sim
+        .class_heap_reachability_probe()
+        .expect("trace keys and values");
+    assert!(
+        !marked[573],
+        "an integral specialization retained an object"
+    );
+    assert!(marked[574], "a class specialization lost its key object");
+    assert!(
+        !marked[575],
+        "an integral element specialization retained an object"
+    );
+    assert!(
+        marked[576],
+        "an inherited specialization lost its element object"
+    );
 }

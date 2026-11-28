@@ -1527,7 +1527,7 @@ impl Simulator {
                 .filter(|&w| w > 0)
                 .unwrap_or_else(|| default_w.max(1));
             if is_queue {
-                self.module.queue_vars.insert(spec_key.clone());
+                class_metadata!(self.module.queue_vars, insert(spec_key.clone()));
                 if let Some(bound) = queue_bound {
                     let params = self.class_spec_value_params();
                     let env = self.spec_param_env(&params);
@@ -1536,9 +1536,10 @@ impl Simulator {
                             .or_else(|| self.eval_expr(&bound).to_i64())
                             .and_then(Self::bounded_queue_capacity)
                     {
-                        self.module
-                            .queue_max_sizes
-                            .insert(spec_key.clone(), capacity);
+                        class_metadata!(
+                            self.module.queue_max_sizes,
+                            insert(spec_key.clone(), capacity)
+                        );
                     }
                 }
             }
@@ -1562,26 +1563,18 @@ impl Simulator {
                         Some((width, signed))
                     }).or(default_iw)
                 }).flatten();
-                self.module
-                    .associative_arrays
-                    .entry(spec_key.clone())
+                class_metadata!(self.module.associative_arrays, entry(spec_key.clone()))
                     .or_insert(is_str);
-                self.module
-                    .assoc_elem_widths
-                    .entry(spec_key.clone())
+                class_metadata!(self.module.assoc_elem_widths, entry(spec_key.clone()))
                     .or_insert(width);
                 if let Some(iw) = assoc_iw {
-                    self.module
-                        .assoc_index_widths
-                        .entry(spec_key.clone())
+                    class_metadata!(self.module.assoc_index_widths, entry(spec_key.clone()))
                         .or_insert(iw);
                 }
                 self.widths.insert(spec_key.clone(), width);
             } else {
-                self.module.dynamic_arrays.insert(spec_key.clone());
-                self.module
-                    .arrays
-                    .entry(spec_key.clone())
+                class_metadata!(self.module.dynamic_arrays, insert(spec_key.clone()));
+                class_metadata!(self.module.arrays, entry(spec_key.clone()))
                     .or_insert((0, 63, width));
                 self.widths.insert(spec_key.clone(), width);
                 self.set_queue_size(&spec_key, 0);
@@ -1635,16 +1628,20 @@ impl Simulator {
             self.this_stack.push(None);
             if let Some(layout) = self.class_array_layout(&cname, &prop) {
                 let default = layout.default_value();
-                self.module
-                    .arrays
-                    .insert(spec_key.clone(), (layout.lo, layout.hi, layout.width));
+                class_metadata!(
+                    self.module.arrays,
+                    insert(spec_key.clone(), (layout.lo, layout.hi, layout.width))
+                );
                 let declared = if layout.descending {
-                    self.module.descending_arrays.insert(spec_key.clone());
+                    class_metadata!(self.module.descending_arrays, insert(spec_key.clone()));
                     (layout.hi, layout.lo)
                 } else {
                     (layout.lo, layout.hi)
                 };
-                self.module.unpacked_decl_dims.insert(spec_key.clone(), vec![declared]);
+                class_metadata!(
+                    self.module.unpacked_decl_dims,
+                    insert(spec_key.clone(), vec![declared])
+                );
                 self.widths.insert(spec_key.clone(), layout.width);
                 for i in layout.lo..=layout.hi {
                     let mut elem = spec_key.clone();
@@ -1661,7 +1658,7 @@ impl Simulator {
                 }
             } else {
                 let w = default_w.max(1);
-                self.module.arrays.insert(spec_key.clone(), (0, -1, w));
+                class_metadata!(self.module.arrays, insert(spec_key.clone(), (0, -1, w)));
             }
             self.this_stack.pop();
             self.class_context_stack.pop();

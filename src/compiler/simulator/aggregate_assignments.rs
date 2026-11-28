@@ -479,7 +479,7 @@ impl Simulator {
         {
             self.signals.remove(&k);
         }
-        self.class_assoc_defaults.remove(scoped);
+        class_metadata!(self.class_assoc_defaults, remove(scoped));
         let elem_dt = self
             .class_member_coll_type(scoped)
             .cloned()
@@ -507,7 +507,7 @@ impl Simulator {
                             &self.module.typedef_types,
                         );
                     }
-                    self.class_assoc_defaults.insert(scoped.to_string(), v);
+                    class_metadata!(self.class_assoc_defaults, insert(scoped.to_string(), v));
                 }
                 continue;
             }
@@ -767,12 +767,13 @@ impl Simulator {
             ExprKind::AssignmentPattern(items) => {
                 if is_assoc {
                     self.eval_builtin_method(name, "delete", &[]);
-                    self.module.assoc_defaults.remove(name);
+                    class_metadata!(self.module.assoc_defaults, remove(name));
                     for item in items {
                         if let AssignmentPatternItem::Default(d) = item {
-                            self.module
-                                .assoc_defaults
-                                .insert(name.to_string(), d.clone());
+                            class_metadata!(
+                                self.module.assoc_defaults,
+                                insert(name.to_string(), d.clone())
+                            );
                             continue;
                         }
                         let Some(k) = self.array_pattern_key(item) else {
@@ -978,9 +979,10 @@ impl Simulator {
         let snap = Self::RET_ASSOC_SNAP;
         if src != snap {
             let is_str = self.is_string_keyed_array(src);
-            self.module
-                .associative_arrays
-                .insert(snap.to_string(), is_str);
+            class_metadata!(
+                self.module.associative_arrays,
+                insert(snap.to_string(), is_str)
+            );
             self.copy_assoc_entries(snap, src);
         }
         self.pending_ret_collection = Some(snap.to_string());
@@ -1037,7 +1039,7 @@ impl Simulator {
             self.signals.insert(k, v);
         }
         if let Some(d) = self.module.assoc_defaults.get(src).cloned() {
-            self.module.assoc_defaults.insert(dst.to_string(), d);
+            class_metadata!(self.module.assoc_defaults, insert(dst.to_string(), d));
         }
         if any {
             self.mark_struct_coll_owner_present(dst);
@@ -1912,7 +1914,7 @@ impl Simulator {
             // members default to 0 as well (§7.2.1, §7.4) — seeded per
             // element leaf (`arr[1].a`), never on the container name.
             if self.packed_type_is_mixed(&dt) {
-                self.mixed_packed_vars.insert(vname.clone());
+                class_metadata!(self.mixed_packed_vars, insert(vname.clone()));
             }
             let fixed_1d = self.module.arrays.get(&vname).copied();
             let fixed_2d = self.module.arrays_2d.get(&vname).copied();
@@ -2734,7 +2736,7 @@ impl Simulator {
                         continue;
                     }
                     if !self.ensure_struct_member_coll(&d) {
-                        self.module.dynamic_arrays.insert(d.clone());
+                        class_metadata!(self.module.dynamic_arrays, insert(d.clone()));
                     }
                     let n = self.get_queue_size(&sname);
                     for j in 0..n {
@@ -2949,11 +2951,12 @@ impl Simulator {
     /// exactly the entries of associative array `src`.
     pub(super) fn store_assoc_elem(&mut self, elem: &str, src: &str) {
         let is_str = self.is_string_keyed_array(src);
-        self.module
-            .associative_arrays
-            .insert(elem.to_string(), is_str);
+        class_metadata!(
+            self.module.associative_arrays,
+            insert(elem.to_string(), is_str)
+        );
         if let Some(w) = self.module.assoc_elem_widths.get(src).copied() {
-            self.module.assoc_elem_widths.insert(elem.to_string(), w);
+            class_metadata!(self.module.assoc_elem_widths, insert(elem.to_string(), w));
         }
         self.copy_assoc_entries(elem, src);
     }
@@ -3884,11 +3887,11 @@ impl Simulator {
     /// Register `row` as an empty dynamic row shaped like `like`.
     pub(super) fn register_dyn_row_like(&mut self, row: &str, like: &str) {
         self.clear_dyn_row(row);
-        self.module.dynamic_arrays.insert(row.to_string());
+        class_metadata!(self.module.dynamic_arrays, insert(row.to_string()));
         let shape = self.module.arrays.get(like).copied().unwrap_or((0, 63, 32));
-        self.module.arrays.insert(row.to_string(), shape);
+        class_metadata!(self.module.arrays, insert(row.to_string(), shape));
         if self.module.queue_vars.contains(like) {
-            self.module.queue_vars.insert(row.to_string());
+            class_metadata!(self.module.queue_vars, insert(row.to_string()));
         }
         self.set_queue_size(row, 0);
     }
@@ -4405,9 +4408,9 @@ impl Simulator {
             self.set_signal_value_by_name(&format!("{RET_SNAP}[{pos}]"), v.clone());
         }
         self.set_queue_size(RET_SNAP, row.len() as u64);
-        self.module.arrays.insert(RET_SNAP.to_string(), (0, -1, w));
-        self.module.dynamic_arrays.insert(RET_SNAP.to_string());
-        self.module.var_decl_types.insert(RET_SNAP.to_string(), dt);
+        class_metadata!(self.module.arrays, insert(RET_SNAP.to_string(), (0, -1, w)));
+        class_metadata!(self.module.dynamic_arrays, insert(RET_SNAP.to_string()));
+        class_metadata!(self.module.var_decl_types, insert(RET_SNAP.to_string(), dt));
         Some(RET_SNAP.to_string())
     }
 
@@ -6072,9 +6075,10 @@ impl Simulator {
             let mut wrote = false;
             for item in items {
                 if let AssignmentPatternItem::Default(e) = item {
-                    self.module
-                        .assoc_defaults
-                        .insert(base.to_string(), e.clone());
+                    class_metadata!(
+                        self.module.assoc_defaults,
+                        insert(base.to_string(), e.clone())
+                    );
                     wrote = true;
                 } else if let Some(k) = self.array_pattern_key(item) {
                     let kv = self.eval_expr(&k);
@@ -6140,7 +6144,7 @@ impl Simulator {
                 let pet = self.p_elem_type(base);
                 pet.is_some()
             } {
-                self.module.dynamic_arrays.insert(base.to_string());
+                class_metadata!(self.module.dynamic_arrays, insert(base.to_string()));
                 let exprs = self.pattern_ordered(items);
                 if exprs.is_empty() {
                     return false;

@@ -122,13 +122,17 @@ impl Simulator {
             _ => return None,
         };
         let (arr, lm, filter, iter) = self.locator_call(recv)?;
-        let tmp = format!("__xz_locator_{:p}", func);
         let picks = self.locator_indices_named(&arr, &lm, filter.as_ref(), iter.as_deref());
-        self.materialize_locator(&tmp, &arr, &lm, &picks);
+        let tmp = self.materialize_locator_temp(&arr, &lm, &picks);
         Some((tmp, mname))
     }
 
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        if args.is_empty()
+            && let Some(value) = self.reduction_iterator_method(func)
+        {
+            return value;
+        }
         // §11.4.1, §7.8.7: a receiver's selects (`m[f()].push_back(x)`) are
         // evaluated once; the dispatch below resolves the receiver several
         // times, so a side-effecting select is folded to its value first.
@@ -208,10 +212,12 @@ impl Simulator {
             }
         }
         // §7.12.1, §7.10.2: a method on a locator call's result queue.
-        if let Some((tmp, mname)) = self.locator_result_temp(func)
-            && let Some(v) = self.eval_builtin_method(&tmp, mname, args)
-        {
-            return v;
+        if let Some((tmp, mname)) = self.locator_result_temp(func) {
+            let value = self.eval_builtin_method(&tmp, mname, args);
+            self.cleanup_dyn_storage(&tmp);
+            if let Some(value) = value {
+                return value;
+            }
         }
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`
@@ -1347,8 +1353,9 @@ impl Simulator {
                         if matches!(mname, "push_back" | "push_front" | "insert")
                             && !self.is_declared_row(&cn)
                         {
-                            self.module.dynamic_arrays.insert(cn.clone());
-                            self.module.arrays.entry(cn.clone()).or_insert((0, 63, 32));
+                            class_metadata!(self.module.dynamic_arrays, insert(cn.clone()));
+                            class_metadata!(self.module.arrays, entry(cn.clone()))
+                                .or_insert((0, 63, 32));
                         }
                         if let Some(res) = self.eval_builtin_method(&cn, mname, args) {
                             return res;
@@ -1366,7 +1373,7 @@ impl Simulator {
                             && (self.module.dynamic_arrays.contains(&cn)
                                 || self.signals.contains_key(&format!("{}.size", cn)))
                         {
-                            self.module.dynamic_arrays.insert(cn.clone());
+                            class_metadata!(self.module.dynamic_arrays, insert(cn.clone()));
                             if let Some(res) = self.eval_builtin_method(&cn, mname, args) {
                                 return res;
                             }
@@ -1562,6 +1569,8 @@ impl Simulator {
                             .unwrap();
                         if let Some(arg) = args.first() {
                             self.mbx_assign_delivered(arg, &val, true);
+                        } else {
+                            self.discard_mailbox_pattern(&val);
                         }
                         self.admit_mailbox_put_waiter(handle);
                         return Value::zero(32);
@@ -1602,10 +1611,13 @@ impl Simulator {
                 // must fall through to normal method dispatch.
                 if self.mailboxes.contains_key(&handle) {
                     let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
-                    if let (Some(v), Some(arg)) = (val, args.first()) {
-                        self.mbx_assign_delivered(arg, &v, true);
-                        self.admit_mailbox_put_waiter(handle);
-                        return Value::from_u64(1, 32);
+                    if let Some(v) = val {
+                        if let Some(arg) = args.first() {
+                            self.mbx_assign_delivered(arg, &v, true);
+                            self.admit_mailbox_put_waiter(handle);
+                            return Value::from_u64(1, 32);
+                        }
+                        self.discard_mailbox_pattern(&v);
                     }
                     return Value::zero(32);
                 }

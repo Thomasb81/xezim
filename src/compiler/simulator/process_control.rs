@@ -453,6 +453,7 @@ impl Simulator {
     /// Per-process state a killed process (`kill()`, `disable fork`,
     /// `disable <label>`) never releases through `child_finished`.
     pub(super) fn release_killed_process_state(&mut self, pid: usize) {
+        self.cancel_mailbox_put(pid);
         self.release_fork_process_metadata(pid);
         self.release_resume_markers(pid);
         // A killed fork child can still be unwinding on the current or a
@@ -473,11 +474,37 @@ impl Simulator {
         self.release_process_execution_caches(pid);
         self.fork_baselines.remove(&pid);
         self.fork_local_scopes.remove(&pid);
+        self.release_parked_collection_locals(pid);
         self.release_fork_collections(pid);
         self.fork_signal_captures.remove(&pid);
         self.suspended_loop_frames.remove(&pid);
         if !self.adopted_pids.is_empty() {
             self.adopted_pids.remove(&pid);
+        }
+    }
+
+    /// Release private collections from a parked frame that will never run
+    /// its normal scope exits (§6.21, §9.6.2). Captured parent keys still
+    /// belong to the parent and are released through the capture counts.
+    fn release_parked_collection_locals(&mut self, pid: usize) {
+        let Some(ctx) = self.process_contexts.get(&pid) else {
+            return;
+        };
+        let inherited = self.fork_collection_captures.get(&pid);
+        let keys: HashSet<_> = ctx
+            .local_dyn
+            .iter()
+            .chain(&ctx.formal_dyn)
+            .chain(ctx.block_scope_saves.iter().map(|save| &save.dyn_shadowed))
+            .flatten()
+            .map(|(_, key)| key)
+            .filter(|key| {
+                key.starts_with('@') && !inherited.is_some_and(|keys| keys.contains(*key))
+            })
+            .cloned()
+            .collect();
+        for key in keys {
+            self.cleanup_dyn_storage(&key);
         }
     }
 
@@ -624,6 +651,7 @@ impl Simulator {
         self.suspended_loop_frames.remove(&child_pid);
         self.fork_baselines.remove(&child_pid);
         self.fork_local_scopes.remove(&child_pid);
+        self.release_parked_collection_locals(child_pid);
         self.release_fork_collections(child_pid);
         self.fork_signal_captures.remove(&child_pid);
         self.process_contexts.remove(&child_pid);

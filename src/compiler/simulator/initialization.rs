@@ -2118,6 +2118,15 @@ impl Simulator {
                 .packed_signal_elem_widths
                 .retain(|n, _| !assoc.contains_key(n));
         }
+        // §6.21, §27.6: eagerly elaborated processes can also belong to a
+        // generate scope. Give them the same qualified local storage as
+        // pending instance processes before any lexical-collision pass.
+        for block in &mut module.initial_blocks {
+            Self::rename_instance_locals(&mut block.stmt, &block.scope);
+        }
+        for block in &mut module.always_blocks {
+            Self::rename_instance_locals(&mut block.stmt, &block.scope);
+        }
         // Lazy always blocks (see `LazyAlways`) everywhere except where a
         // pass reads every always-block body before classification: code
         // coverage instruments them, and opt-in signal placement walks them.
@@ -4747,7 +4756,8 @@ impl Simulator {
             class_gc_live_signals: 0,
             class_gc_released: 0,
             class_gc_runs: 0,
-            virtual_iface_bindings: HashMap::default(),
+            class_metadata_keys: Default::default(),
+            virtual_iface_bindings: Default::default(),
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
             vif_capable_statics: std::cell::OnceCell::new(),
@@ -4849,6 +4859,7 @@ impl Simulator {
             mbx_patterns: HashMap::default(),
             mailbox_bound: HashMap::default(),
             mailbox_put_waiters: HashMap::default(),
+            mailbox_put_by_pid: HashMap::default(),
             rand_mode_disabled: HashMap::default(),
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
@@ -4864,11 +4875,11 @@ impl Simulator {
             randomize_budget_deadline: None,
             randomize_budget_exhausted: false,
             rand_child_snapshots: Vec::new(),
-            randc_used: HashMap::default(),
-            randc_pending: HashMap::default(),
+            randc_used: Default::default(),
+            randc_pending: Default::default(),
             randc_wide: HashMap::default(),
             randc_wide_pending: HashMap::default(),
-            dist_decks: HashMap::default(),
+            dist_decks: Default::default(),
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
@@ -5001,7 +5012,7 @@ impl Simulator {
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
             event_aliases: HashMap::default(),
-            event_obj_ids: HashMap::default(),
+            event_obj_ids: Default::default(),
             event_obj_slots: HashMap::default(),
             next_event_obj_id: 0,
             class_event_prop_names: None,

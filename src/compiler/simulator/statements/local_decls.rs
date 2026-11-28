@@ -513,9 +513,10 @@ impl Simulator {
             // Record the declared type so type-directed
             // consumers (`%s` string-member detection, `%p`)
             // can resolve `p.member` through the typedef.
-            self.module
-                .var_decl_types
-                .insert(d.name.name.clone(), data_type.clone());
+            class_metadata!(
+                self.module.var_decl_types,
+                insert(d.name.name.clone(), data_type.clone())
+            );
             self.note_struct_root(&d.name.name);
             self.note_struct_type(data_type);
             // §6.21: each entry gets FRESH (empty) dynamic members.
@@ -559,7 +560,7 @@ impl Simulator {
                             // §6.11.3: a signed member (`int`, `byte`) reads
                             // signed, as a module-scope leaf does.
                             if dv.is_signed {
-                                self.signed_signals.insert(k.clone());
+                                class_metadata!(self.signed_signals, insert(k.clone()));
                             }
                             self.signals.insert(k, dv);
                         }
@@ -681,10 +682,10 @@ impl Simulator {
         if let Some((fields, name, prev)) = self.local_elem_layout.take()
             && name == bare
         {
-            self.module.packed_struct_fields.insert(sk.to_string(), fields);
+            class_metadata!(self.module.packed_struct_fields, insert(sk.to_string(), fields));
             match prev {
-                Some(p) => self.module.packed_struct_fields.insert(name, p),
-                None => self.module.packed_struct_fields.remove(&name),
+                Some(p) => class_metadata!(self.module.packed_struct_fields, insert(name, p)),
+                None => class_metadata!(self.module.packed_struct_fields, remove(&name)),
             };
         }
         if let Some(dimensions) = self
@@ -694,11 +695,12 @@ impl Simulator {
             .filter(|d| d.len() > 1)
             .cloned()
         {
-            self.module.packed_full_dims.insert(sk.to_string(), dimensions);
+            class_metadata!(self.module.packed_full_dims, insert(sk.to_string(), dimensions));
             if let Some(width) = self.module.packed_signal_elem_widths.get(bare).copied() {
-                self.module
-                    .packed_signal_elem_widths
-                    .insert(sk.to_string(), width);
+                class_metadata!(
+                    self.module.packed_signal_elem_widths,
+                    insert(sk.to_string(), width)
+                );
             }
         }
     }
@@ -850,9 +852,10 @@ impl Simulator {
             match self.module.var_decl_types.get_mut(d.name.name.as_str()) {
                 Some(slot) => *slot = data_type.clone(),
                 None => {
-                    self.module
-                        .var_decl_types
-                        .insert(d.name.name.clone(), data_type.clone());
+                    class_metadata!(
+                        self.module.var_decl_types,
+                        insert(d.name.name.clone(), data_type.clone())
+                    );
                 }
             }
             // §7.4.1: a packed-of-packed local (`u8_vec16_t y;`)
@@ -864,9 +867,10 @@ impl Simulator {
             if d.dimensions.is_empty() && !plain {
                 if let Some(ew) = self.ast_decl_elem_width(data_type) {
                     if ew > 0 && w > ew && w % ew == 0 {
-                        self.module
-                            .packed_signal_elem_widths
-                            .insert(d.name.name.clone(), ew);
+                        class_metadata!(
+                            self.module.packed_signal_elem_widths,
+                            insert(d.name.name.clone(), ew)
+                        );
                     }
                 }
             }
@@ -875,12 +879,13 @@ impl Simulator {
                 // layout; only a vector's own non-normalized range is kept.
                 match super::elaborate::packed_full_dims_of(data_type, &self.module.parameters) {
                     Some(fdims) => {
-                        self.module
-                            .packed_full_dims
-                            .insert(d.name.name.clone(), fdims);
+                        class_metadata!(
+                            self.module.packed_full_dims,
+                            insert(d.name.name.clone(), fdims)
+                        );
                     }
                     None => {
-                        self.module.packed_full_dims.remove(&d.name.name);
+                        class_metadata!(self.module.packed_full_dims, remove(&d.name.name));
                     }
                 }
             } else if d.dimensions.is_empty() {
@@ -904,11 +909,12 @@ impl Simulator {
                         &self.module.typedefs,
                     )
                 }) {
-                    self.module
-                        .packed_signal_elem_widths
-                        .insert(d.name.name.clone(), elem_w);
+                    class_metadata!(
+                        self.module.packed_signal_elem_widths,
+                        insert(d.name.name.clone(), elem_w)
+                    );
                 } else {
-                    self.module.packed_signal_elem_widths.remove(&d.name.name);
+                    class_metadata!(self.module.packed_signal_elem_widths, remove(&d.name.name));
                 }
                 if let Some(fdims) =
                     super::elaborate::packed_full_dims_of(data_type, &self.module.parameters)
@@ -927,11 +933,12 @@ impl Simulator {
                         })
                         .or_else(|| self.struct_array_full_dims(data_type))
                 {
-                    self.module
-                        .packed_full_dims
-                        .insert(d.name.name.clone(), fdims);
+                    class_metadata!(
+                        self.module.packed_full_dims,
+                        insert(d.name.name.clone(), fdims)
+                    );
                 } else {
-                    self.module.packed_full_dims.remove(&d.name.name);
+                    class_metadata!(self.module.packed_full_dims, remove(&d.name.name));
                 }
                 // Per-field element widths (`u.n[i]` where the member
                 // is itself a packed array) — mirrors the module-scope
@@ -970,16 +977,23 @@ impl Simulator {
                                 // member has different packed dims).
                                 if let Some(ew) = ew {
                                     self.note_elem_width_key(&key);
-                                    self.module
-                                        .packed_signal_elem_widths
-                                        .insert(key.clone(), ew);
+                                    class_metadata!(
+                                        self.module.packed_signal_elem_widths,
+                                        insert(key.clone(), ew)
+                                    );
                                 } else {
-                                    self.module.packed_signal_elem_widths.remove(&key);
+                                    class_metadata!(
+                                        self.module.packed_signal_elem_widths,
+                                        remove(&key)
+                                    );
                                 }
                                 if let Some(fd) = &fd {
-                                    self.module.packed_full_dims.insert(key.clone(), fd.clone());
+                                    class_metadata!(
+                                        self.module.packed_full_dims,
+                                        insert(key.clone(), fd.clone())
+                                    );
                                 } else {
-                                    self.module.packed_full_dims.remove(&key);
+                                    class_metadata!(self.module.packed_full_dims, remove(&key));
                                 }
                                 if let crate::ast::types::DataType::Struct(nested) =
                                     self.resolve_dt(&m.data_type)
@@ -1020,9 +1034,10 @@ impl Simulator {
                         if env_set_cached!("XEZIM_PSDBG") {
                             eprintln!("[PSDBG] register packed local {}", d.name.name);
                         }
-                        self.module
-                            .packed_struct_fields
-                            .insert(d.name.name.clone(), fields);
+                        class_metadata!(
+                            self.module.packed_struct_fields,
+                            insert(d.name.name.clone(), fields)
+                        );
                     }
                 }
                 // Declaration-order member names for `%p` (§21.2.1.7).
@@ -1030,9 +1045,10 @@ impl Simulator {
                     super::elaborate::struct_member_names(data_type, &self.module.typedef_types)
                 {
                     if !names.is_empty() {
-                        self.module
-                            .struct_members
-                            .insert(d.name.name.clone(), names);
+                        class_metadata!(
+                            self.module.struct_members,
+                            insert(d.name.name.clone(), names)
+                        );
                     }
                 }
             } else {
@@ -1046,11 +1062,11 @@ impl Simulator {
                     .packed_struct_layout_in_ctx(data_type)
                     .filter(|f| !f.is_empty())
                 {
-                    let prev = self
-                        .module
-                        .packed_struct_fields
-                        .insert(d.name.name.clone(), fields.clone())
-                        .map(|f| f.to_vec());
+                    let prev = class_metadata!(
+                        self.module.packed_struct_fields,
+                        insert(d.name.name.clone(), fields.clone())
+                    )
+                    .map(|f| f.to_vec());
                     // An array local to an automatic task lives under a
                     // per-call key (`declare_local_dyn`).
                     self.local_elem_layout = Some((fields, d.name.name.clone(), prev));
@@ -1077,21 +1093,23 @@ impl Simulator {
                         )
                         .or_else(|| self.ast_decl_elem_width(data_type))
                         {
-                            self.module
-                                .packed_signal_elem_widths
-                                .insert(d.name.name.clone(), ew);
+                            class_metadata!(
+                                self.module.packed_signal_elem_widths,
+                                insert(d.name.name.clone(), ew)
+                            );
                         }
-                        self.module
-                            .packed_full_dims
-                            .insert(d.name.name.clone(), fdims);
-                        self.array_local_packed_dims.insert(d.name.name.clone());
+                        class_metadata!(
+                            self.module.packed_full_dims,
+                            insert(d.name.name.clone(), fdims)
+                        );
+                        class_metadata!(self.array_local_packed_dims, insert(d.name.name.clone()));
                     }
                     // Only a name this arm registered can hold a stale
                     // geometry: the common array local pays no lookup.
                     _ if !self.array_local_packed_dims.is_empty()
-                        && self.array_local_packed_dims.remove(&d.name.name) =>
+                        && class_metadata!(self.array_local_packed_dims, remove(&d.name.name)) =>
                     {
-                        self.module.packed_full_dims.remove(&d.name.name);
+                        class_metadata!(self.module.packed_full_dims, remove(&d.name.name));
                     }
                     _ => {}
                 }
@@ -1193,18 +1211,23 @@ impl Simulator {
                     };
                     self.adopt_local_shape(&name);
                     if let Some(bounds) = self.declared_fixed_dims(dims) {
-                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                        class_metadata!(
+                            self.module.unpacked_decl_dims,
+                            insert(name.clone(), bounds)
+                        );
                     }
                     match shape.len() {
                         2 => {
-                            self.module
-                                .arrays_2d
-                                .insert(name.clone(), (shape[0], shape[1], w));
+                            class_metadata!(
+                                self.module.arrays_2d,
+                                insert(name.clone(), (shape[0], shape[1], w))
+                            );
                         }
                         _ => {
-                            self.module
-                                .arrays_nd
-                                .insert(name.clone(), (shape.clone(), w));
+                            class_metadata!(
+                                self.module.arrays_nd,
+                                insert(name.clone(), (shape.clone(), w))
+                            );
                         }
                     }
                     // Every element, row-major.
@@ -1226,7 +1249,7 @@ impl Simulator {
                         }
                     );
                     if is_string_elem {
-                        self.string_signals.insert(name.clone());
+                        class_metadata!(self.string_signals, insert(name.clone()));
                     }
                     for sfx in suffixes {
                         let elem = format!("{}{}", name, sfx);
@@ -1239,9 +1262,10 @@ impl Simulator {
                         self.widths.insert(elem, w);
                     }
                     self.widths.insert(name.clone(), w);
-                    self.module
-                        .var_decl_types
-                        .insert(name.clone(), data_type.clone());
+                    class_metadata!(
+                        self.module.var_decl_types,
+                        insert(name.clone(), data_type.clone())
+                    );
                     if let Some(init) = &d.init {
                         self.route_decl_init_via_assign(&name, init, d.name.span);
                     }
@@ -1301,21 +1325,23 @@ impl Simulator {
                             bare.clone()
                         };
                         self.adopt_local_shape(&name);
-                        self.module.arrays.insert(name.clone(), (0, -1, w));
-                        self.module.dynamic_arrays.insert(name.clone());
+                        class_metadata!(self.module.arrays, insert(name.clone(), (0, -1, w)));
+                        class_metadata!(self.module.dynamic_arrays, insert(name.clone()));
                         if name != bare {
                             // The element type, under the per-call key too
                             // (a queue of structs spreads its members by it).
-                            self.module
-                                .var_decl_types
-                                .insert(name.clone(), data_type.clone());
+                            class_metadata!(
+                                self.module.var_decl_types,
+                                insert(name.clone(), data_type.clone())
+                            );
                             if let crate::ast::types::DataType::TypeReference { name: tn, .. } =
                                 data_type
                             {
                                 if self.module.classes.contains_key(&tn.name.name) {
-                                    self.module
-                                        .array_elem_class
-                                        .insert(name.clone(), tn.name.name.clone());
+                                    class_metadata!(
+                                        self.module.array_elem_class,
+                                        insert(name.clone(), tn.name.name.clone())
+                                    );
                                 }
                             }
                         }
@@ -1326,14 +1352,17 @@ impl Simulator {
                         // range rule of an unallocated dynamic array.
                         // Mirror the module-scope classification.
                         if let UnpackedDimension::Queue { max_size, .. } = first {
-                            self.module.queue_vars.insert(name.clone());
+                            class_metadata!(self.module.queue_vars, insert(name.clone()));
                             if let Some(bound) = max_size
                                 && let Some(capacity) = self
                                     .eval_expr(bound)
                                     .to_i64()
                                     .and_then(Self::bounded_queue_capacity)
                             {
-                                self.module.queue_max_sizes.insert(name.clone(), capacity);
+                                class_metadata!(
+                                    self.module.queue_max_sizes,
+                                    insert(name.clone(), capacity)
+                                );
                             }
                         }
                         self.widths.insert(name.clone(), w);
@@ -1364,23 +1393,28 @@ impl Simulator {
                             if let Some(inner) = inner
                                 .filter(|sh| sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096))
                             {
-                                self.module.arrays.remove(&name);
+                                class_metadata!(self.module.arrays, remove(&name));
                                 if inner.len() == 1 {
-                                    self.module
-                                        .arrays_2d
-                                        .insert(name.clone(), ((0, 63), inner[0], w));
+                                    class_metadata!(
+                                        self.module.arrays_2d,
+                                        insert(name.clone(), ((0, 63), inner[0], w))
+                                    );
                                 } else {
                                     let mut shape = vec![(0i64, 63i64)];
                                     shape.extend(inner.iter().cloned());
-                                    self.module.arrays_nd.insert(name.clone(), (shape, w));
+                                    class_metadata!(
+                                        self.module.arrays_nd,
+                                        insert(name.clone(), (shape, w))
+                                    );
                                 }
                                 if let crate::ast::types::DataType::TypeReference {
                                     name: tn, ..
                                 } = data_type
                                 {
-                                    self.module
-                                        .array_elem_class
-                                        .insert(name.clone(), tn.name.name.clone());
+                                    class_metadata!(
+                                        self.module.array_elem_class,
+                                        insert(name.clone(), tn.name.name.clone())
+                                    );
                                 }
                             }
                         }
@@ -1399,7 +1433,7 @@ impl Simulator {
                                 ..
                             }
                         ) {
-                            self.string_signals.insert(name.clone());
+                            class_metadata!(self.string_signals, insert(name.clone()));
                         } else {
                             self.forget_string_flag(&name);
                         }
@@ -1478,9 +1512,10 @@ impl Simulator {
                         for k in stale {
                             self.signals.remove(&k);
                         }
-                        self.module
-                            .associative_arrays
-                            .insert(name.clone(), is_string_key);
+                        class_metadata!(
+                            self.module.associative_arrays,
+                            insert(name.clone(), is_string_key)
+                        );
                         self.widths.insert(name.clone(), w);
                         // §7.8.2 / §7.9: the key's width and signedness, as
                         // elaboration records them for a module-scope array.
@@ -1511,10 +1546,13 @@ impl Simulator {
                             .0
                         }) {
                             Some(iw) => {
-                                self.module.assoc_index_widths.insert(name.clone(), iw);
+                                class_metadata!(
+                                    self.module.assoc_index_widths,
+                                    insert(name.clone(), iw)
+                                );
                             }
                             None => {
-                                self.module.assoc_index_widths.remove(&name);
+                                class_metadata!(self.module.assoc_index_widths, remove(&name));
                             }
                         }
                         // §6.19.6/§7.8: a NAMED key type (`int aa[e_t];`)
@@ -1529,10 +1567,16 @@ impl Simulator {
                         if self.local_type_stack.is_empty() {
                             match key_tn {
                                 Some(tn) => {
-                                    self.module.assoc_key_type_names.insert(bare.clone(), tn);
+                                    class_metadata!(
+                                        self.module.assoc_key_type_names,
+                                        insert(bare.clone(), tn)
+                                    );
                                 }
                                 None => {
-                                    self.module.assoc_key_type_names.remove(&bare);
+                                    class_metadata!(
+                                        self.module.assoc_key_type_names,
+                                        remove(&bare)
+                                    );
                                 }
                             }
                         } else {
@@ -1544,15 +1588,14 @@ impl Simulator {
                         // the element class (incl. parameterized
                         // typedefs — UVM's sort_by_precedence local
                         // `rsrc_q_t all[int]`; issue #113).
-                        self.module
-                            .var_decl_types
-                            .insert(name.clone(), data_type.clone());
+                        class_metadata!(
+                            self.module.var_decl_types,
+                            insert(name.clone(), data_type.clone())
+                        );
                         if let crate::ast::types::DataType::TypeReference { name: tn, .. } =
                             data_type
                         {
-                            self.module
-                                .array_elem_class
-                                .entry(name.clone())
+                            class_metadata!(self.module.array_elem_class, entry(name.clone()))
                                 .or_insert_with(|| tn.name.name.clone());
                         }
                         // A `string m[...]` (string-VALUED assoc): mark the
@@ -1567,7 +1610,7 @@ impl Simulator {
                                 ..
                             }
                         ) {
-                            self.string_signals.insert(name.clone());
+                            class_metadata!(self.string_signals, insert(name.clone()));
                         } else {
                             self.forget_string_flag(&name);
                         }
@@ -1580,7 +1623,10 @@ impl Simulator {
                         {
                             let ecn = en.name.name.clone();
                             if self.module.classes.contains_key(&ecn) {
-                                self.module.array_elem_class.insert(name.clone(), ecn);
+                                class_metadata!(
+                                    self.module.array_elem_class,
+                                    insert(name.clone(), ecn)
+                                );
                             }
                         }
                         // A local ASSOCIATIVE array's declaration
@@ -1657,25 +1703,29 @@ impl Simulator {
                 };
                 if let Some(shape) = nd_shape {
                     if let Some(bounds) = self.declared_fixed_dims(&dims) {
-                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                        class_metadata!(
+                            self.module.unpacked_decl_dims,
+                            insert(name.clone(), bounds)
+                        );
                     }
-                    self.module.arrays.remove(&name);
+                    class_metadata!(self.module.arrays, remove(&name));
                     if shape.len() == 2 {
-                        self.module
-                            .arrays_2d
-                            .insert(name.clone(), (shape[0], shape[1], w));
-                        self.module.arrays_nd.remove(&name);
+                        class_metadata!(
+                            self.module.arrays_2d,
+                            insert(name.clone(), (shape[0], shape[1], w))
+                        );
+                        class_metadata!(self.module.arrays_nd, remove(&name));
                     } else {
-                        self.module.arrays_nd.insert(name.clone(), (shape, w));
-                        self.module.arrays_2d.remove(&name);
+                        class_metadata!(self.module.arrays_nd, insert(name.clone(), (shape, w)));
+                        class_metadata!(self.module.arrays_2d, remove(&name));
                     }
                     continue;
                 }
-                self.module.arrays.insert(name.clone(), (lo, hi, w));
-                self.module.arrays_2d.remove(&name);
-                self.module.arrays_nd.remove(&name);
+                class_metadata!(self.module.arrays, insert(name.clone(), (lo, hi, w)));
+                class_metadata!(self.module.arrays_2d, remove(&name));
+                class_metadata!(self.module.arrays_nd, remove(&name));
                 if descending {
-                    self.module.descending_arrays.insert(name.clone());
+                    class_metadata!(self.module.descending_arrays, insert(name.clone()));
                 }
                 // A local FIXED array of STRINGS: mark the array name
                 // (the element-string check keys off it, like the
@@ -1693,7 +1743,7 @@ impl Simulator {
                     }
                 );
                 if is_string_elem {
-                    self.string_signals.insert(name.clone());
+                    class_metadata!(self.string_signals, insert(name.clone()));
                 } else {
                     self.forget_string_flag(&name);
                 }
@@ -1719,7 +1769,7 @@ impl Simulator {
                             // §6.11.3: a signed member (`int`, `byte`) reads
                             // signed, as a module-scope leaf does.
                             if dv.is_signed {
-                                self.signed_signals.insert(k.clone());
+                                class_metadata!(self.signed_signals, insert(k.clone()));
                             }
                             self.signals.insert(k, dv);
                         }
@@ -1737,9 +1787,10 @@ impl Simulator {
                 // Element type of a LOCAL array: the pattern spread and
                 // the type-directed `%p` renderer both need it, and only
                 // module-scope declarations recorded one.
-                self.module
-                    .var_decl_types
-                    .insert(name.clone(), data_type.clone());
+                class_metadata!(
+                    self.module.var_decl_types,
+                    insert(name.clone(), data_type.clone())
+                );
                 // A local FIXED array's declaration initializer was
                 // dropped, so `int a[4] = '{10,20,30,40};` inside a block
                 // read back all zeros. Route it through an assignment,
@@ -1907,19 +1958,19 @@ impl Simulator {
                 // same-named signed flag from another frame.
                 if decl_signed {
                     if !self.signed_signals.contains(d.name.name.as_str()) {
-                        self.signed_signals.insert(d.name.name.clone());
+                        class_metadata!(self.signed_signals, insert(d.name.name.clone()));
                     }
                 } else {
-                    self.signed_signals.remove(&d.name.name);
+                    class_metadata!(self.signed_signals, remove(&d.name.name));
                 }
                 // Track `real` locals so assignments coerce to real —
                 // without this a block-local `real r; r = 3.14159;`
                 // rounded through real_to_int and read back 3.0
                 // (issue #23). A non-real decl clears a stale flag.
                 if is_real_type {
-                    self.real_signals.insert(d.name.name.clone());
+                    class_metadata!(self.real_signals, insert(d.name.name.clone()));
                 } else {
-                    self.real_signals.remove(&d.name.name);
+                    class_metadata!(self.real_signals, remove(&d.name.name));
                 }
                 // Track `string`-typed locals so `{a, b}` concatenations
                 // involving them are evaluated as string concat. A
@@ -1934,7 +1985,7 @@ impl Simulator {
                         ..
                     }
                 ) {
-                    self.string_signals.insert(d.name.name.clone());
+                    class_metadata!(self.string_signals, insert(d.name.name.clone()));
                 } else {
                     self.forget_string_flag(&d.name.name);
                 }
@@ -1968,7 +2019,10 @@ impl Simulator {
                     if cn_is_class {
                         self.record_local_class_type(&d.name.name, cn);
                         if self.var_class_types.get(d.name.name.as_str()) != Some(cn) {
-                            self.var_class_types.insert(d.name.name.clone(), cn.clone());
+                            class_metadata!(
+                                self.var_class_types,
+                                insert(d.name.name.clone(), cn.clone())
+                            );
                         }
                         // A typedef'd local (e.g. `table_q_t rq` where
                         // `table_q_t = shared#(Foo[$])`) resolves to
@@ -1983,7 +2037,10 @@ impl Simulator {
                             } else if let Some((_, Some(ta))) =
                                 self.resolve_typeref_class_with_type_args(name)
                             {
-                                self.var_type_args.insert(d.name.name.clone(), ta);
+                                class_metadata!(
+                                    self.var_type_args,
+                                    insert(d.name.name.clone(), ta)
+                                );
                             }
                         }
                     } else if self.resolve_type_param_binding(cn).is_some() {
@@ -2005,7 +2062,10 @@ impl Simulator {
                         // `new()` could not resolve CB, and the return
                         // value came back null to the caller.
                         self.record_local_class_type(&d.name.name, cn);
-                        self.var_class_types.insert(d.name.name.clone(), cn.clone());
+                        class_metadata!(
+                            self.var_class_types,
+                            insert(d.name.name.clone(), cn.clone())
+                        );
                     }
                 }
                 // Record a parameterized local's declared `#(...)` type
@@ -2023,20 +2083,22 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(ta) = self.scoped_class_type_args(data_type) {
-                    self.var_type_args.insert(d.name.name.clone(), ta);
+                    class_metadata!(self.var_type_args, insert(d.name.name.clone(), ta));
                 } else if let crate::ast::types::DataType::TypeReference { type_args, .. } =
                     data_type
                 {
                     if !type_args.is_empty() {
-                        self.var_type_args
-                            .insert(d.name.name.clone(), type_args.clone());
+                        class_metadata!(
+                            self.var_type_args,
+                            insert(d.name.name.clone(), type_args.clone())
+                        );
                     } else if let Some(ta) = resolved_ta {
-                        self.var_type_args.insert(d.name.name.clone(), ta);
+                        class_metadata!(self.var_type_args, insert(d.name.name.clone(), ta));
                     } else {
-                        self.var_type_args.remove(&d.name.name);
+                        class_metadata!(self.var_type_args, remove(&d.name.name));
                     }
                 } else {
-                    self.var_type_args.remove(&d.name.name);
+                    class_metadata!(self.var_type_args, remove(&d.name.name));
                 }
                 // §15.3/§15.4: record a mailbox/semaphore-typed local so
                 // a later separate `name = new(bound)` allocates the right
@@ -2048,11 +2110,13 @@ impl Simulator {
                     .and_then(|t| self.builtin_container_kind(t))
                 {
                     Some(k) => {
-                        self.var_container_types
-                            .insert(d.name.name.clone(), k.to_string());
+                        class_metadata!(
+                            self.var_container_types,
+                            insert(d.name.name.clone(), k.to_string())
+                        );
                     }
                     None => {
-                        self.var_container_types.remove(&d.name.name);
+                        class_metadata!(self.var_container_types, remove(&d.name.name));
                     }
                 }
                 // LRM §6.19.6: track typedef-typed locals so
@@ -2087,8 +2151,10 @@ impl Simulator {
                         || self.module.typedef_types.contains_key(&tn)
                     {
                         if self.var_typedef_types.get(d.name.name.as_str()) != Some(&tn) {
-                            self.var_typedef_types
-                                .insert(d.name.name.clone(), tn.clone());
+                            class_metadata!(
+                                self.var_typedef_types,
+                                insert(d.name.name.clone(), tn.clone())
+                            );
                         }
                         // Record the frame-scoped typedef too so a
                         // method-local enum type is resolvable without
@@ -2216,18 +2282,18 @@ impl Simulator {
                 }
                 if is_signed {
                     if !self.signed_signals.contains(d.name.name.as_str()) {
-                        self.signed_signals.insert(d.name.name.clone());
+                        class_metadata!(self.signed_signals, insert(d.name.name.clone()));
                     }
                 } else {
-                    self.signed_signals.remove(&d.name.name);
+                    class_metadata!(self.signed_signals, remove(&d.name.name));
                 }
                 if is_real {
-                    self.real_signals.insert(d.name.name.clone());
+                    class_metadata!(self.real_signals, insert(d.name.name.clone()));
                 } else {
-                    self.real_signals.remove(&d.name.name);
+                    class_metadata!(self.real_signals, remove(&d.name.name));
                 }
                 if is_string {
-                    self.string_signals.insert(d.name.name.clone());
+                    class_metadata!(self.string_signals, insert(d.name.name.clone()));
                 } else {
                     self.forget_string_flag(&d.name.name);
                 }
@@ -2282,11 +2348,14 @@ impl Simulator {
                 self.declare_local_dyn(&d.name.name)
             };
             self.register_coll_name(&name, StructCollKind::Dynamic, w, false);
-            self.module
-                .var_decl_types
-                .insert(name.clone(), data_type.clone());
-            self.dynamic_assoc_dims
-                .insert(name.clone(), dims[1..].to_vec());
+            class_metadata!(
+                self.module.var_decl_types,
+                insert(name.clone(), data_type.clone())
+            );
+            class_metadata!(
+                self.dynamic_assoc_dims,
+                insert(name.clone(), dims[1..].to_vec())
+            );
             self.clear_dynamic_assoc_rows(&name, 0);
             self.set_queue_size(&name, 0);
             if let Some(init) = &d.init
@@ -2340,19 +2409,22 @@ impl Simulator {
         self.adopt_local_shape(&name);
         match shape.len() {
             1 => {
-                self.module
-                    .arrays
-                    .insert(name.clone(), (shape[0].0, shape[0].1, w));
+                class_metadata!(
+                    self.module.arrays,
+                    insert(name.clone(), (shape[0].0, shape[0].1, w))
+                );
             }
             2 => {
-                self.module
-                    .arrays_2d
-                    .insert(name.clone(), (shape[0], shape[1], w));
+                class_metadata!(
+                    self.module.arrays_2d,
+                    insert(name.clone(), (shape[0], shape[1], w))
+                );
             }
             _ => {
-                self.module
-                    .arrays_nd
-                    .insert(name.clone(), (shape.clone(), w));
+                class_metadata!(
+                    self.module.arrays_nd,
+                    insert(name.clone(), (shape.clone(), w))
+                );
             }
         }
         let assoc_key = match &dims[k] {
@@ -2388,27 +2460,28 @@ impl Simulator {
             match assoc_key {
                 Some(is_str) => {
                     if let Some(index) = key_info.0 {
-                        self.module.assoc_index_widths.insert(en.clone(), index);
+                        class_metadata!(self.module.assoc_index_widths, insert(en.clone(), index));
                     }
                     if let Some(key_type) = &key_info.1 {
-                        self.module
-                            .assoc_key_type_names
-                            .insert(en.clone(), key_type.clone());
+                        class_metadata!(
+                            self.module.assoc_key_type_names,
+                            insert(en.clone(), key_type.clone())
+                        );
                     }
-                    self.module.assoc_elem_widths.insert(en.clone(), w);
-                    self.module.associative_arrays.insert(en, is_str);
+                    class_metadata!(self.module.assoc_elem_widths, insert(en.clone(), w));
+                    class_metadata!(self.module.associative_arrays, insert(en, is_str));
                 }
                 None => {
-                    self.module.dynamic_arrays.insert(en.clone());
-                    self.module.arrays.insert(en.clone(), (0, 63, w));
+                    class_metadata!(self.module.dynamic_arrays, insert(en.clone()));
+                    class_metadata!(self.module.arrays, insert(en.clone(), (0, 63, w)));
                     self.set_queue_size(&en, 0);
                 }
             }
         }
         if name.starts_with('@') {
-            self.local_coll_elems.insert(name.clone(), elems);
+            class_metadata!(self.local_coll_elems, insert(name.clone(), elems));
         }
-        self.module.var_decl_types.insert(name, data_type.clone());
+        class_metadata!(self.module.var_decl_types, insert(name, data_type.clone()));
         true
     }
 

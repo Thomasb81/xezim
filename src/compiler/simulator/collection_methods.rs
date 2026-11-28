@@ -1386,6 +1386,8 @@ impl Simulator {
     pub(super) fn resolve_locator_storage(&self, name: &str) -> String {
         let registered = |s: &Self, n: &str| {
             s.module.arrays.contains_key(n)
+                || s.module.arrays_2d.contains_key(n)
+                || s.module.arrays_nd.contains_key(n)
                 || s.module.dynamic_arrays.contains(n)
                 || s.is_associative_array(n)
         };
@@ -1436,15 +1438,47 @@ impl Simulator {
             .unwrap_or_else(|| name.to_string())
     }
 
-    /// Element storage names an array reduction walks: `obj[0]..obj[size-1]`,
-    /// or an associative array's populated keys in key order (§7.8) — which
-    /// are not dense indices, so a reduction over one summed nothing.
+    /// The next fixed dimension of an array or selected row (§7.12.3).
+    fn fixed_reduction_dimension<'n>(&self, name: &'n str) -> Option<(&'n str, (i64, i64), bool)> {
+        let mut root = name;
+        let mut depth = 0;
+        loop {
+            let shape = if let Some(&(outer, inner, _)) = self.module.arrays_2d.get(root) {
+                Some(([outer, inner].get(depth).copied()?, depth == 0))
+            } else if let Some((dims, _)) = self.module.arrays_nd.get(root) {
+                Some((*dims.get(depth)?, depth + 1 < dims.len()))
+            } else if depth == 0 {
+                self.module
+                    .arrays
+                    .get(root)
+                    .map(|&(lo, hi, _)| ((lo, hi), false))
+            } else {
+                None
+            };
+            if let Some((bounds, rows)) = shape {
+                if depth == 0 && self.module.dynamic_arrays.contains(root) {
+                    return Some((root, (0, self.get_queue_size(root) as i64 - 1), rows));
+                }
+                let (left, right) = bounds;
+                return Some((root, (left.min(right), left.max(right)), rows));
+            }
+            let (parent, index) = root.strip_suffix(']')?.rsplit_once('[')?;
+            index.parse::<i64>().ok()?;
+            root = parent;
+            depth += 1;
+        }
+    }
+
+    /// Element storage names in a reduction. Fixed dimensions retain their
+    /// declared index values and associative arrays visit populated keys.
     pub(super) fn reduction_elem_names(&self, obj: &str) -> Vec<String> {
         if self.is_associative_array(obj) {
             self.assoc_top_level_keys(obj)
                 .into_iter()
                 .map(|k| format!("{}[{}]", obj, k))
                 .collect()
+        } else if let Some((_, (lo, hi), _)) = self.fixed_reduction_dimension(obj) {
+            (lo..=hi).map(|i| format!("{obj}[{i}]")).collect()
         } else {
             (0..self.get_queue_size(obj))
                 .map(|i| format!("{}[{}]", obj, i))
@@ -1459,6 +1493,56 @@ impl Simulator {
             || self.module.dynamic_arrays.contains(name)
             || name.contains('#')
             || self.is_associative_array(name)
+    }
+
+    pub(super) fn is_reduction_with_receiver(&self, name: &str, method: &str) -> bool {
+        self.is_with_receiver_storage(name)
+            || (Self::is_array_reduction(BuiltinM::classify(method))
+                && self.fixed_reduction_dimension(name).is_some())
+    }
+
+    pub(super) fn reduction_row_alias(&self, name: &str) -> Option<&str> {
+        let row = self.item_alias.as_deref()?;
+        if name != "item" && name != self.locator_iter {
+            return None;
+        }
+        self.fixed_reduction_dimension(row)?;
+        Some(row)
+    }
+
+    pub(super) fn reduction_iterator_method(&self, func: &Expression) -> Option<Value> {
+        self.item_alias.as_ref()?;
+        let (receiver, method) = match &func.kind {
+            ExprKind::Ident(h) if h.root.is_none() => {
+                let [receiver, method] = h.path.as_slice() else {
+                    return None;
+                };
+                if !receiver.selects.is_empty() || !method.selects.is_empty() {
+                    return None;
+                }
+                (&receiver.name.name, &method.name.name)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                let [receiver] = h.path.as_slice() else {
+                    return None;
+                };
+                if h.root.is_some() || !receiver.selects.is_empty() {
+                    return None;
+                }
+                (&receiver.name.name, &member.name)
+            }
+            _ => return None,
+        };
+        let op = BuiltinM::classify(method);
+        if !Self::is_array_reduction(op) {
+            return None;
+        }
+        let row = self.reduction_row_alias(receiver)?;
+        let (_, _, contains_rows) = self.fixed_reduction_dimension(row)?;
+        (!contains_rows).then(|| self.reduce_array(row, op))
     }
 
     /// `(array, method, filter)` when `e` is a locator call on an array/queue,
@@ -1761,6 +1845,39 @@ impl Simulator {
         self.set_queue_size(dst, picks.len() as u64);
     }
 
+    /// §7.12.1: a locator used inside an expression owns its result only
+    /// until that expression consumes it. A unique key allows nested calls.
+    pub(super) fn materialize_locator_temp(
+        &mut self,
+        arr: &str,
+        method: &str,
+        picks: &LocatorPicks,
+    ) -> String {
+        let tmp = format!("@locator#{}", self.next_dyn_id);
+        self.next_dyn_id += 1;
+        self.materialize_locator(&tmp, arr, method, picks);
+        if !method.ends_with("_index") {
+            let mut rows = Vec::new();
+            if let Some(su) = self.queue_elem_struct(arr) {
+                let members = self.struct_coll_suffixes(&su);
+                for i in 0..picks.len() {
+                    rows.extend(members.iter().map(|member| format!("{tmp}[{i}].{member}")));
+                }
+            } else {
+                for i in 0..picks.len() {
+                    let row = format!("{tmp}[{i}]");
+                    if self.module.associative_arrays.contains_key(&row) {
+                        rows.push(row);
+                    }
+                }
+            }
+            if !rows.is_empty() {
+                class_metadata!(self.local_coll_elems, insert(tmp.clone(), rows));
+            }
+        }
+        tmp
+    }
+
     /// Will `sort_with` order by the STRING text of each element's key?
     /// `expr_is_string_valued`/`call_returns_string` resolve loop-locals only
     /// when their declared type is on record, but a `q.sort with (item.f)` /
@@ -1895,6 +2012,28 @@ impl Simulator {
         let leaf = arr.rsplit('.').next().unwrap_or(arr);
         let leaf = leaf.split('[').next().unwrap_or(leaf);
         self.collection_element_class_named(leaf)
+    }
+
+    /// §7.9.2: deleting an entry drops its aggregate rows as well as any
+    /// marker cell. Runtime row registrations have the same lifetime.
+    fn delete_assoc_rows(&mut self, array: &str, selected: Option<&str>) {
+        let prefix = Self::name_with_suffix(array, "[");
+        let discard = |key: &str| match selected {
+            Some(row) => key
+                .strip_prefix(row)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['.', '['])),
+            None => key.starts_with(&prefix),
+        };
+        if let Some(owner) = super::heap_gc::StorageOwner::of(array) {
+            self.release_owned_collection_rows(owner, discard);
+        } else {
+            for key in self.signals.keys_with_elem_prefix(&prefix) {
+                if discard(&key) {
+                    self.signals.remove(&key);
+                    self.widths.remove(&key);
+                }
+            }
+        }
     }
 
     /// The named key type of associative array `arr` in scope: a local's
@@ -2258,6 +2397,78 @@ impl Simulator {
         }
     }
 
+    fn is_array_reduction(op: BuiltinM) -> bool {
+        matches!(
+            op,
+            BuiltinM::Sum | BuiltinM::Product | BuiltinM::And | BuiltinM::Or | BuiltinM::Xor
+        )
+    }
+
+    /// §7.12.3: retain the result type and the X/Z plane through the fold.
+    fn combine_reduction(op: BuiltinM, left: Value, mut right: Value) -> Value {
+        let signed = left.is_signed;
+        if !right.is_real && !left.is_real {
+            right.is_signed = signed;
+            if right.width != left.width {
+                right = right.resize_for_assign(left.width);
+            }
+        }
+        let mut result = match op {
+            BuiltinM::Sum => left.add(&right),
+            BuiltinM::Product => left.mul(&right),
+            BuiltinM::And => left.bitwise_and(&right),
+            BuiltinM::Or => left.bitwise_or(&right),
+            BuiltinM::Xor => left.bitwise_xor(&right),
+            BuiltinM::Min if right.less_than(&left).is_true() => right,
+            BuiltinM::Max if right.greater_than(&left).is_true() => right,
+            _ => left,
+        };
+        if !result.is_real {
+            result.is_signed = signed;
+        }
+        result
+    }
+
+    fn reduce_array(&self, name: &str, op: BuiltinM) -> Value {
+        let root = self
+            .fixed_reduction_dimension(name)
+            .map_or(name, |(root, ..)| root);
+        let (width, signed) = self.array_elem_sign_width(root);
+        let identity = u64::from(op == BuiltinM::Product);
+        let mut acc: Option<Value> = None;
+        for name in self.reduction_elem_names(name) {
+            let Some(mut value) = self.get_signal_value_by_name(&name) else {
+                continue;
+            };
+            if !value.is_real {
+                value.is_signed = signed;
+                if value.width != width {
+                    value = value.resize_for_assign(width);
+                }
+            }
+            let prefix = acc.take().or_else(|| {
+                matches!(op, BuiltinM::Sum | BuiltinM::Product).then(|| {
+                    if value.is_real {
+                        Value::from_f64(identity as f64)
+                    } else {
+                        let mut start = Value::from_u64(identity, width);
+                        start.is_signed = signed;
+                        start
+                    }
+                })
+            });
+            acc = Some(match prefix {
+                Some(prefix) => Self::combine_reduction(op, prefix, value),
+                None => value,
+            });
+        }
+        acc.unwrap_or_else(|| {
+            let mut value = Value::from_u64(identity, width);
+            value.is_signed = signed;
+            value
+        })
+    }
+
     pub(super) fn reduce_with(
         &mut self,
         arr: &str,
@@ -2273,10 +2484,20 @@ impl Simulator {
                 self.assoc_key_ty(arr),
             )
         });
+        let fixed = self.fixed_reduction_dimension(arr);
         let size = match &assoc {
             Some((k, _)) => k.len() as u64,
-            None => self.get_queue_size(arr),
+            None => fixed.map_or_else(
+                || self.get_queue_size(arr),
+                |(_, (lo, hi), _)| hi.saturating_sub(lo).saturating_add(1).max(0) as u64,
+            ),
         };
+        let first = fixed.map_or(0, |(_, (lo, _), _)| lo);
+        let alias_elements =
+            fixed.is_some_and(|(_, _, rows)| rows) || self.queue_elem_struct(arr).is_some();
+        let saved_alias = self.item_alias.take();
+        let saved_iter =
+            std::mem::replace(&mut self.locator_iter, iter.unwrap_or("item").to_string());
         // Ensure a local frame exists so `item` has somewhere to live.
         // Initial-block-scope calls (no enclosing function) reach here
         // with an empty local_stack, which previously silenced every
@@ -2293,6 +2514,10 @@ impl Simulator {
             .last()
             .and_then(|f| f.get("item.index").cloned());
         let iter_index = iter.map(|nm| format!("{}.index", nm));
+        let saved_named = iter.and_then(|name| self.local_stack.last()?.get(name).cloned());
+        let saved_named_index = iter_index
+            .as_ref()
+            .and_then(|name| self.local_stack.last()?.get(name).cloned());
         let with_class = self.bind_with_iter_class(arr, iter);
         // §7.12.3/§7.2.1: a packed-struct element binds its fields, as for
         // the locators: `sum() with (item.code)` read 0 for every element.
@@ -2301,35 +2526,26 @@ impl Simulator {
             .as_ref()
             .map(|f| self.coll_packed_elem_field_signs(arr, f))
             .unwrap_or_default();
-        // §7.12.3: accumulate at 128 bits — the `with` expression's type can
-        // be wider than 64 bits (`q.sum() with (item)` over `logic [95:0]`),
-        // and an i64 accumulator wrapped there, building a result capped at
-        // `expr_w.min(64)` that could never equal a wide target.
-        let mut acc: Option<i128> = None;
-        // §7.12.3: with a `with` clause the result type is the type of the
-        // EXPRESSION, so the accumulation wraps at that width. A 1-bit
-        // predicate like `q.sum with (item > 4)` therefore counts modulo 2 —
-        // accumulating in a full i64 and returning 32 bits gave the raw match
-        // count (3) where the LRM requires 1.
-        let mut expr_w: u32 = 0;
-        let mut expr_s = false;
-        // §7.12.3: a real `with` expression makes the result real; `+` and
-        // `*` are defined for it (Table 11-1). Its values are folded as reals:
-        // read as integers they were their binary64 bit patterns.
-        let mut real_acc: Option<f64> = None;
+        let op = BuiltinM::classify(method);
+        let mut acc: Option<Value> = None;
         for i in 0..size {
             let key = assoc.as_ref().map(|(k, ty)| (k[i as usize].as_str(), *ty));
+            let index = first + i as i64;
+            let elem_name = match key {
+                Some((k, _)) => format!("{arr}[{k}]"),
+                None => format!("{arr}[{index}]"),
+            };
             let elem = self
-                .get_signal_value_by_name(&match key {
-                    Some((k, _)) => format!("{}[{}]", arr, k),
-                    None => format!("{}[{}]", arr, i),
-                })
+                .get_signal_value_by_name(&elem_name)
                 .unwrap_or_else(|| Value::zero(32));
+            if alias_elements {
+                self.item_alias = Some(elem_name);
+            }
             // §7.12.4: `item.index` is the element's index (an int), or the
             // key of an associative array.
             let ix = match key {
                 Some((k, ty)) => ty.value(k),
-                None => int_index(i as usize),
+                None => Self::signed_loop_val(index),
             };
             if let Some(f) = self.local_stack.last_mut() {
                 if let Some(nm) = iter {
@@ -2349,43 +2565,14 @@ impl Simulator {
                 f.insert("item".to_string(), elem);
                 f.insert("item.index".to_string(), ix);
             }
-            let fv = self.eval_expr(filter);
-            if (fv.is_real || real_acc.is_some()) && matches!(method, "sum" | "product") {
-                // A conditional may yield integral values before its first
-                // real one: they start the real fold.
-                let v = fv.to_f64();
-                let prefix = real_acc
-                    .or_else(|| acc.map(|a| if expr_s { a as f64 } else { (a as u128) as f64 }));
-                real_acc = Some(match prefix {
-                    None => v,
-                    Some(a) if method == "sum" => a + v,
-                    Some(a) => a * v,
-                });
-                continue;
-            }
-            if expr_w == 0 {
-                expr_w = fv.width.max(1);
-                expr_s = fv.is_signed;
-            }
-            // Read the item's value at its own width: `to_i64` gives only the
-            // low word of a wide (>64-bit) element.
-            let mut raw = fv.to_u128();
-            if fv.is_signed && fv.width > 0 && fv.width < 128 && (raw >> (fv.width - 1)) & 1 == 1 {
-                raw |= !0u128 << (fv.width - 1);
-            }
-            let v = raw as i128;
-            acc = Some(match (acc, method) {
-                (None, _) => v,
-                (Some(a), "sum") => a.wrapping_add(v),
-                (Some(a), "product") => a.wrapping_mul(v),
-                (Some(a), "min") => a.min(v),
-                (Some(a), "max") => a.max(v),
-                (Some(a), "and") => a & v,
-                (Some(a), "or") => a | v,
-                (Some(a), "xor") => a ^ v,
-                (Some(a), _) => a,
+            let value = self.eval_expr(filter);
+            acc = Some(match acc {
+                Some(previous) => Self::combine_reduction(op, previous, value),
+                None => value,
             });
         }
+        self.item_alias = saved_alias;
+        self.locator_iter = saved_iter;
         if let (Some(fields), Some(f)) = (&pfields, self.local_stack.last_mut()) {
             let it = iter.unwrap_or("item");
             for (fname, _, _) in fields {
@@ -2396,10 +2583,18 @@ impl Simulator {
         // Restore the prior `item` binding (if any); drop the iterator's.
         if let Some(f) = self.local_stack.last_mut() {
             if let Some(nm) = iter {
-                f.remove(nm);
+                if let Some(value) = saved_named {
+                    f.insert(nm.to_string(), value);
+                } else {
+                    f.remove(nm);
+                }
             }
             if let Some(k) = &iter_index {
-                f.remove(k);
+                if let Some(value) = saved_named_index {
+                    f.insert(k.clone(), value);
+                } else {
+                    f.remove(k);
+                }
             }
             match saved_item {
                 Some(v) => {
@@ -2421,29 +2616,15 @@ impl Simulator {
         if pushed_frame {
             self.pop_local_frame();
         }
-        if let Some(r) = real_acc {
-            return Value::from_f64(r);
+        match acc {
+            Some(value) if matches!(op, BuiltinM::Min | BuiltinM::Max) => {
+                let mut value = value.resize(value.width.max(32));
+                value.is_signed = false;
+                value
+            }
+            Some(value) => value,
+            None => Value::zero(32),
         }
-        // Truncate to the expression's width for the accumulating reductions;
-        // min/max/and/or/xor cannot exceed an operand and need no masking.
-        let w = if expr_w == 0 { 32 } else { expr_w };
-        let raw = acc.unwrap_or(0) as u128;
-        let out = if matches!(method, "sum" | "product") && w < 128 {
-            raw & ((1u128 << w) - 1)
-        } else {
-            raw
-        };
-        // §7.12.3: the result has the type of the `with` expression: its
-        // width (`$bits(a.sum() with (16'(item)))` is 16) and signedness
-        // (`sb.sum() with (item) == -56` over bytes holds).
-        if matches!(method, "sum" | "product" | "and" | "or" | "xor") && expr_w > 0 {
-            let w = expr_w.min(128);
-            let mut v =
-                Value::from_u128(if w < 128 { out & ((1u128 << w) - 1) } else { out }, w);
-            v.is_signed = expr_s;
-            return v;
-        }
-        Value::from_u64(out as u64, w.max(32))
     }
 
     /// The subroutine call a method-call receiver is reached through
@@ -2571,9 +2752,10 @@ impl Simulator {
         // unpacked struct writes member leaves (and the writeback copies them
         // back) — without it a `ref rec_t items[$]` came back with the right
         // SIZE and every member blank.
-        self.module
-            .var_decl_types
-            .insert(pname.to_string(), queue_data_type.clone());
+        class_metadata!(
+            self.module.var_decl_types,
+            insert(pname.to_string(), queue_data_type.clone())
+        );
         let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
         if let crate::ast::types::DataType::Struct(su) = resolved_dt {
             if !su.packed {
@@ -2581,8 +2763,10 @@ impl Simulator {
                 // recover per-field `is_real` (real fields) via struct_field_layout.
                 if let crate::ast::types::DataType::TypeReference { name: tn, .. } = queue_data_type
                 {
-                    self.var_typedef_types
-                        .insert(pname.to_string(), tn.name.name.clone());
+                    class_metadata!(
+                        self.var_typedef_types,
+                        insert(pname.to_string(), tn.name.name.clone())
+                    );
                 }
                 // Collect struct fields with cumulative offsets. SV packs
                 // struct members with the LAST member at the LSB.
@@ -2599,9 +2783,10 @@ impl Simulator {
                         offset += fw;
                     }
                 }
-                self.module
-                    .packed_struct_fields
-                    .insert(pname.to_string(), fields);
+                class_metadata!(
+                    self.module.packed_struct_fields,
+                    insert(pname.to_string(), fields)
+                );
             }
         }
         if let Some(parts) = literal_elems {
@@ -2609,8 +2794,8 @@ impl Simulator {
             let width = elem_width_override
                 .or_else(|| self.declared_collection_elem_width(queue_data_type))
                 .unwrap_or(32);
-            self.module.arrays.insert(key.clone(), (0, -1, width));
-            self.module.dynamic_arrays.insert(key.clone());
+            class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, width)));
+            class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
             // §10.10: a queue or array operand of `{..}` contributes all of
             // its elements (`{jal}`, `{q, X}`).
             if matches!(arg.kind, ExprKind::Concatenation(_))
@@ -2652,8 +2837,8 @@ impl Simulator {
             let w = elem_width_override
                 .or_else(|| self.declared_collection_elem_width(queue_data_type))
                 .unwrap_or(w);
-            self.module.arrays.insert(key.clone(), (0, -1, w));
-            self.module.dynamic_arrays.insert(key.clone());
+            class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, w)));
+            class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
             let n = vals.len() as u64;
             for (j, v) in vals.into_iter().enumerate() {
                 self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
@@ -2676,8 +2861,8 @@ impl Simulator {
         {
             let key = self.formal_dyn_key(pname, queue_data_type);
             self.register_formal_shape(&key, dims);
-            self.module.arrays.insert(key.clone(), (0, -1, 32));
-            self.module.dynamic_arrays.insert(key.clone());
+            class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, 32)));
+            class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
             self.vif_tokens_stored = true;
             for (j, inst) in insts.iter().enumerate() {
                 self.set_signal_value_by_name(
@@ -2720,8 +2905,8 @@ impl Simulator {
                 })
                 .collect()
         };
-        self.module.arrays.insert(key.clone(), (0, -1, w));
-        self.module.dynamic_arrays.insert(key.clone());
+        class_metadata!(self.module.arrays, insert(key.clone(), (0, -1, w)));
+        class_metadata!(self.module.dynamic_arrays, insert(key.clone()));
         if let Some(su) = &elem_struct {
             for j in 0..size {
                 let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", key, j));
@@ -2794,7 +2979,7 @@ impl Simulator {
                 | DataType::Enum(_)
         );
         if !plain {
-            self.module.var_decl_types.insert(key.clone(), dt.clone());
+            class_metadata!(self.module.var_decl_types, insert(key.clone(), dt.clone()));
         }
         if let Some(dims) = super::elaborate::packed_full_dims_chained(
             dt,
@@ -2803,18 +2988,20 @@ impl Simulator {
         )
         .filter(|dims| dims.len() > 1)
         {
-            self.module.packed_full_dims.insert(key.clone(), dims);
+            class_metadata!(self.module.packed_full_dims, insert(key.clone(), dims));
             if let Some(width) = self.ast_decl_elem_width(dt) {
-                self.module
-                    .packed_signal_elem_widths
-                    .insert(key.clone(), width);
+                class_metadata!(
+                    self.module.packed_signal_elem_widths,
+                    insert(key.clone(), width)
+                );
             }
         }
         if let crate::ast::types::DataType::TypeReference { name: tn, .. } = dt {
             if self.module.classes.contains_key(&tn.name.name) {
-                self.module
-                    .array_elem_class
-                    .insert(key.clone(), tn.name.name.clone());
+                class_metadata!(
+                    self.module.array_elem_class,
+                    insert(key.clone(), tn.name.name.clone())
+                );
             }
         }
         key
@@ -3123,13 +3310,13 @@ impl Simulator {
         // The size may live in the compact table rather than `signals`.
         let sz = self.get_queue_size(param);
         if let Some(e) = self.module.arrays.get(param).copied() {
-            self.module.arrays.insert(tmp.clone(), e);
+            class_metadata!(self.module.arrays, insert(tmp.clone(), e));
         }
         if self.module.dynamic_arrays.contains(param) {
-            self.module.dynamic_arrays.insert(tmp.clone());
+            class_metadata!(self.module.dynamic_arrays, insert(tmp.clone()));
         }
         if let Some(dt) = self.module.var_decl_types.get(param).cloned() {
-            self.module.var_decl_types.insert(tmp.clone(), dt);
+            class_metadata!(self.module.var_decl_types, insert(tmp.clone(), dt));
         }
         for j in 0..sz {
             let (d, s2) = (format!("{}[{}]", tmp, j), format!("{}[{}]", param, j));
@@ -3146,18 +3333,7 @@ impl Simulator {
 
     /// Drop a staged queue temp created by `stage_queue_param`.
     pub(super) fn drop_staged_queue(&mut self, tmp: &str) {
-        let sz_key = format!("{}.size", tmp);
-        let pre = format!("{}[", tmp);
-        let mut keys: Vec<String> = self.signals.keys_with_elem_prefix(&pre);
-        if self.signals.contains_key(&sz_key) {
-            keys.push(sz_key.clone());
-        }
-        for k in keys {
-            self.signals.remove(&k);
-        }
-        self.module.arrays.remove(tmp);
-        self.module.dynamic_arrays.remove(tmp);
-        self.module.var_decl_types.remove(tmp);
+        self.cleanup_dyn_storage(tmp);
     }
 
     /// Copy a queue param's contents back to the caller's queue on return
@@ -3179,8 +3355,8 @@ impl Simulator {
         for k in stale {
             self.signals.remove(&k);
         }
-        self.module.arrays.insert(caller.to_string(), (0, -1, w));
-        self.module.dynamic_arrays.insert(caller.to_string());
+        class_metadata!(self.module.arrays, insert(caller.to_string(), (0, -1, w)));
+        class_metadata!(self.module.dynamic_arrays, insert(caller.to_string()));
         // §7.2: an element of an UNPACKED-struct queue is a set of member
         // leaves, not one value — copying `q[j]` alone moved nothing, so a
         // `ref pkt_t q[$]` came back with the right SIZE and every member
@@ -3283,6 +3459,8 @@ impl Simulator {
             .arrays
             .get(obj)
             .map(|&(_, _, w)| w)
+            .or_else(|| self.module.arrays_2d.get(obj).map(|&(_, _, w)| w))
+            .or_else(|| self.module.arrays_nd.get(obj).map(|(_, w)| *w))
             .or_else(|| {
                 self.get_signal_value_by_name(&format!("{}[0]", obj))
                     .map(|v| v.width)
@@ -3891,106 +4069,8 @@ impl Simulator {
                 self.assoc_top_level_keys_shared(obj_name).len() as u64
             ));
         }
-        if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
-            let elems = self.reduction_elem_names(obj_name);
-            let (w, signed) = self.array_elem_sign_width(obj_name);
-            // §7.12.3: the reduction is computed at the element's own width
-            // and wraps there. A wide (>64-bit) element type needs a 128-bit
-            // accumulator: the u64 one wrapped every partial sum at 64 bits
-            // and the result was built at `w.min(64)`, so a 96-bit target
-            // like `ws.sum() == 96'h1_0000_0000_0000_0000` could never hold
-            // (the sum read as its low word, 0).
-            if w > 64 {
-                let mut total: u128 = if bm == BuiltinM::Sum { 0 } else { 1 };
-                for elem in &elems {
-                    if let Some(v) = self.get_signal_value_by_name(elem) {
-                        let mut x = v.to_u128();
-                        if signed && w < 128 && (x >> (w - 1)) & 1 == 1 {
-                            x |= !0u128 << (w - 1);
-                        }
-                        total = if bm == BuiltinM::Sum {
-                            total.wrapping_add(x)
-                        } else {
-                            total.wrapping_mul(x)
-                        };
-                    }
-                }
-                let out = if w < 128 {
-                    total & ((1u128 << w) - 1)
-                } else {
-                    total
-                };
-                let mut val = Value::from_u128(out, w);
-                val.is_signed = signed;
-                return Some(val);
-            }
-            let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
-            // A real element type: `+` and `*` are defined for it (Table
-            // 11-1), so the elements fold as reals, not as their bit patterns.
-            let mut real_total: Option<f64> = None;
-            for elem in &elems {
-                if let Some(v) = self.get_signal_value_by_name(elem) {
-                    if v.is_real {
-                        let r = real_total.unwrap_or(if bm == BuiltinM::Sum { 0.0 } else { 1.0 });
-                        real_total = Some(if bm == BuiltinM::Sum {
-                            r + v.to_f64()
-                        } else {
-                            r * v.to_f64()
-                        });
-                        continue;
-                    }
-                    let x = if signed {
-                        v.to_i64().unwrap_or(0) as u64
-                    } else {
-                        v.to_u64().unwrap_or(0)
-                    };
-                    total = if bm == BuiltinM::Sum {
-                        total.wrapping_add(x)
-                    } else {
-                        total.wrapping_mul(x)
-                    };
-                }
-            }
-            if let Some(r) = real_total {
-                return Some(Value::from_f64(r));
-            }
-            // Truncate to the element width — the accumulation wraps there.
-            let mut out = Value::from_u64(
-                if w < 64 {
-                    total & ((1u64 << w) - 1)
-                } else {
-                    total
-                },
-                w.min(64),
-            );
-            out.is_signed = signed;
-            return Some(out);
-        }
-        if matches!(bm, BuiltinM::And | BuiltinM::Or | BuiltinM::Xor) {
-            // §7.12.3: the result has the ELEMENT type — its width and
-            // signedness — and is folded over the elements' full values.
-            // `to_u64` kept the low word of a wide element and the result
-            // was built 32 bits wide, so `p.and()` over `bit [95:0]`
-            // elements could never equal a 96-bit target (#928).
-            let (w, signed) = self.array_elem_sign_width(obj_name);
-            let w = w.max(1);
-            let mut acc: Option<Value> = None;
-            for elem in self.reduction_elem_names(obj_name) {
-                if let Some(v) = self.get_signal_value_by_name(&elem) {
-                    let x = if v.width == w { v } else { v.resize(w) };
-                    acc = Some(match acc {
-                        None => x,
-                        Some(a) => match bm {
-                            BuiltinM::And => a.bitwise_and(&x),
-                            BuiltinM::Or => a.bitwise_or(&x),
-                            _ => a.bitwise_xor(&x),
-                        },
-                    });
-                }
-            }
-            let mut out = acc.unwrap_or_else(|| Value::zero(w));
-            out.is_signed = signed;
-            return Some(out);
+        if Self::is_array_reduction(bm) {
+            return Some(self.reduce_array(obj_name, bm));
         }
         if bm == BuiltinM::Min {
             let cur_size = self.get_queue_size(obj_name) as usize;
@@ -4201,26 +4281,19 @@ impl Simulator {
                             matches!(self.resolve_dt_ref(ty.as_ref()), DataType::Struct(su)
                             if Self::spreads_member_wise(su))
                         });
-                    if self.signals.remove(&elem_name).is_none() || aggregate {
-                        // §7.9.2: deleting an unpacked struct removes its
-                        // member cells even when a pattern store also left
-                        // an `aa[k]` marker. Scalar entries keep the direct
-                        // removal path without scanning the array (#1124).
-                        let member = Self::name_with_suffix(&elem_name, ".");
-                        let sub = Self::name_with_suffix(&elem_name, "[");
-                        let prefix = format!("{}[", obj_name);
-                        for k in self.signals.keys_with_elem_prefix(&prefix) {
-                            if k.starts_with(member.as_str()) || k.starts_with(sub.as_str()) {
-                                self.signals.remove(&k);
-                            }
-                        }
+                    let nested = aggregate
+                        || self.module.associative_arrays.contains_key(&elem_name)
+                        || self.module.dynamic_arrays.contains(&elem_name)
+                        || self
+                            .coll_shape_at(obj_name)
+                            .is_some_and(|(shape, depth)| shape.dims.len() > depth + 1);
+                    if nested || self.signals.remove(&elem_name).is_none() {
+                        self.delete_assoc_rows(obj_name, Some(&elem_name));
+                    } else {
+                        self.widths.remove(&elem_name);
                     }
                 } else {
-                    let prefix = format!("{}[", obj_name);
-                    let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-                    for k in keys {
-                        self.signals.remove(&k);
-                    }
+                    self.delete_assoc_rows(obj_name, None);
                 }
                 return Some(Value::zero(32));
             }
@@ -4270,9 +4343,9 @@ impl Simulator {
             // key's ASCII bytes as an integer into the ref arg (e.g. "ID103"
             // -> 2 garbage bytes). String keys are strings however they read;
             // never treat a string-keyed array as a wide numeric key.
-            let wide = self
-                .assoc_index_width_for(obj_name)
-                .filter(|&(kw, _)| kw > 64 && !self.is_string_keyed_array(obj_name));
+            let index_type = self.assoc_index_width_for(obj_name);
+            let wide =
+                index_type.filter(|&(kw, _)| kw > 64 && !self.is_string_keyed_array(obj_name));
             // §7.8.2, §7.9.4: string keys are strings however they read.
             let all_numeric = wide.is_none()
                 && !self.is_string_keyed_array(obj_name)
@@ -4322,21 +4395,29 @@ impl Simulator {
                 }
             };
             if let Some(key) = result_key {
+                let mut status = 1;
                 if let Some(arg) = args.first() {
+                    // §7.9.8: a narrower integral argument receives the
+                    // truncated key and the method returns a signed -1.
+                    let width = self.infer_width(arg);
+                    if (all_numeric || wide.is_some())
+                        && index_type.is_some_and(|(kw, _)| width < kw)
+                    {
+                        status = -1;
+                    }
                     if let Some((kw, ks)) = wide {
                         let mut v = Value::from_str_radix(&key, 16, kw);
                         v.is_signed = ks;
                         self.assign_value(arg, &v);
                     } else if all_numeric {
                         let key_int = key.parse::<i128>().unwrap_or(0);
-                        let w = self.infer_width(arg);
-                        self.assign_value(arg, &Value::from_u64(key_int as u64, w));
+                        self.assign_value(arg, &Value::from_u64(key_int as u64, width));
                     } else {
                         let key_val = Self::name_key_value(&key);
                         self.assign_value(arg, &key_val);
                     }
                 }
-                return Some(Value::from_u64(1, 32));
+                return Some(Self::signed_loop_val(status));
             } else {
                 return Some(Value::zero(32));
             }

@@ -82,11 +82,11 @@ impl Simulator {
                         if c.row_tail.is_some() {
                             // Its elements are rows, not values.
                             self.resize_row_owner(c, n);
-                            self.module.dynamic_arrays.insert(c.scoped.clone());
+                            class_metadata!(self.module.dynamic_arrays, insert(c.scoped.clone()));
                             continue;
                         }
                         self.resize_coll(&c.scoped, n);
-                        self.module.dynamic_arrays.insert(c.scoped.clone());
+                        class_metadata!(self.module.dynamic_arrays, insert(c.scoped.clone()));
                         let signed = self.class_prop_signed_of(handle, &c.prop);
                         for i in 0..n {
                             let key = format!("{}[{}]", c.scoped, i);

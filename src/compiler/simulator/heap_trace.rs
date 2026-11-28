@@ -8,30 +8,66 @@
 
 use serde::{ser, Serialize, Serializer};
 
-/// One bit per heap slot.
-#[derive(Clone, Default)]
-pub(super) struct SlotBits(Vec<u64>);
+const DENSE_SLOT_LIMIT: usize = 1 << 20;
+const PAGE_WORDS: usize = 64;
+
+type SlotPage = [u64; PAGE_WORDS];
+
+enum SlotWords {
+    Dense(Vec<u64>),
+    Paged(xezim_core::hasher::HashMap<usize, Box<SlotPage>>),
+}
+
+/// One bit per slot. Once the handle space grows large, only allocate pages
+/// containing candidates. Handles stay monotonic even after slots are freed.
+pub(super) struct SlotBits {
+    len: usize,
+    words: SlotWords,
+}
+
 impl SlotBits {
     pub fn new(len: usize) -> Self {
-        Self(vec![0; len.div_ceil(64)])
+        let words = if len <= DENSE_SLOT_LIMIT {
+            SlotWords::Dense(vec![0; len.div_ceil(64)])
+        } else {
+            SlotWords::Paged(Default::default())
+        };
+        Self { len, words }
     }
+
     pub fn get(&self, i: usize) -> bool {
-        self.0.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
+        if i >= self.len {
+            return false;
+        }
+        let index = i / 64;
+        let word = match &self.words {
+            SlotWords::Dense(words) => words[index],
+            SlotWords::Paged(pages) => pages
+                .get(&(index / PAGE_WORDS))
+                .map_or(0, |page| page[index % PAGE_WORDS]),
+        };
+        word & (1 << (i % 64)) != 0
     }
+
     /// Sets bit `i`, returning whether it was clear. Out of range: false.
     pub fn set(&mut self, i: usize) -> bool {
-        let Some(w) = self.0.get_mut(i / 64) else {
+        if i >= self.len {
             return false;
-        };
-        let m = 1 << (i % 64);
-        let was_clear = *w & m == 0;
-        *w |= m;
-        was_clear
-    }
-    pub fn clear(&mut self, i: usize) {
-        if let Some(w) = self.0.get_mut(i / 64) {
-            *w &= !(1 << (i % 64));
         }
+        let index = i / 64;
+        let word = match &mut self.words {
+            SlotWords::Dense(words) => &mut words[index],
+            SlotWords::Paged(pages) => {
+                let page = pages
+                    .entry(index / PAGE_WORDS)
+                    .or_insert_with(|| Box::new([0; PAGE_WORDS]));
+                &mut page[index % PAGE_WORDS]
+            }
+        };
+        let mask = 1 << (i % 64);
+        let was_clear = *word & mask == 0;
+        *word |= mask;
+        was_clear
     }
 }
 
@@ -68,6 +104,10 @@ impl HandleTrace {
             capture_words: 0,
         }
     }
+    pub fn can_candidate(&self, n: u64) -> bool {
+        n != 0 && n < self.candidates.len as u64
+    }
+
     pub fn candidate(&mut self, n: u64) {
         if n != 0
             && let Ok(n) = usize::try_from(n)
@@ -76,34 +116,45 @@ impl HandleTrace {
             self.found.push(n);
         }
     }
-    pub fn drain_candidates(&mut self) -> Vec<usize> {
-        let found = std::mem::take(&mut self.found);
-        for &h in &found {
-            self.candidates.clear(h);
-        }
-        found
+    /// Queue each newly reached handle once. Keep its bit set across
+    /// subsequent edges so cycles and shared subgraphs are visited once.
+    pub fn append_candidates(&mut self, target: &mut Vec<usize>) {
+        target.append(&mut self.found);
     }
+    /// Common small runtime values carry their bits inline. Apply the same
+    /// candidate rules as the Serde visitor without traversing its fields.
+    pub fn trace_value(&mut self, value: &super::Value) -> Result<(), TraceError> {
+        if value.width > 64 {
+            return self.trace(value);
+        }
+        let (bits, xz) = value.raw_bits();
+        self.candidate(bits);
+        if value.width >= 56 {
+            self.packed_event_handle(&(bits & !xz).to_be_bytes());
+        }
+        Ok(())
+    }
+
+    pub fn trace_storage_key(&mut self, key: &str) {
+        self.text_pieces(key);
+    }
+
     pub fn trace<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), TraceError> {
         value.serialize(&mut *self)
     }
-    /// Trace the keys `name[first]` .. `name[first + count - 1]`, as tracing
-    /// each key's text does, without spelling the keys out.
-    pub fn elem_keys(&mut self, name: &str, first: u64, count: usize) {
-        if count == 0 {
-            return;
-        }
+    /// Trace the base of a positional run. Its implicit indices are offsets
+    /// in a fixed array, queue or dynamic array (§7.4, §7.5, §7.10).
+    /// Explicit keys, including class-handle associative keys, are traced
+    /// separately through the ordinary keyed store.
+    pub fn elem_run_base(&mut self, name: &str) {
         if let Some(rest) = name.strip_prefix("\u{2}inst")
             && let Some((owner, _)) = rest.split_once('#')
             && let Ok(handle) = owner.parse::<u64>()
         {
             self.candidate(handle);
         }
-        // A key with a bracket is no number in any radix; its pieces are
-        // the name's and the index.
+        // A nested run's base can itself contain an associative key.
         self.text_pieces(name);
-        for i in first..first + count as u64 {
-            self.candidate(i);
-        }
     }
     fn text_pieces(&mut self, text: &str) {
         for piece in text.split(['.', '[', ']', ':']) {
@@ -162,6 +213,10 @@ impl HandleTrace {
             return;
         }
         let bytes: Vec<u8> = words.iter().rev().flat_map(|w| w.to_be_bytes()).collect();
+        self.packed_event_handle(&bytes);
+    }
+
+    fn packed_event_handle(&mut self, bytes: &[u8]) {
         let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
         let Some(rest) = bytes[start..].strip_prefix(b"\x02inst") else {
             return;
@@ -248,10 +303,13 @@ impl<'a> Serializer for &'a mut HandleTrace {
     fn serialize_u64(self, v: u64) -> Result<(), TraceError> {
         match self.capture_words {
             1 => self.value_words.push(v),
-            2 => self.xz_words.push(v),
+            2 => {
+                self.xz_words.push(v);
+                return Ok(());
+            }
             _ => {}
         }
-        self.candidate(v as u64);
+        self.candidate(v);
         Ok(())
     }
     fn serialize_u128(self, v: u128) -> Result<(), TraceError> {
@@ -457,7 +515,13 @@ impl ser::SerializeStruct for Fields<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), TraceError> {
-        if !self.skip {
+        if !self.skip
+            && match self.kind {
+                "Value" => key == "storage",
+                "WidePlanes" => matches!(key, "val" | "xz"),
+                _ => true,
+            }
+        {
             let old = self.trace.capture_words;
             if (self.kind == "ValueStorage" && key == "val_bits")
                 || (self.kind == "WidePlanes" && key == "val")
@@ -580,6 +644,33 @@ mod tests {
             "source spans are not references"
         );
     }
+    #[test]
+    fn sparse_slot_bits_allocate_only_touched_pages() {
+        use super::{SlotBits, SlotWords};
+        let mut bits = SlotBits::new(100_000_001);
+        assert!(bits.set(7));
+        assert!(bits.set(100_000_000));
+        assert!(!bits.set(100_000_001));
+        assert!(bits.get(7));
+        assert!(bits.get(100_000_000));
+        assert!(!bits.set(7));
+        assert!(!bits.get(500_000));
+        let SlotWords::Paged(pages) = &bits.words else {
+            panic!("large historic heap should use sparse pages");
+        };
+        assert_eq!(pages.len(), 2);
+    }
+
+    #[test]
+    fn value_geometry_does_not_keep_heap_slots_live() {
+        use crate::compiler::simulator::Value;
+        let mut trace = HandleTrace::new(1000);
+        trace.trace(&Value::zero(257)).unwrap();
+        trace.trace(&Value::from_inline(0, 490, 64)).unwrap();
+        assert!(!trace.candidates.get(257));
+        assert!(!trace.candidates.get(490));
+    }
+
     #[test]
     fn traces_owned_names_associative_keys_and_wide_values() {
         let mut trace = HandleTrace::new(1000);

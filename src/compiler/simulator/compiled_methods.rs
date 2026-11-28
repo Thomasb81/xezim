@@ -3721,7 +3721,7 @@ impl Simulator {
             if self.module.classes.contains_key(&cn) {
                 let rn = pre.fn_ret_name.clone();
                 self.record_local_class_type(&rn, &cn);
-                self.var_class_types.insert(rn, cn);
+                class_metadata!(self.var_class_types, insert(rn, cn));
             }
         }
         let _prev_comp = if SAMPLER_READY.load(Ordering::Relaxed) {

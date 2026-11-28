@@ -1244,10 +1244,10 @@ impl Simulator {
                                 if len >= bound {
                                     let value = self.mbx_message(&args[0]);
                                     let cont = pc.resume_at(pc.start + i + 1);
-                                    self.mailbox_put_waiters
-                                        .entry(handle)
-                                        .or_default()
-                                        .push_back(MailboxPutWaiter { pid, value, cont });
+                                    self.park_mailbox_put(
+                                        handle,
+                                        MailboxPutWaiter { pid, value, cont },
+                                    );
                                     return;
                                 }
                             }
@@ -2653,12 +2653,12 @@ impl Simulator {
                                 .collect();
                             let fe_saved = self.snapshot_loop_vars(&fe_names);
                             let fe_auto_len = self.auto_loop_vars.len();
-                            // foreach index vars are automatic (§9.7.3); like
-                            // for-init vars, record for fork capture.
-                            if self.local_stack.last().is_none() {
-                                for nm in &fe_names {
-                                    self.auto_loop_vars.push(nm.clone());
-                                }
+                            // §12.7.3: an automatic foreach index must stay
+                            // private while the body is suspended. Reuse the
+                            // process-local frame used by blocking for loops.
+                            let owns_loop_frame = self.local_stack.is_empty() && !fe_names.is_empty();
+                            if owns_loop_frame {
+                                self.push_loop_frame();
                             }
                             let loop_var = vars
                                 .first()
@@ -2735,6 +2735,7 @@ impl Simulator {
                                     frame_key: Self::frame_key(&wrap_frame),
                                     frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
                                     loop_vars: fe_saved,
+                                    owns_loop_frame,
                                     static_hidden,
                                     ..Default::default()
                                 });

@@ -547,11 +547,12 @@ impl Simulator {
         let snap = Self::RET_STRUCT_SNAP;
         if name != snap {
             let w = self.module.arrays.get(name).map_or(32, |t| t.2);
-            self.module.arrays.insert(snap.to_string(), (0, -1, w));
-            self.module.dynamic_arrays.insert(snap.to_string());
-            self.module
-                .var_decl_types
-                .insert(snap.to_string(), DataType::Struct(su.clone()));
+            class_metadata!(self.module.arrays, insert(snap.to_string(), (0, -1, w)));
+            class_metadata!(self.module.dynamic_arrays, insert(snap.to_string()));
+            class_metadata!(
+                self.module.var_decl_types,
+                insert(snap.to_string(), DataType::Struct(su.clone()))
+            );
             for (pos, i) in idx.iter().enumerate() {
                 self.copy_unpacked_struct(&format!("{snap}[{pos}]"), &format!("{name}[{i}]"), su);
             }
@@ -733,13 +734,13 @@ impl Simulator {
             // source was a fixed array with another declared range (§7.6).
             // The return side channel supplies size and leaves; collection
             // consumers also need its type and storage classification.
-            self.module.arrays.insert(name.clone(), (0, -1, width));
-            self.module.dynamic_arrays.insert(name.clone());
-            self.module.var_decl_types.insert(name.clone(), data_type);
+            class_metadata!(self.module.arrays, insert(name.clone(), (0, -1, width)));
+            class_metadata!(self.module.dynamic_arrays, insert(name.clone()));
+            class_metadata!(self.module.var_decl_types, insert(name.clone(), data_type));
         } else if name == Self::RET_ASSOC_SNAP {
             // §21.2.1.7: the element type of a returned associative array
             // (an enum prints its labels, a string is quoted).
-            self.module.var_decl_types.insert(name.clone(), data_type);
+            class_metadata!(self.module.var_decl_types, insert(name.clone(), data_type));
         }
         Some(name)
     }
@@ -1965,10 +1966,10 @@ impl Simulator {
                     };
                     match src_tag {
                         Some(tag) => {
-                            self.active_union_tag.insert(lname.to_string(), tag);
+                            class_metadata!(self.active_union_tag, insert(lname.to_string(), tag));
                         }
                         None => {
-                            self.active_union_tag.remove(&*lname);
+                            class_metadata!(self.active_union_tag, remove(&*lname));
                         }
                     }
                 }
@@ -2257,7 +2258,7 @@ impl Simulator {
                     self.settle_after_proc_write();
                     return;
                 }
-                self.module.dynamic_arrays.insert(row.clone());
+                class_metadata!(self.module.dynamic_arrays, insert(row.clone()));
                 self.fill_sized_new(&row, n_expr, src_expr);
                 self.settle_after_proc_write();
                 return;
@@ -3275,10 +3276,8 @@ impl Simulator {
                         for k in stale {
                             self.signals.remove(&k);
                         }
-                        self.module.dynamic_arrays.insert(lname.to_string());
-                        self.module
-                            .arrays
-                            .entry(lname.to_string())
+                        class_metadata!(self.module.dynamic_arrays, insert(lname.to_string()));
+                        class_metadata!(self.module.arrays, entry(lname.to_string()))
                             .or_insert((0, 63, w));
                         // A STRUCT-element array keeps each member in its
                         // own leaf signal (`arr[i].path`); registering a
@@ -3340,7 +3339,7 @@ impl Simulator {
                 } else {
                     tag.name.clone()
                 };
-                self.active_union_tag.insert(lname.to_string(), tag_name);
+                class_metadata!(self.active_union_tag, insert(lname.to_string(), tag_name));
                 if let Some(inner_expr) = inner {
                     let v = self.eval_expr(inner_expr);
                     self.set_signal_value_by_name(&lname, v);

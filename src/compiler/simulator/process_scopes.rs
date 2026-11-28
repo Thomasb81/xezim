@@ -2201,7 +2201,6 @@ impl Simulator {
         // The statics the block's variables hid are visible again.
         // Each goes back at its position, which `static_mark` relies on.
         self.unhide_statics(sv.static_hidden.take());
-        let forked = self.next_pid != sv.pid_mark;
         for s in stmts {
             let (data_type, declarators) = match &s.kind {
                 StatementKind::VarDecl {
@@ -2237,9 +2236,7 @@ impl Simulator {
                         .map(|pos| ld.remove(pos))
                 });
                 if let Some((_, key)) = gone {
-                    if !forked {
-                        self.cleanup_dyn_storage(&key);
-                    }
+                    self.cleanup_dyn_storage(&key);
                 }
             }
         }
